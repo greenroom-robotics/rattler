@@ -1586,8 +1586,10 @@ pub struct IndexAzureConfig {
     pub max_parallel: usize,
     /// The multi-progress bar to use for the index.
     pub multi_progress: Option<MultiProgress>,
-    /// Configuration for precondition checks during file operations.
-    pub precondition_checks: PreconditionChecks,
+    // NOTE: no `precondition_checks` field. opendal's azblob service does not
+    // support conditional (`if_match`) writes, so precondition checks can only
+    // ever be disabled here; the Azure path hardcodes `Disabled` rather than
+    // exposing a knob whose enabled state always fails.
 }
 
 /// Build an opendal `AzblobConfig` from a channel URL and credentials.
@@ -1618,13 +1620,20 @@ fn azblob_config(
         .ok_or_else(|| anyhow::anyhow!("No container in Azure blob URL"))?;
     let root = format!("/{}", segments.collect::<Vec<_>>().join("/"));
 
+    // Preserve a non-default port so custom endpoints (e.g. the Azurite
+    // emulator on :10000) work; real Azure uses the scheme default (443).
+    let authority = match channel.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+
     let (account_key, sas_token) = match credentials {
         AzureCredentials::AccountKey(key) => (Some(key.clone()), None),
         AzureCredentials::SasToken(token) => (None, Some(token.clone())),
     };
 
     Ok(AzblobConfig {
-        endpoint: Some(format!("{}://{}", channel.scheme(), host)),
+        endpoint: Some(format!("{}://{}", channel.scheme(), authority)),
         account_name: Some(account_name.to_string()),
         container: container.to_string(),
         root: Some(root),
@@ -1657,7 +1666,6 @@ pub async fn index_azure_with_channel_metadata(
         force,
         max_parallel,
         multi_progress,
-        precondition_checks,
     }: IndexAzureConfig,
     channel_metadata: ChannelMetadata,
 ) -> anyhow::Result<()> {
@@ -1676,7 +1684,9 @@ pub async fn index_azure_with_channel_metadata(
         force,
         max_parallel,
         multi_progress,
-        precondition_checks,
+        // opendal's azblob service can't do conditional writes, so preconditions
+        // must be disabled (matching the filesystem backend).
+        PreconditionChecks::Disabled,
         channel_metadata,
     )
     .await
@@ -2016,6 +2026,24 @@ mod tests {
         assert_eq!(config.root.as_deref(), Some("/"));
         assert_eq!(config.account_key.as_deref(), Some("key"));
         assert_eq!(config.sas_token, None);
+    }
+
+    #[cfg(feature = "azure")]
+    #[test]
+    fn azblob_config_preserves_non_default_port() {
+        let channel =
+            Url::parse("http://devstoreaccount1.blob.localhost:10000/testcontainer/ch").unwrap();
+        let credentials = AzureCredentials::AccountKey("key".to_string());
+
+        let config = azblob_config(&credentials, &channel).unwrap();
+
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("http://devstoreaccount1.blob.localhost:10000")
+        );
+        assert_eq!(config.account_name.as_deref(), Some("devstoreaccount1"));
+        assert_eq!(config.container, "testcontainer");
+        assert_eq!(config.root.as_deref(), Some("/ch"));
     }
 
     #[test]
