@@ -10,7 +10,7 @@ use rattler_conda_types::Platform;
 use rattler_config::config::{
     concurrency::default_max_concurrent_solves, index::IndexChannelConfig,
 };
-#[cfg(any(feature = "s3", feature = "azure"))]
+#[cfg(feature = "s3")]
 use rattler_index::PreconditionChecks;
 use rattler_index::{
     ChannelMetadata, IndexFsConfig, PackageRevisionAssignment, index_fs_with_channel_metadata,
@@ -88,10 +88,10 @@ struct Cli {
     repodata_patch: Option<String>,
 
     /// Disable precondition checks (`ETags`, timestamps) during file operations.
-    /// Use this flag if your S3/Azure backend doesn't fully support conditional requests,
+    /// Use this flag if your S3 backend doesn't fully support conditional requests,
     /// or if you're certain no concurrent indexing processes are running.
     /// Warning: Disabling this removes protection against concurrent modifications.
-    #[cfg(any(feature = "s3", feature = "azure"))]
+    #[cfg(feature = "s3")]
     #[arg(long, default_value = "false", global = true)]
     disable_precondition_checks: bool,
 
@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         .or(config.as_ref().map(|c| c.concurrency.downloads))
         .unwrap_or_else(default_max_concurrent_solves);
 
-    #[cfg(any(feature = "s3", feature = "azure"))]
+    #[cfg(feature = "s3")]
     let precondition_checks = if cli.disable_precondition_checks {
         PreconditionChecks::Disabled
     } else {
@@ -276,7 +276,6 @@ async fn main() -> anyhow::Result<()> {
                     force: cli.force,
                     max_parallel,
                     multi_progress: Some(multi_progress),
-                    precondition_checks,
                 },
                 channel_metadata,
             )
