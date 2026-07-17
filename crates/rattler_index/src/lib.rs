@@ -51,7 +51,7 @@ use rattler_package_streaming::{
 use rattler_s3::ResolvedS3Credentials;
 use retry_policies::{Jitter, RetryDecision, RetryPolicy, policies::ExponentialBackoff};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, digest::array::SliceExt};
 use tokio::sync::Semaphore;
 use tracing::Instrument;
 #[cfg(feature = "s3")]
@@ -767,26 +767,30 @@ async fn index_subdir_inner(
             }
         };
 
-    // List all the packages in the subdirectory, keeping each file's size. The
-    // listers populate content_length as part of the listing, so this needs no
-    // extra stat round-trips.
-    let uploaded_sizes: HashMap<DistArchiveIdentifier, u64> = op
-        .list_with(&format!("{}/", subdir.as_str()))
-        .await?
+    let existing = op.list_with(&format!("{}/", subdir.as_str())).await?;
+    // get the md5 hashes of each uploaded .conda, storing an optional md5 hash and a archive size
+    // for each, so that we can later check if the contents has changed
+    let uploaded_hashes: HashMap<DistArchiveIdentifier, Option<&str>> = existing
         .iter()
         .filter_map(|entry| {
             let meta = entry.metadata();
             if meta.mode().is_file() {
                 // Check if the file is an archive package file.
                 DistArchiveIdentifier::try_from_filename(entry.name())
-                    .map(|id| (id, meta.content_length()))
+                    // this seems like it could be quite expensive? Depending on how opendal sets
+                    // the content_md5.
+                    // TODO: docs say md5 is best effort so maybe some backends don't set
+                    // this at all? Needs testing against the supported backends to confirm they set
+                    // it otherwise this will force us to re-index everything in the channel
+                    // TODO: investigate timestamp as a possibly better check? Doubt it though
+                    .map(|id| (id, meta.content_md5()))
             } else {
                 None
             }
         })
         .collect();
     let uploaded_packages: HashSet<DistArchiveIdentifier> =
-        uploaded_sizes.keys().cloned().collect();
+        uploaded_hashes.keys().cloned().collect();
 
     tracing::debug!(
         "Found {} already uploaded packages in subdir {}.",
@@ -814,28 +818,31 @@ async fn index_subdir_inner(
         registered_packages.remove(filename);
     }
 
-    // Re-index packages whose file no longer matches the size recorded in the
+    // Re-index packages whose file no longer matches the md5 recorded in the
     // previous repodata. `.conda`/`.tar.bz2` archives aren't reproducible, so a
     // package rebuilt and republished under the same filename has different
     // bytes; without this the stale record's sha256/size are kept and clients
     // hit a hash mismatch on download. Dropping the mismatched entry here moves
     // it into `packages_to_add` below, which re-reads and re-hashes it.
-    //
-    // Size is the only signal available without re-reading every package: a
-    // rebuild that lands on the exact same byte count still slips through, and
-    // `--force` remains the way to rebuild repodata unconditionally.
     let stale = registered_packages
         .iter()
-        .filter(|(id, pkg)| match (uploaded_sizes.get(id), pkg.record.size) {
-            (Some(current), Some(recorded)) => *current != recorded,
-            (Some(_), None) => true, // no recorded size to trust
-            (None, _) => false,      // absent from the channel: handled above
+        .filter(|(id, pkg)| {
+            // if we have a new hash and size and an old hash and old size, and they are all equal,
+            // then we know the package is not stale
+            if let Some(Some(new_md5)) = uploaded_hashes.get(id)
+                && let Some(old_md5) = pkg.record.md5
+                && old_md5.as_slice() == new_md5.as_bytes()
+            {
+                false
+            } else {
+                true
+            }
         })
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
 
     if !stale.is_empty() {
-        tracing::info!(
+        tracing::warn!(
             "Re-indexing {} packages in subdir {} whose blob size changed since the last index.",
             stale.len(),
             subdir
