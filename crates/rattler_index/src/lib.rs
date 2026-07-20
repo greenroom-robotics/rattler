@@ -782,12 +782,10 @@ async fn index_subdir_inner(
             if meta.mode().is_file() {
                 // Check if the file is an archive package file.
                 DistArchiveIdentifier::try_from_filename(entry.name())
-                    // this seems like it could be quite expensive? Depending on how opendal sets
-                    // the content_md5.
-                    // TODO: docs say md5 is best effort so maybe some backends don't set
-                    // this at all? Needs testing against the supported backends to confirm they set
-                    // it otherwise this will force us to re-index everything in the channel
-                    // TODO: investigate timestamp as a possibly better check? Doubt it though
+                    // opendal populates content_md5 from the backend's Content-MD5
+                    // header on list (verified for azure/azblob via the azure_md5_probe
+                    // test). md5 is documented best-effort, so backends that omit it
+                    // yield None here and those packages get re-indexed.
                     .map(|id| (id, meta.content_md5()))
             } else {
                 None
