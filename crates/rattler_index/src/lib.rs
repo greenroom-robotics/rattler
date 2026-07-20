@@ -18,6 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use bytes::buf::Buf;
 use fs_err::{self as fs};
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -55,7 +56,7 @@ use rattler_package_streaming::{
 use rattler_s3::ResolvedS3Credentials;
 use retry_policies::{Jitter, RetryDecision, RetryPolicy, policies::ExponentialBackoff};
 use serde::Serialize;
-use sha2::{Digest, Sha256, digest::array::SliceExt};
+use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing::Instrument;
 #[cfg(any(feature = "s3", feature = "azure"))]
@@ -831,11 +832,14 @@ async fn index_subdir_inner(
     let stale = registered_packages
         .iter()
         .filter(|(id, pkg)| {
-            // if we have a new hash and size and an old hash and old size, and they are all equal,
-            // then we know the package is not stale
+            // Not stale only if the backend's md5 matches the one in the previous
+            // repodata. opendal exposes content_md5 as the base64 Content-MD5 header
+            // (e.g. azure), so decode it to raw bytes before comparing to the record's
+            // 16-byte digest. Missing/undecodable md5 => treat as stale and re-index.
             if let Some(Some(new_md5)) = uploaded_hashes.get(id)
                 && let Some(old_md5) = pkg.record.md5
-                && old_md5.as_slice() == new_md5.as_bytes()
+                && let Ok(new_md5) = base64::engine::general_purpose::STANDARD.decode(new_md5)
+                && old_md5.as_slice() == new_md5.as_slice()
             {
                 false
             } else {
@@ -847,7 +851,7 @@ async fn index_subdir_inner(
 
     if !stale.is_empty() {
         tracing::warn!(
-            "Re-indexing {} packages in subdir {} whose blob size changed since the last index.",
+            "Re-indexing {} packages in subdir {} whose md5 changed since the last index.",
             stale.len(),
             subdir
         );
