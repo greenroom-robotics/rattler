@@ -220,7 +220,7 @@ impl TryFrom<ArtifactoryOpts> for ArtifactoryData {
     type Error = miette::Error;
 
     fn try_from(value: ArtifactoryOpts) -> Result<Self, Self::Error> {
-        let data = Self::new(value.url, value.channels);
+        let data = Self::new(value.url, value.channels, None);
 
         if let Some(username) = value.username {
             let password = value
@@ -238,12 +238,12 @@ impl TryFrom<ArtifactoryOpts> for ArtifactoryData {
 }
 
 impl ArtifactoryData {
-    /// Create a new and unauthenticated instance of `ArtifactoryData`
-    pub fn new(url: Url, channels: String) -> Self {
+    /// Create a new instance of `ArtifactoryData`, optionally bearer-authenticated.
+    pub fn new(url: Url, channels: String, token: Option<String>) -> Self {
         Self {
             url: url.into(),
             channels,
-            authentication: None,
+            authentication: token.map(ArtifactoryAuthentication::Token),
         }
     }
 

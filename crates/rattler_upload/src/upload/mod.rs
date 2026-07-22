@@ -572,7 +572,7 @@ mod test {
         let router = Router::new().fallback(ok_with_bearer);
         let url = start_test_server(router).await;
         let storage = AuthenticationStorage::empty();
-        let artifactory_data = ArtifactoryData::new(url, "test-channel".to_string())
+        let artifactory_data = ArtifactoryData::new(url, "test-channel".to_string(), None)
             .with_bearer_auth("test-token".to_string());
         let result = super::upload_package_to_artifactory(
             &storage,
@@ -588,7 +588,7 @@ mod test {
         let router = Router::new().fallback(ok_with_basic);
         let url = start_test_server(router).await;
         let storage = AuthenticationStorage::empty();
-        let artifactory_data = ArtifactoryData::new(url, "test-channel".to_string())
+        let artifactory_data = ArtifactoryData::new(url, "test-channel".to_string(), None)
             .with_basic_auth("test-user".to_string(), "test-password".to_string());
         let result = super::upload_package_to_artifactory(
             &storage,
@@ -614,7 +614,7 @@ mod test {
                 },
             )
             .unwrap();
-        let artifactory_data = ArtifactoryData::new(url, "test-channel".to_string());
+        let artifactory_data = ArtifactoryData::new(url, "test-channel".to_string(), None);
         let result = super::upload_package_to_artifactory(
             &storage,
             &vec![test_package_path()],
@@ -629,7 +629,7 @@ mod test {
         let router = Router::new().fallback(unauthorized);
         let url = start_test_server(router).await;
         let storage = AuthenticationStorage::empty();
-        let artifactory_data = ArtifactoryData::new(url, "test-channel".to_string())
+        let artifactory_data = ArtifactoryData::new(url, "test-channel".to_string(), None)
             .with_bearer_auth("bad-token".to_string());
         let result = super::upload_package_to_artifactory(
             &storage,
