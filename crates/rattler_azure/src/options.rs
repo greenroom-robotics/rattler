@@ -110,9 +110,11 @@ pub struct AzureFetchOptions {
 /// breaks the private ones.
 ///
 /// There is therefore no entry-level `auth` field at all. It is absent from the
-/// type rather than defaulted to false, so the one setting whose blast radius
-/// would be every container on the account is unrepresentable. The worst typo
-/// here grants one container.
+/// type rather than defaulted to false, so a grant always names a container — a
+/// container *under the key's reading of the URL*. A key whose shape does not
+/// match the endpoint reads the account segment as the container: on a host that
+/// really fronts its accounts path-style, a host-style key's `accta = true` grants
+/// every URL whose first segment is `accta`, which is the whole account.
 ///
 /// ```toml
 /// [azure-options."mycompany.blob.core.windows.net"]
