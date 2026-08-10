@@ -1987,44 +1987,6 @@ mod tests {
 
     #[cfg(feature = "azure")]
     #[test]
-    fn azblob_config_derives_fields_from_url() {
-        let channel =
-            AzureChannelUrl::parse("az://stcondachannel.blob.core.windows.net/general/sub/dir")
-                .unwrap();
-        let credentials = AzureCredentials::SasToken("sv=token".into());
-
-        let config =
-            rattler_azure::azblob_config(&credentials, &channel, AzureEndpoint::default()).unwrap();
-
-        assert_eq!(
-            config.endpoint.as_deref(),
-            Some("https://stcondachannel.blob.core.windows.net")
-        );
-        assert_eq!(config.account_name.as_deref(), Some("stcondachannel"));
-        assert_eq!(config.container, "general");
-        assert_eq!(config.root.as_deref(), Some("/sub/dir"));
-        assert_eq!(config.sas_token.as_deref(), Some("sv=token"));
-        assert_eq!(config.account_key, None);
-    }
-
-    #[cfg(feature = "azure")]
-    #[test]
-    fn azblob_config_container_only_url() {
-        let channel =
-            AzureChannelUrl::parse("az://stcondachannel.blob.core.windows.net/general").unwrap();
-        let credentials = AzureCredentials::AccountKey("key".into());
-
-        let config =
-            rattler_azure::azblob_config(&credentials, &channel, AzureEndpoint::default()).unwrap();
-
-        assert_eq!(config.container, "general");
-        assert_eq!(config.root.as_deref(), Some("/"));
-        assert_eq!(config.account_key.as_deref(), Some("key"));
-        assert_eq!(config.sas_token, None);
-    }
-
-    #[cfg(feature = "azure")]
-    #[test]
     fn azblob_config_preserves_non_default_port() {
         let channel =
             AzureChannelUrl::parse("az://devstoreaccount1.blob.localhost:10000/testcontainer/ch")

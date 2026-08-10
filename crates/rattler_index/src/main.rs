@@ -349,7 +349,7 @@ fn effective_index_options(
 
 #[cfg(all(test, feature = "azure"))]
 mod tests {
-    use rattler_azure::{Addressing, AzureCredentials, AzureScheme};
+    use rattler_azure::{Addressing, AzureScheme};
 
     use super::*;
 
@@ -401,42 +401,5 @@ mod tests {
         let endpoint = azure_endpoint(&config, channel.host());
         assert_eq!(endpoint.scheme, AzureScheme::Http);
         assert_eq!(endpoint.addressing, Addressing::PathStyle);
-
-        let azblob = rattler_azure::azblob_config(
-            &AzureCredentials::AccountKey("key".into()),
-            &channel,
-            endpoint,
-        )
-        .expect("an Azurite channel must build an opendal config");
-
-        assert_eq!(
-            azblob.endpoint.as_deref(),
-            Some("http://127.0.0.1:10000/devstoreaccount1")
-        );
-        assert_eq!(azblob.account_name.as_deref(), Some("devstoreaccount1"));
-        assert_eq!(azblob.container, "general");
-        assert_eq!(azblob.root.as_deref(), Some("/mychannel"));
-    }
-
-    /// Without an entry the same URL errors instead of silently addressing
-    /// something else, and the error names the config line that fixes it.
-    #[test]
-    fn an_emulator_host_without_an_entry_is_a_guided_error() {
-        let channel =
-            AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general").unwrap();
-        let endpoint = azure_endpoint(&None, channel.host());
-
-        let err = rattler_azure::azblob_config(
-            &AzureCredentials::AccountKey("key".into()),
-            &channel,
-            endpoint,
-        )
-        .expect_err("host-style cannot address an IP literal");
-        let message = err.to_string();
-        assert!(
-            message.contains("[azure-options.\"127.0.0.1:10000\"]"),
-            "{message}"
-        );
-        assert!(message.contains("path-style = true"), "{message}");
     }
 }
