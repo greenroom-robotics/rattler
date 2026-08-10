@@ -24,8 +24,11 @@ const X_MS_VERSION: &str = "2021-12-02";
 /// Middleware that rewrites `az://` URLs to their wire form and signs the ones
 /// whose container is granted credentials.
 ///
-/// The `az://` host is the full blob endpoint, so rewriting is a plain scheme
-/// swap: `az://{host}/{path}` → `https://{host}/{path}`.
+/// Rewriting is a scheme swap and nothing else: `az://{host}/{path}` →
+/// `{scheme}://{host}/{path}`, with the scheme from the matched entry, so an
+/// emulator entry rewrites to `http`. The blob endpoint is `{scheme}://{key}`,
+/// which under a path-style key is more than the host — but that leading segment
+/// stays in the path either way, so no request URL has to be rebuilt.
 ///
 /// See [`rattler_azure::options`] for what an `azure-options` entry grants.
 ///
@@ -60,7 +63,7 @@ enum Signers {
     /// The ambient chain, narrowed off Azure. `any` reaches everything reqsign
     /// can find — Azure CLI, IMDS, workload identity — and so is only reached for
     /// a host that is demonstrably Azure over TLS; `explicit` reads
-    /// `AZURE_STORAGE_*` and nothing else, and covers every other granted host.
+    /// `AZURE_STORAGE_*` and nothing else, and covers every other granted request.
     /// See [`AzureMiddleware::signer_for`].
     Ambient {
         any: Signer<Credential>,
@@ -128,8 +131,8 @@ impl AzureMiddleware {
         }
     }
 
-    /// Create a middleware that grants no host, so every `az://` request is sent
-    /// unsigned.
+    /// Create a middleware with no entries, so nothing is granted and every
+    /// `az://` request is sent unsigned.
     pub fn anonymous(client: Client) -> Self {
         Self::new(client, [])
     }
@@ -151,7 +154,8 @@ impl AzureMiddleware {
         }
     }
 
-    /// The signer whose credential sources are safe to reach for `host`.
+    /// The signer whose credential sources are safe to reach for `channel` over
+    /// `scheme`.
     ///
     /// An AAD access token is audience-wide by construction — Azure issues it for
     /// `https://storage.azure.com/`, valid against every account the principal can
