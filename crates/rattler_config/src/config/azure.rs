@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use rattler_azure::{AzureEndpointKey, AzureEndpointOptions};
+use rattler_azure::{AzureEndpointKey, AzureEndpointOptions, AzureHost};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -35,6 +35,53 @@ impl AzureOptionsMap {
     pub fn contains(&self, key: &AzureEndpointKey) -> bool {
         self.0.contains_key(key)
     }
+}
+
+/// Reject a document that spells one endpoint two ways.
+///
+/// Both spellings reach serde, which silently keeps whichever the table iterated
+/// last — byte order of the raw keys, not the order they were written — so one
+/// entry's grants vanish and Azure reports the private container as a 404. TOML's
+/// own duplicate-key check runs on the raw text, so it cannot see the collision.
+///
+/// A host carrying both readings of its account is refused on the same terms: only
+/// one of `H` and `H/<account>` can describe an endpoint, and longest-match would
+/// pick the path-style one without saying so.
+pub(crate) fn ensure_no_colliding_keys(document: &toml::Table) -> Result<(), String> {
+    let Some(table) = document
+        .get("azure-options")
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(());
+    };
+
+    let mut seen: IndexMap<AzureEndpointKey, &String> = IndexMap::new();
+    let mut reading: IndexMap<AzureHost, (&String, bool)> = IndexMap::new();
+    for written in table.keys() {
+        // An unparseable key is serde's error to report, not ours.
+        let Ok(key) = AzureEndpointKey::parse(written) else {
+            continue;
+        };
+        if let Some(first) = seen.insert(key.clone(), written) {
+            return Err(format!(
+                "`azure-options` names one endpoint twice: \"{first}\" and \"{written}\" are both \
+                 `{key}`"
+            ));
+        }
+
+        let host_style = matches!(key, AzureEndpointKey::HostStyle(_));
+        if let Some((first, first_host_style)) =
+            reading.insert(key.host().clone(), (written, host_style))
+            && first_host_style != host_style
+        {
+            return Err(format!(
+                "`azure-options` reads `{}` both ways: \"{first}\" and \"{written}\" disagree on \
+                 whether the storage account is the host's first label or a path segment",
+                key.host()
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Config for AzureOptionsMap {
@@ -231,6 +278,58 @@ mod tests {
             written_back.contains(&format!("[\"{looked_up}\"")),
             "{written} was written back as {written_back}"
         );
+    }
+
+    #[test]
+    fn a_document_naming_one_endpoint_twice_is_refused() {
+        for document in [
+            r#"
+[azure-options."acct.blob.example".auth]
+releases = false
+
+[azure-options."ACCT.blob.example.".auth]
+releases = true
+"#,
+            r#"
+[azure-options."proxy.internal/accta".auth]
+releases = false
+
+[azure-options."Proxy.Internal./accta".auth]
+releases = true
+"#,
+        ] {
+            let error = ensure_no_colliding_keys(&document.parse().unwrap())
+                .expect_err("a collision must be reported");
+            assert!(error.contains("names one endpoint twice"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_host_read_both_ways_is_refused() {
+        let document = r#"
+[azure-options."proxy.internal".auth]
+accta = true
+
+[azure-options."proxy.internal/accta".auth]
+general = true
+"#;
+        let error = ensure_no_colliding_keys(&document.parse().unwrap())
+            .expect_err("both readings of one host must be reported");
+        assert!(error.contains("proxy.internal"), "{error}");
+    }
+
+    /// Two accounts behind one proxy is the case the path-style key exists for, so
+    /// it must survive the walk.
+    #[test]
+    fn two_path_style_keys_on_one_host_are_allowed() {
+        let document = r#"
+[azure-options."proxy.internal/accta".auth]
+general = true
+
+[azure-options."proxy.internal/acctb".auth]
+general = true
+"#;
+        assert!(ensure_no_colliding_keys(&document.parse().unwrap()).is_ok());
     }
 
     /// A key runs up to the container and no further, so one naming a container

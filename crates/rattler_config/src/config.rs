@@ -446,6 +446,9 @@ where
     /// should surface these to the user as warnings (they are typos or
     /// keys of other tools).
     pub fn from_toml_str(input: &str) -> Result<(Self, BTreeSet<String>), toml::de::Error> {
+        azure::ensure_no_colliding_keys(&input.parse()?)
+            .map_err(serde::de::Error::custom::<String>)?;
+
         // The document is deserialized twice: once into the common
         // configuration and once into the extension. Each pass records the
         // keys it did not recognize; only keys unknown to *both* passes are

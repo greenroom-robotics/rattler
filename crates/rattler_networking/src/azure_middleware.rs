@@ -630,6 +630,23 @@ mod tests {
         }
     }
 
+    /// A host that carries no account label has no key, so nothing is granted and
+    /// the container segment decides nothing — refusing it would break an
+    /// anonymous fetch that Azure itself would have served.
+    #[test]
+    fn an_unkeyed_url_is_anonymous_whatever_its_first_segment_says() {
+        let middleware = middleware(HashMap::new());
+
+        for url in [
+            "az://127.0.0.1:10000/Conda_Channel/noarch/repodata.json",
+            "az://azurite/Conda_Channel/noarch/repodata.json",
+            "az://mirror/ab/noarch/repodata.json",
+            "az://localhost:8080/My_Repo/noarch/repodata.json",
+        ] {
+            assert_eq!(resolve(&middleware, url).grant, Grant::Ungranted, "{url}");
+        }
+    }
+
     #[test]
     fn rejects_userinfo() {
         let middleware = middleware(HashMap::new());

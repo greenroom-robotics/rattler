@@ -453,15 +453,21 @@ pub fn locate(
 
 /// The container a URL addresses under `key`, the one derivation there is.
 ///
-/// `Ok(None)` means the URL has no container segment, so there is nothing to
-/// attribute a grant to. `Err` means the segment is there but is not a name Azure
-/// allows, which is a malformed endpoint rather than an ungranted one.
+/// `Ok(None)` means there is nothing to attribute a grant to: the URL has no
+/// container segment, or no key, in which case no segment is the container. `Err`
+/// means the segment is there but is not a name Azure allows, which is a malformed
+/// endpoint rather than an ungranted one — and only reportable when a key matched,
+/// since that is the only case where a grant could otherwise be missed.
 fn container_after(
     channel: &AzureChannelUrl,
     key: Option<&AzureEndpointKey>,
 ) -> Result<Option<ContainerName>, AzureUrlError> {
-    let index = key.map_or(0, AzureEndpointKey::container_segment);
-    segment(channel, index).map(ContainerName::new).transpose()
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    segment(channel, key.container_segment())
+        .map(ContainerName::new)
+        .transpose()
 }
 
 fn segment(channel: &AzureChannelUrl, index: usize) -> Option<&str> {
@@ -777,6 +783,8 @@ impl AzureChannelUrl {
         // checked against the text the user wrote, because by the time `url` exists
         // the evidence is gone. One anywhere is enough: `/general/a/../../evil/x`
         // eats backwards into the container from a segment that reads as harmless.
+        // `\` is a separator to that parser as much as `/` is, so the written text
+        // is split on both: `/general\..\..\evil/x` climbs exactly as far.
         //
         // Nothing else about the path is this parser's business. Which blob a
         // well-formed path names is the user's to get right; only the segments that
@@ -787,7 +795,7 @@ impl AzureChannelUrl {
             "" => "/",
             path => path,
         };
-        for segment in written.trim_start_matches('/').split('/') {
+        for segment in written.trim_start_matches(['/', '\\']).split(['/', '\\']) {
             let decoded = percent_encoding::percent_decode_str(segment)
                 .decode_utf8()
                 .map_err(|source| AzureUrlError::NonUtf8Path {
@@ -1280,7 +1288,6 @@ mod tests {
                 &["proxy.internal/accta"],
             ),
             ("az://proxy.internal/accta/general", &["proxy.internal"]),
-            ("az://127.0.0.1:10000/devstoreaccount1/general", &[]),
             (
                 "az://127.0.0.1:10000/devstoreaccount1/general",
                 &["127.0.0.1:10000/devstoreaccount1"],
@@ -1323,7 +1330,7 @@ mod tests {
     fn an_unmatched_url_falls_back_to_host_style() {
         let anonymous = located("az://127.0.0.1:10000/devstoreaccount1/general", &[]);
         assert_eq!(anonymous.key(), None);
-        assert_eq!(anonymous.container(), Some(&container("devstoreaccount1")));
+        assert_eq!(anonymous.container(), None);
 
         let azure = located("az://acct.blob.core.windows.net/general/noarch", &[]);
         assert_eq!(azure.key(), Some(&key("acct.blob.core.windows.net")));
@@ -1360,6 +1367,52 @@ mod tests {
                 matches!(err, AzureUrlError::InvalidContainerName(_)),
                 "{url}: {err}"
             );
+        }
+    }
+
+    /// A `\` is a path separator to the parser that resolves dot segments, so a
+    /// traversal spelled with one climbs just as far as a `/`-spelled one.
+    #[test]
+    fn a_backslash_spelled_dot_segment_is_rejected() {
+        for input in [
+            r"az://acct.blob.core.windows.net/general\..\..\evil/x",
+            r"az://127.0.0.1:10000/devstoreaccount1/general\..\..\otheracct\othercontainer",
+            r"az://acct.blob.core.windows.net\general\.\noarch",
+        ] {
+            assert!(
+                matches!(
+                    AzureChannelUrl::parse(input),
+                    Err(AzureUrlError::DotSegmentInPath(_))
+                ),
+                "expected a rejection for {input}"
+            );
+        }
+
+        for written in [
+            r"proxy.internal/x\..\..\accta",
+            "proxy.internal/x/../../accta",
+        ] {
+            assert!(
+                AzureEndpointKey::parse(written).is_err(),
+                "expected a rejection for {written}"
+            );
+        }
+    }
+
+    /// Without a key nothing is granted, so a segment Azure would refuse as a
+    /// container is not this parse's business: refusing it turns an anonymous fetch
+    /// a user had working into a hard error.
+    #[test]
+    fn an_unkeyed_url_reports_no_container_rather_than_a_bad_one() {
+        for url in [
+            "az://127.0.0.1:10000/Conda_Channel/noarch/repodata.json",
+            "az://azurite/Conda_Channel/noarch/repodata.json",
+            "az://mirror/ab/noarch/repodata.json",
+            "az://localhost:8080/My_Repo/noarch/repodata.json",
+        ] {
+            let located = located(url, &[]);
+            assert_eq!(located.key(), None, "{url}");
+            assert_eq!(located.container(), None, "{url}");
         }
     }
 
