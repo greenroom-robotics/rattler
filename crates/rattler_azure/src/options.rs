@@ -123,6 +123,12 @@ impl Addressing {
             Addressing::PathStyle => 1,
         }
     }
+
+    /// How many leading path segments the account and container consume, and so
+    /// where a channel's root prefix starts.
+    pub(crate) fn segments_before_root(self) -> usize {
+        self.container_segment() + 1
+    }
 }
 
 impl From<bool> for Addressing {

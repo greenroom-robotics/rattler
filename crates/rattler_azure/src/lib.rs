@@ -773,16 +773,6 @@ pub fn azblob_config(
         Addressing::PathStyle => format!("{}://{authority}/{account}", endpoint_options.scheme),
     };
 
-    // Root prefix = the path after the segments the coordinates already consumed:
-    // the container, plus the account when path-style put it in the path. Skipping
-    // one too few there leaves the account segment inside `root`, so every blob is
-    // written one directory deeper than the channel actually lives — silently, and
-    // in the right container, which is what makes it hard to spot.
-    let consumed = match endpoint_options.addressing {
-        Addressing::HostStyle => 1,
-        Addressing::PathStyle => 2,
-    };
-
     // Percent-decode each segment: `path_segments()` yields still-encoded segments
     // and opendal percent-encodes `root + path` again, so passing them through
     // verbatim would double-encode a prefix containing a space or a `+`.
@@ -791,7 +781,7 @@ pub fn azblob_config(
         "/{}",
         channel
             .path_segments()
-            .skip(consumed)
+            .skip(endpoint_options.addressing.segments_before_root())
             // Infallible in practice: `AzureChannelUrl::parse` rejects a segment that
             // does not decode to UTF-8. Erroring rather than substituting U+FFFD is
             // what keeps that a guarantee instead of an assumption.

@@ -109,6 +109,12 @@ impl AzureMiddleware {
         Self::with_credential_provider(client, DefaultCredentialProvider::new(), options)
     }
 
+    /// Create a middleware that grants no host, so every `az://` request is sent
+    /// unsigned.
+    pub fn anonymous(client: Client) -> Self {
+        Self::new(client, [])
+    }
+
     fn with_credential_provider(
         client: Client,
         provider: impl ProvideCredential<Credential = Credential> + 'static,

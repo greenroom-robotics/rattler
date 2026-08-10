@@ -61,13 +61,9 @@ pub fn create_client_with_middleware(
     ));
     #[cfg(feature = "gcs")]
     let client = client.with(rattler_networking::GCSMiddleware::default());
-    // `az://` URLs carry the full blob endpoint, so the middleware needs no
-    // configuration to *reach* one — it just swaps the scheme. The empty options
-    // table means every `az://` fetch here is anonymous.
     #[cfg(feature = "azure")]
-    let client = client.with(rattler_networking::AzureMiddleware::new(
+    let client = client.with(rattler_networking::AzureMiddleware::anonymous(
         download_client,
-        [],
     ));
 
     Ok(client.build())

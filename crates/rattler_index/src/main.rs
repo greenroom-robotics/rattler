@@ -119,9 +119,8 @@ enum Commands {
     Azblob {
         /// The Azure Blob channel URL, e.g.
         /// `az://<account>.blob.core.windows.net/<container>/<channel>`.
-        ///
-        /// Not a wire `Url`: the wire scheme comes from the host's
-        /// `azure-options` entry, which is only read after clap has run.
+        // Not a wire `Url`: the wire scheme comes from the host's `azure-options`
+        // entry, which is only read after clap has run.
         channel: AzureChannelUrl,
 
         #[clap(flatten)]
@@ -164,12 +163,8 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::FileSystem { channel } => {
-            let target = channel
-                .canonicalize()
-                .unwrap_or_else(|_| channel.clone())
-                .to_string_lossy()
-                .into_owned();
-            let resolved = resolve_index_channel_config(&config, &target);
+            let resolved =
+                resolve_index_channel_config(&config, &IndexConfigKey::for_path(&channel));
             let (write_zst, write_shards, repodata_revisions, package_revision_assignment) =
                 effective_index_options(&resolved);
             let channel_metadata = ChannelMetadata::from_index_config(&resolved);
@@ -196,8 +191,8 @@ async fn main() -> anyhow::Result<()> {
             channel,
             mut credentials,
         } => {
-            let target = channel.to_string();
-            let resolved = resolve_index_channel_config(&config, &target);
+            let resolved =
+                resolve_index_channel_config(&config, &IndexConfigKey::for_url(&channel));
             let (write_zst, write_shards, repodata_revisions, package_revision_assignment) =
                 effective_index_options(&resolved);
             let channel_metadata = ChannelMetadata::from_index_config(&resolved);
@@ -246,11 +241,8 @@ async fn main() -> anyhow::Result<()> {
             channel,
             credentials,
         } => {
-            // `canonical()`, not the wire URL: `[index-config."az://…"]` is how a
-            // user keys an Azure channel, and matching the https spelling meant
-            // such a key never applied to anything.
-            let target = channel.canonical().to_string();
-            let resolved = resolve_index_channel_config(&config, &target);
+            let resolved =
+                resolve_index_channel_config(&config, &IndexConfigKey::for_azure(&channel));
             let (write_zst, write_shards, repodata_revisions, package_revision_assignment) =
                 effective_index_options(&resolved);
             let channel_metadata = ChannelMetadata::from_index_config(&resolved);
@@ -298,10 +290,40 @@ fn azure_endpoint(config: &Option<Config>, host: &AzureHost) -> AzureEndpoint {
         .unwrap_or_default()
 }
 
-fn resolve_index_channel_config(config: &Option<Config>, target: &str) -> IndexChannelConfig {
+/// The `[index-config."…"]` key a channel is looked up under.
+///
+/// Each backend builds it one way only, so a channel cannot be looked up under a
+/// spelling no user writes.
+struct IndexConfigKey(String);
+
+impl IndexConfigKey {
+    fn for_path(path: &std::path::Path) -> Self {
+        Self(
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    #[cfg(feature = "s3")]
+    fn for_url(url: &Url) -> Self {
+        Self(url.to_string())
+    }
+
+    #[cfg(feature = "azure")]
+    fn for_azure(channel: &AzureChannelUrl) -> Self {
+        Self(channel.canonical().to_string())
+    }
+}
+
+fn resolve_index_channel_config(
+    config: &Option<Config>,
+    key: &IndexConfigKey,
+) -> IndexChannelConfig {
     config
         .as_ref()
-        .map(|c| c.index_config.resolve(target))
+        .map(|c| c.index_config.resolve(&key.0))
         .unwrap_or_default()
 }
 
@@ -350,14 +372,12 @@ mod tests {
         let channel =
             AzureChannelUrl::parse("az://acct.blob.core.windows.net/general/mychannel").unwrap();
 
-        let resolved = resolve_index_channel_config(&config, channel.canonical().as_str());
-        assert_eq!(resolved.write_shards, Some(false));
-
-        let wire = channel.wire(AzureScheme::Https).to_string();
+        let key = IndexConfigKey::for_azure(&channel);
         assert_eq!(
-            resolve_index_channel_config(&config, &wire).write_shards,
-            None
+            resolve_index_channel_config(&config, &key).write_shards,
+            Some(false)
         );
+        assert_ne!(key.0, channel.wire(AzureScheme::Https).to_string());
     }
 
     /// All four fields are derived differently under path-style, and a wrong one
