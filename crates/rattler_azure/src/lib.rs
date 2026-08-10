@@ -273,6 +273,40 @@ impl std::fmt::Display for AccountHost {
     }
 }
 
+/// A host whose first path segment is the storage account it serves, which is the
+/// only addressing a host with no usable account label has.
+///
+/// Only [`new`](Self::new) builds one, so the segment has passed Azure's naming
+/// rules wherever it came from — a written config key or a channel URL's path.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AccountPath {
+    host: AzureHost,
+    account: AccountName,
+}
+
+impl AccountPath {
+    pub fn new(host: AzureHost, segment: &str) -> Result<Self, AzureUrlError> {
+        Ok(Self {
+            host,
+            account: AccountName::new(segment)?,
+        })
+    }
+
+    pub fn host(&self) -> &AzureHost {
+        &self.host
+    }
+
+    pub fn account(&self) -> &AccountName {
+        &self.account
+    }
+}
+
+impl std::fmt::Display for AccountPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.host, self.account)
+    }
+}
+
 /// The key of an `azure-options` entry: a channel URL prefix that runs up to, but
 /// not including, the container.
 ///
@@ -293,10 +327,7 @@ pub enum AzureEndpointKey {
     HostStyle(AccountHost),
 
     /// The account is the first path segment.
-    PathStyle {
-        host: AzureHost,
-        account: AccountName,
-    },
+    PathStyle(AccountPath),
 }
 
 impl AzureEndpointKey {
@@ -319,10 +350,7 @@ impl AzureEndpointKey {
             .collect::<Vec<_>>();
         match segments.as_slice() {
             [] => Self::host_style(channel.host()),
-            [account] => Ok(Self::PathStyle {
-                host: channel.host().clone(),
-                account: AccountName::new(account)?,
-            }),
+            [account] => Self::path_style(channel.host().clone(), account),
             _ => Err(AzureUrlError::InvalidKey(key.to_string())),
         }
     }
@@ -333,29 +361,29 @@ impl AzureEndpointKey {
         AccountHost::new(host.clone()).map(Self::HostStyle)
     }
 
+    /// The key for a URL whose first path segment names the account.
+    pub fn path_style(host: AzureHost, segment: &str) -> Result<Self, AzureUrlError> {
+        AccountPath::new(host, segment).map(Self::PathStyle)
+    }
+
     pub fn host(&self) -> &AzureHost {
         match self {
             Self::HostStyle(host) => host.host(),
-            Self::PathStyle { host, .. } => host,
+            Self::PathStyle(path) => path.host(),
         }
     }
 
     pub fn account(&self) -> &AccountName {
         match self {
             Self::HostStyle(host) => host.account(),
-            Self::PathStyle { account, .. } => account,
+            Self::PathStyle(path) => path.account(),
         }
-    }
-
-    /// The container `channel` addresses under this key.
-    pub fn container_in(&self, channel: &AzureChannelUrl) -> Result<ContainerName, AzureUrlError> {
-        container_after(channel, Some(self))?.ok_or(AzureUrlError::NoContainer)
     }
 
     fn container_segment(&self) -> usize {
         match self {
             Self::HostStyle(_) => 0,
-            Self::PathStyle { .. } => 1,
+            Self::PathStyle(_) => 1,
         }
     }
 
@@ -371,7 +399,7 @@ impl std::fmt::Display for AzureEndpointKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::HostStyle(host) => write!(f, "{host}"),
-            Self::PathStyle { host, account } => write!(f, "{host}/{account}"),
+            Self::PathStyle(path) => write!(f, "{path}"),
         }
     }
 }
@@ -398,18 +426,27 @@ impl From<AzureEndpointKey> for String {
     }
 }
 
-/// The `azure-options` entry a channel URL falls under, and the container it
+/// A channel URL, the `azure-options` entry it falls under, and the container it
 /// addresses under that entry.
 ///
-/// Both come out of one matched key, so they cannot disagree: the container is by
-/// definition the segment right after the key's prefix.
+/// All three come out of one matched key, so they cannot disagree: the container is
+/// by definition the segment right after the key's prefix, and the key is a prefix
+/// of this channel's own URL. It is the only currency the Azure paths pass around,
+/// because a key and a channel handed over separately can name different hosts —
+/// and the endpoint would then be built from one while the container and root came
+/// from the other.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AzureLocation {
+    channel: AzureChannelUrl,
     key: Option<AzureEndpointKey>,
     container: Option<ContainerName>,
 }
 
 impl AzureLocation {
+    pub fn channel(&self) -> &AzureChannelUrl {
+        &self.channel
+    }
+
     /// The key the URL matched, or the host-style key it falls back to.
     ///
     /// `None` when neither exists: an unconfigured IP literal names no account, so
@@ -418,9 +455,26 @@ impl AzureLocation {
         self.key.as_ref()
     }
 
-    /// `None` when the URL carries no container segment.
+    /// `None` when the URL carries no container segment, or no key that says which
+    /// segment the container is.
     pub fn container(&self) -> Option<&ContainerName> {
         self.container.as_ref()
+    }
+
+    /// The key and container a request has to name, or the reason the URL names
+    /// neither.
+    ///
+    /// The fetch path can send anonymously without either; anything that writes,
+    /// signs or builds an endpoint needs both.
+    pub fn addressed(&self) -> Result<(&AzureEndpointKey, &ContainerName), AzureUrlError> {
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| AzureUrlError::InvalidHost(self.channel.host().to_string()))?;
+        Ok((
+            key,
+            self.container.as_ref().ok_or(AzureUrlError::NoContainer)?,
+        ))
     }
 }
 
@@ -435,20 +489,73 @@ pub fn locate(
 ) -> Result<AzureLocation, AzureUrlError> {
     let host_style = AzureEndpointKey::host_style(channel.host()).ok();
     let path_style = segment(channel, 0)
-        .and_then(|segment| AccountName::new(segment).ok())
-        .map(|account| AzureEndpointKey::PathStyle {
-            host: channel.host().clone(),
-            account,
-        });
+        .and_then(|segment| AzureEndpointKey::path_style(channel.host().clone(), segment).ok());
 
     let key = [path_style, host_style.clone()]
         .into_iter()
         .flatten()
         .find(|key| configured(key))
         .or(host_style);
-    let container = container_after(channel, key.as_ref())?;
 
-    Ok(AzureLocation { key, container })
+    located(channel, key)
+}
+
+/// Locate a channel under the addressing the caller states outright.
+///
+/// For a caller with no `azure-options` table to match against, where the account's
+/// whereabouts is the one thing the URL cannot say: `az://proxy.internal/accta/…`
+/// reads as account `proxy` or account `accta` with equal justification.
+pub fn locate_as(
+    channel: &AzureChannelUrl,
+    addressing: AzureAddressing,
+) -> Result<AzureLocation, AzureUrlError> {
+    let key = match addressing {
+        AzureAddressing::HostStyle => AzureEndpointKey::host_style(channel.host())?,
+        AzureAddressing::PathStyle => AzureEndpointKey::path_style(
+            channel.host().clone(),
+            segment(channel, 0).unwrap_or_default(),
+        )?,
+    };
+    located(channel, Some(key))
+}
+
+/// The one place an [`AzureLocation`] is built.
+fn located(
+    channel: &AzureChannelUrl,
+    key: Option<AzureEndpointKey>,
+) -> Result<AzureLocation, AzureUrlError> {
+    let container = container_after(channel, key.as_ref())?;
+    Ok(AzureLocation {
+        channel: channel.clone(),
+        key,
+        container,
+    })
+}
+
+/// Where a caller with no configuration to match against says the storage account
+/// is.
+///
+/// Deliberately just the missing bit, not the account itself: the account is
+/// already at path segment 0 of the URL, and a caller naming it separately could
+/// contradict the URL and sign for a different account than the one addressed.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AzureAddressing {
+    /// The account is the host's first label.
+    #[default]
+    HostStyle,
+
+    /// The account is the first path segment.
+    PathStyle,
+}
+
+impl From<bool> for AzureAddressing {
+    fn from(path_style: bool) -> Self {
+        if path_style {
+            Self::PathStyle
+        } else {
+            Self::HostStyle
+        }
+    }
 }
 
 /// The container a URL addresses under `key`, the one derivation there is.
@@ -956,7 +1063,7 @@ fn strip_az_scheme(value: &str) -> Option<&str> {
 }
 
 /// Build an opendal [`AzblobConfig`](opendal::services::AzblobConfig) from a
-/// channel URL, the key it was matched under, its wire scheme and credentials.
+/// located channel, its wire scheme and credentials.
 ///
 /// opendal's azblob core builds every request URI as `{endpoint}/{container}/{path}`
 /// and carries no account field, so under a path-style key the account can only
@@ -973,20 +1080,20 @@ fn strip_az_scheme(value: &str) -> Option<&str> {
 #[cfg(feature = "opendal")]
 pub fn azblob_config(
     credentials: &AzureCredentials,
-    channel: &AzureChannelUrl,
-    key: &AzureEndpointKey,
+    location: &AzureLocation,
     scheme: AzureScheme,
 ) -> Result<opendal::services::AzblobConfig, AzureUrlError> {
-    let container = key.container_in(channel)?;
+    let (key, container) = location.addressed()?;
     let endpoint = format!("{scheme}://{key}");
 
     // Percent-decode each segment: `path_segments()` yields still-encoded segments
     // and opendal percent-encodes `root + path` again, so passing them through
     // verbatim would double-encode a prefix containing a space or a `+`.
-    // `container_in` has already confirmed the consumed segments exist.
+    // `addressed` has already confirmed the consumed segments exist.
     let root = format!(
         "/{}",
-        channel
+        location
+            .channel()
             .path_segments()
             .skip(key.segments_before_root())
             // Infallible in practice: `AzureChannelUrl::parse` rejects a segment that
@@ -1181,6 +1288,12 @@ mod tests {
         ContainerName::new(name).expect("test container name")
     }
 
+    /// Locate `url` path-style, the way a caller with no configuration states it.
+    fn path_style(url: &str) -> AzureLocation {
+        locate_as(&channel(url), AzureAddressing::PathStyle)
+            .unwrap_or_else(|err| panic!("{url} should locate path-style: {err}"))
+    }
+
     #[test]
     fn a_written_key_round_trips() {
         for (written, canonical) in [
@@ -1298,7 +1411,7 @@ mod tests {
                 panic!("{url} names a container");
             };
             let prefix = match located.key() {
-                Some(AzureEndpointKey::PathStyle { account, .. }) => format!("/{account}"),
+                Some(AzureEndpointKey::PathStyle(path)) => format!("/{}", path.account()),
                 Some(AzureEndpointKey::HostStyle(_)) | None => String::new(),
             };
             assert!(
@@ -1473,35 +1586,47 @@ mod tests {
         ] {
             let key = key(&format!("{host}/devstoreaccount1"));
             assert_eq!(key.account().as_str(), "devstoreaccount1", "{host}");
-            assert_eq!(
-                key.container_in(&channel(&format!(
-                    "az://{host}/devstoreaccount1/general/noarch"
-                )))
-                .unwrap(),
-                container("general"),
-                "{host}"
-            );
+
+            let located = locate_as(
+                &channel(&format!("az://{host}/devstoreaccount1/general/noarch")),
+                AzureAddressing::PathStyle,
+            )
+            .unwrap_or_else(|err| panic!("{host} should locate path-style: {err}"));
+            assert_eq!(located.addressed().unwrap(), (&key, &container("general")));
         }
     }
 
+    /// Stated addressing is not a promise the URL carries the segments it needs, so
+    /// `addressed` is where a URL short of the container is refused.
     #[test]
     fn a_url_short_of_the_container_has_none_to_address() {
-        for (written, url) in [
+        for (url, addressing) in [
             (
-                "127.0.0.1:10000/devstoreaccount1",
                 "az://127.0.0.1:10000/devstoreaccount1",
+                AzureAddressing::PathStyle,
             ),
-            ("127.0.0.1:10000/devstoreaccount1", "az://127.0.0.1:10000/"),
             (
-                "acct.blob.core.windows.net",
                 "az://acct.blob.core.windows.net",
+                AzureAddressing::HostStyle,
             ),
         ] {
-            assert!(matches!(
-                key(written).container_in(&channel(url)),
-                Err(AzureUrlError::NoContainer)
-            ));
+            let located =
+                locate_as(&channel(url), addressing).unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(located.container(), None, "{url}");
+            assert!(
+                matches!(located.addressed(), Err(AzureUrlError::NoContainer)),
+                "{url}"
+            );
         }
+
+        // Path-style over a URL with no first segment names no account at all.
+        assert!(matches!(
+            locate_as(
+                &channel("az://127.0.0.1:10000/"),
+                AzureAddressing::PathStyle
+            ),
+            Err(AzureUrlError::InvalidAccountName(_))
+        ));
     }
 
     /// A sloppy suffix match would accept hosts Microsoft does not operate and
@@ -1829,13 +1954,9 @@ mod tests {
     #[cfg(feature = "opendal")]
     #[test]
     fn azblob_config_under_path_style() {
-        let channel =
-            AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general/mychannel")
-                .unwrap();
         let config = azblob_config(
             &AzureCredentials::AccountKey("key".into()),
-            &channel,
-            &key("127.0.0.1:10000/devstoreaccount1"),
+            &path_style("az://127.0.0.1:10000/devstoreaccount1/general/mychannel"),
             AzureScheme::Http,
         )
         .unwrap();
@@ -1867,12 +1988,9 @@ mod tests {
     #[cfg(feature = "opendal")]
     #[test]
     fn azblob_config_path_style_without_a_prefix() {
-        let channel =
-            AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general").unwrap();
         let config = azblob_config(
             &AzureCredentials::SasToken("?sv=token".into()),
-            &channel,
-            &key("127.0.0.1:10000/devstoreaccount1"),
+            &path_style("az://127.0.0.1:10000/devstoreaccount1/general"),
             AzureScheme::Http,
         )
         .unwrap();
@@ -1885,13 +2003,12 @@ mod tests {
     #[cfg(feature = "opendal")]
     #[test]
     fn azblob_config_under_host_style_is_unchanged() {
-        let channel =
-            AzureChannelUrl::parse("az://stcondachannel.blob.core.windows.net/general/sub/dir")
-                .unwrap();
         let config = azblob_config(
             &AzureCredentials::SasToken("sv=token".into()),
-            &channel,
-            &key("stcondachannel.blob.core.windows.net"),
+            &located(
+                "az://stcondachannel.blob.core.windows.net/general/sub/dir",
+                &[],
+            ),
             AzureScheme::Https,
         )
         .unwrap();
@@ -1910,12 +2027,9 @@ mod tests {
     #[cfg(feature = "opendal")]
     #[test]
     fn azblob_config_decodes_the_root() {
-        let channel =
-            AzureChannelUrl::parse("az://acct.blob.core.windows.net/general/with%20space").unwrap();
         let config = azblob_config(
             &AzureCredentials::AccountKey("key".into()),
-            &channel,
-            &key("acct.blob.core.windows.net"),
+            &located("az://acct.blob.core.windows.net/general/with%20space", &[]),
             AzureScheme::Https,
         )
         .unwrap();

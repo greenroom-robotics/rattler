@@ -29,7 +29,7 @@ use opendal::layers::RetryLayer;
 use opendal::services::S3Config;
 use opendal::{Configurator, Operator, services::FsConfig};
 #[cfg(feature = "azure")]
-use rattler_azure::{AzureChannelUrl, AzureCredentials, AzureEndpointKey, AzureScheme};
+use rattler_azure::{AzureCredentials, AzureEndpointKey, AzureLocation, AzureScheme};
 use rattler_conda_types::{
     ChannelInfo, ChannelNotice, ChannelNotices, ChannelRelations, PackageRecord, PatchInstructions,
     Platform, RepoData, Shard, ShardedRepodata, ShardedSubdirInfo, UrlOrPath, V3Packages,
@@ -1526,13 +1526,11 @@ pub async fn index_s3_with_channel_metadata(
 /// Configuration for `index_azure`
 #[cfg(feature = "azure")]
 pub struct IndexAzureConfig {
-    /// The channel to index.
-    pub channel: AzureChannelUrl,
+    /// The channel to index, with the `azure-options` entry it falls under and the
+    /// container it addresses under that entry.
+    pub location: AzureLocation,
     /// The credentials to use for Azure Blob access.
     pub credentials: AzureCredentials,
-    /// The `azure-options` key the channel was matched under, which says where
-    /// its storage account and container are.
-    pub key: AzureEndpointKey,
     /// The wire scheme requests are sent over.
     pub scheme: AzureScheme,
     /// The target platform to index.
@@ -1572,9 +1570,8 @@ pub async fn index_azure(config: IndexAzureConfig) -> anyhow::Result<()> {
 #[cfg(feature = "azure")]
 pub async fn index_azure_with_channel_metadata(
     IndexAzureConfig {
-        channel,
+        location,
         credentials,
-        key,
         scheme,
         target_platform,
         repodata_patch,
@@ -1588,11 +1585,10 @@ pub async fn index_azure_with_channel_metadata(
     }: IndexAzureConfig,
     channel_metadata: ChannelMetadata,
 ) -> anyhow::Result<()> {
-    let azblob_config = rattler_azure::azblob_config(&credentials, &channel, &key, scheme)?;
-    // The container every request below is aimed at. `azblob_config` has already
-    // derived it, but it keeps it to itself and an opendal error names neither it
-    // nor the account.
-    let container = key.container_in(&channel)?;
+    let azblob_config = rattler_azure::azblob_config(&credentials, &location, scheme)?;
+    // The key and container every request below is aimed at. `azblob_config` reads
+    // the same pair, but an opendal error names neither it nor the account.
+    let (key, container) = location.addressed()?;
     let builder = azblob_config.into_builder();
     // opendal's default retry interceptor logs the error with its `url` context,
     // and for a SAS the credential is *in* that URL — once per retry, at warn
@@ -1620,7 +1616,7 @@ pub async fn index_azure_with_channel_metadata(
     // blob. Ask once here, where the answer can still be attributed to the
     // container and account the run was pointed at.
     if let Err(e) = op.list_with("").await {
-        return Err(explain_azure_error(e, &key, &container));
+        return Err(explain_azure_error(e, key, container));
     }
 
     index_with_channel_metadata(
@@ -1639,7 +1635,7 @@ pub async fn index_azure_with_channel_metadata(
     )
     .await
     .map(|_| ())
-    .map_err(|e| annotate_azure_failure(e, &key, &container))
+    .map_err(|e| annotate_azure_failure(e, key, container))
 }
 
 /// Explains an opendal error in terms of the account and container the request
@@ -1666,17 +1662,27 @@ fn explain_azure_error(
 }
 
 /// A 403 part-way through a run is usually a SAS that expired under the index,
-/// since nothing renews one mid-run.
+/// since nothing renews one mid-run. A 403 on the first request is as likely to be
+/// the wrong account: under host-style addressing the account was never written
+/// down, it was read off the host, and signing canonicalizes over whatever it read.
 #[cfg(feature = "azure")]
 fn azure_permission_denied_hint(
     key: &AzureEndpointKey,
     container: &rattler_azure::ContainerName,
 ) -> String {
     let account = key.account();
+    let addressing = match key {
+        AzureEndpointKey::HostStyle(_) => format!(
+            "; `{account}` was taken from the host's first label, so if the account is a path \
+             segment instead, name the endpoint `{}/<account>`",
+            key.host()
+        ),
+        AzureEndpointKey::PathStyle(_) => String::new(),
+    };
     format!(
         "access to container `{container}` in account `{account}` was denied; a SAS minted by \
          `--azure-cli` expires after `--azure-cli-sas-ttl-minutes` (30 by default) and is not \
-         renewed mid-run, so a long index can outlive it"
+         renewed mid-run, so a long index can outlive it{addressing}"
     )
 }
 
@@ -2048,18 +2054,16 @@ mod tests {
     #[cfg(feature = "azure")]
     #[test]
     fn azblob_config_preserves_non_default_port() {
-        let channel =
-            AzureChannelUrl::parse("az://devstoreaccount1.blob.localhost:10000/testcontainer/ch")
-                .unwrap();
-        let credentials = AzureCredentials::AccountKey("key".into());
-
-        let config = rattler_azure::azblob_config(
-            &credentials,
-            &channel,
-            &AzureEndpointKey::parse("devstoreaccount1.blob.localhost:10000").unwrap(),
-            AzureScheme::Http,
+        let channel = rattler_azure::AzureChannelUrl::parse(
+            "az://devstoreaccount1.blob.localhost:10000/testcontainer/ch",
         )
         .unwrap();
+        let location =
+            rattler_azure::locate_as(&channel, rattler_azure::AzureAddressing::HostStyle).unwrap();
+        let credentials = AzureCredentials::AccountKey("key".into());
+
+        let config =
+            rattler_azure::azblob_config(&credentials, &location, AzureScheme::Http).unwrap();
 
         assert_eq!(
             config.endpoint.as_deref(),

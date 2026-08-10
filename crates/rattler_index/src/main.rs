@@ -5,7 +5,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::Verbosity;
 #[cfg(feature = "azure")]
-use rattler_azure::{AzureChannelUrl, AzureEndpointKey, AzureScheme};
+use rattler_azure::{AzureChannelUrl, AzureEndpointKey, AzureLocation, AzureScheme};
 use rattler_conda_types::Platform;
 use rattler_config::config::{
     concurrency::default_max_concurrent_solves, index::IndexChannelConfig,
@@ -247,17 +247,16 @@ async fn main() -> anyhow::Result<()> {
                 effective_index_options(&resolved);
             let channel_metadata = ChannelMetadata::from_index_config(&resolved);
 
-            let (key, scheme) = azure_endpoint(&config, &channel)?;
+            let (location, scheme) = azure_endpoint(&config, &channel)?;
 
             let credentials = credentials
-                .resolve(AZURE_INDEX_SAS_PERMISSIONS, &channel, &key, scheme)
+                .resolve(AZURE_INDEX_SAS_PERMISSIONS, &location, scheme)
                 .await?;
 
             index_azure_with_channel_metadata(
                 IndexAzureConfig {
-                    channel,
+                    location,
                     credentials,
-                    key,
                     scheme,
                     target_platform: cli.target_platform,
                     repodata_patch: cli.repodata_patch,
@@ -290,22 +289,22 @@ async fn main() -> anyhow::Result<()> {
 fn azure_endpoint(
     config: &Option<Config>,
     channel: &AzureChannelUrl,
-) -> anyhow::Result<(AzureEndpointKey, AzureScheme)> {
+) -> anyhow::Result<(AzureLocation, AzureScheme)> {
     let located = rattler_azure::locate(channel, |key| {
         config
             .as_ref()
             .is_some_and(|config| config.azure_options.contains(key))
     })?;
+    // Re-derived only for the error, which names the key to add.
     let key = match located.key() {
         Some(key) => key.clone(),
-        // Re-derived only for the error, which names the key to add.
         None => AzureEndpointKey::host_style(channel.host())?,
     };
     let scheme = config
         .as_ref()
         .map(|config| config.azure_options.get(&key).scheme())
         .unwrap_or_default();
-    Ok((key, scheme))
+    Ok((located, scheme))
 }
 
 /// The `[index-config."…"]` key a channel is looked up under.
@@ -413,13 +412,14 @@ mod tests {
             AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general/mychannel")
                 .unwrap();
 
-        let (key, scheme) = azure_endpoint(&config, &channel).unwrap();
+        let (location, scheme) = azure_endpoint(&config, &channel).unwrap();
         assert_eq!(scheme, AzureScheme::Http);
+        let (key, container) = location.addressed().unwrap();
         assert_eq!(
             key,
-            AzureEndpointKey::parse("127.0.0.1:10000/devstoreaccount1").unwrap()
+            &AzureEndpointKey::parse("127.0.0.1:10000/devstoreaccount1").unwrap()
         );
-        assert_eq!(key.container_in(&channel).unwrap().as_str(), "general");
+        assert_eq!(container.as_str(), "general");
     }
 
     /// Without an entry the same channel is read host-style, and an IP literal

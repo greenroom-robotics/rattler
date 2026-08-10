@@ -435,6 +435,16 @@ pub struct AzureOpts {
     #[arg(short, long, env = "AZURE_CHANNEL")]
     pub channel: rattler_azure::AzureChannelUrl,
 
+    /// Read the storage account from the channel URL's first path segment rather
+    /// than the host's first label.
+    ///
+    /// Needed for an endpoint that fronts an account instead of being named after
+    /// one — an IP literal, a single-label host, the Azurite emulator. The account
+    /// itself is not a flag: it is already at path segment 0 of the channel URL, and
+    /// naming it twice would let the two disagree.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub path_style: bool,
+
     #[clap(flatten)]
     pub credentials: rattler_azure::clap::AzureCredentialsOpts,
 
@@ -639,6 +649,46 @@ impl CondaForgeData {
 mod test {
     use super::{AzureOpts, ForceOverwrite};
     use clap::Parser;
+
+    /// The flag is the only thing that says where the account is, and getting it
+    /// wrong signs over a resource that does not exist.
+    #[test]
+    fn test_azure_path_style_selects_the_account_from_the_path() {
+        let args = [
+            "az",
+            "--channel",
+            "az://proxy.internal/accta/general/mychannel",
+        ];
+
+        let host_style = AzureOpts::try_parse_from(args).unwrap();
+        assert!(!host_style.path_style);
+        let located =
+            rattler_azure::locate_as(&host_style.channel, host_style.path_style.into()).unwrap();
+        assert_eq!(located.addressed().unwrap().0.account().as_str(), "proxy");
+
+        let path_style = AzureOpts::try_parse_from(args.iter().chain(["--path-style"].iter()))
+            .expect("--path-style should parse");
+        assert!(path_style.path_style);
+        let located =
+            rattler_azure::locate_as(&path_style.channel, path_style.path_style.into()).unwrap();
+        let (key, container) = located.addressed().unwrap();
+        assert_eq!(key.account().as_str(), "accta");
+        assert_eq!(key.to_string(), "proxy.internal/accta");
+        assert_eq!(container.as_str(), "general");
+    }
+
+    /// An endpoint that names no account in its host is unaddressable without the
+    /// flag, and says so rather than signing for a first label that is not one.
+    #[test]
+    fn test_azure_host_style_refuses_a_host_with_no_account_label() {
+        let opts = AzureOpts::try_parse_from([
+            "az",
+            "--channel",
+            "az://127.0.0.1:10000/devstoreaccount1/general",
+        ])
+        .unwrap();
+        assert!(rattler_azure::locate_as(&opts.channel, opts.path_style.into()).is_err());
+    }
 
     #[test]
     fn test_azure_force_parses_as_a_flag() {

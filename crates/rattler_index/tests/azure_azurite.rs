@@ -66,6 +66,12 @@ fn azurite_key() -> AzureEndpointKey {
         .expect("azurite authority and account name")
 }
 
+/// The emulator's channels, located under [`azurite_key`].
+fn azurite_location(channel: &AzureChannelUrl) -> rattler_azure::AzureLocation {
+    rattler_azure::locate_as(channel, rattler_azure::AzureAddressing::PathStyle)
+        .expect("azurite path-style location")
+}
+
 /// The `azure-options` entry for the emulator. Its grant on `CONTAINER` is only
 /// for the signing client below: `index_azure` signs with the credential it is
 /// handed and never reads a grant.
@@ -82,8 +88,7 @@ fn azurite_options() -> AzureEndpointOptions {
 fn production_operator(channel: &AzureChannelUrl) -> Operator {
     let config = rattler_azure::azblob_config(
         &AzureCredentials::AccountKey(ACCOUNT_KEY.into()),
-        channel,
-        &azurite_key(),
+        &azurite_location(channel),
         azurite_options().scheme(),
     )
     .expect("azblob config for an azurite path-style channel");
@@ -187,9 +192,8 @@ async fn with_azurite_credentials<F: Future<Output = ()>>(body: F) {
 
 fn index_config(channel: AzureChannelUrl) -> IndexAzureConfig {
     IndexAzureConfig {
-        channel,
+        location: azurite_location(&channel),
         credentials: AzureCredentials::AccountKey(ACCOUNT_KEY.into()),
-        key: azurite_key(),
         scheme: azurite_options().scheme(),
         target_platform: None,
         repodata_patch: None,

@@ -7,7 +7,7 @@ use futures::StreamExt;
 use miette::IntoDiagnostic;
 use opendal::{Configurator, ErrorKind};
 use rattler_azure::{
-    AccountName, AzureChannelUrl, AzureCredentials, AzureEndpointKey, AzureScheme, ContainerName,
+    AccountName, AzureChannelUrl, AzureCredentials, AzureLocation, AzureScheme, ContainerName,
 };
 
 use crate::upload::{
@@ -26,24 +26,22 @@ pub(crate) const AZURE_UPLOAD_SAS_PERMISSIONS: &str = "rcw";
 
 /// Uploads packages to a channel in an Azure Blob Storage container.
 ///
-/// The account name, endpoint, container and root prefix come from the channel
-/// URL and `key` (see `azblob_config`). A path-style key is what makes an IP,
-/// single-label or Azurite endpoint uploadable.
+/// The account name, endpoint, container and root prefix all come from `location`
+/// (see `azblob_config`). A path-style location is what makes an IP, single-label
+/// or Azurite endpoint uploadable.
 pub async fn upload_package_to_azure(
-    channel: AzureChannelUrl,
+    location: &AzureLocation,
     credentials: AzureCredentials,
-    key: &AzureEndpointKey,
     scheme: AzureScheme,
     package_files: &[PathBuf],
     force: ForceOverwrite,
 ) -> miette::Result<()> {
-    let config =
-        rattler_azure::azblob_config(&credentials, &channel, key, scheme).into_diagnostic()?;
+    let config = rattler_azure::azblob_config(&credentials, location, scheme).into_diagnostic()?;
 
-    // The container the requests below are aimed at. `azblob_config` has already
-    // derived it, but it keeps it to itself, and an opendal error names neither it
-    // nor the account.
-    let container = key.container_in(&channel).into_diagnostic()?;
+    // The key and container the requests below are aimed at. `azblob_config` reads
+    // the same pair, but an opendal error names neither it nor the account.
+    let (key, container) = location.addressed().into_diagnostic()?;
+    let channel = location.channel();
 
     let builder = config.into_builder();
     let op = BlobStore::new(builder).into_diagnostic()?;
@@ -56,8 +54,6 @@ pub async fn upload_package_to_azure(
     let outcomes: Vec<(PathBuf, miette::Result<()>)> = futures::stream::iter(package_files.iter())
         .map(|package_file| {
             let op = op.clone();
-            let channel = &channel;
-            let container = &container;
             async move {
                 let result = upload_single_package(
                     &op,
@@ -226,10 +222,21 @@ mod test {
         AzureChannelUrl::parse("az://account.blob.core.windows.net/container/prefix").unwrap()
     }
 
-    /// The key `test_channel` falls under, which carries the account the channel's
-    /// host names.
-    fn test_key() -> rattler_azure::AzureEndpointKey {
-        rattler_azure::AzureEndpointKey::host_style(test_channel().host()).unwrap()
+    /// The location `test_channel` falls under, read host-style as the upload CLI
+    /// reads one by default.
+    fn test_location() -> rattler_azure::AzureLocation {
+        rattler_azure::locate_as(&test_channel(), rattler_azure::AzureAddressing::HostStyle)
+            .unwrap()
+    }
+
+    fn test_account() -> rattler_azure::AccountName {
+        let location = test_location();
+        location.addressed().unwrap().0.account().clone()
+    }
+
+    fn test_container() -> rattler_azure::ContainerName {
+        let location = test_location();
+        location.addressed().unwrap().1.clone()
     }
 
     fn package_key() -> String {
@@ -254,8 +261,8 @@ mod test {
         upload_single_package(
             &op,
             &channel,
-            test_key().account(),
-            &test_key().container_in(&test_channel()).unwrap(),
+            &test_account(),
+            &test_container(),
             &package,
             ForceOverwrite(true),
         )
@@ -265,8 +272,8 @@ mod test {
         let err = upload_single_package(
             &op,
             &channel,
-            test_key().account(),
-            &test_key().container_in(&test_channel()).unwrap(),
+            &test_account(),
+            &test_container(),
             &package,
             ForceOverwrite(false),
         )
@@ -284,8 +291,8 @@ mod test {
         upload_single_package(
             &op,
             &test_channel(),
-            test_key().account(),
-            &test_key().container_in(&test_channel()).unwrap(),
+            &test_account(),
+            &test_container(),
             &test_package_path(),
             ForceOverwrite(false),
         )
@@ -305,8 +312,8 @@ mod test {
         upload_single_package(
             &op,
             &test_channel(),
-            test_key().account(),
-            &test_key().container_in(&test_channel()).unwrap(),
+            &test_account(),
+            &test_container(),
             &test_package_path(),
             ForceOverwrite(false),
         )
