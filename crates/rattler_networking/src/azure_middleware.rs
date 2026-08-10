@@ -76,9 +76,8 @@ enum Signers {
 /// The account and container a request addresses, and whether it may be signed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Grant {
-    /// Send unsigned. Carries the coordinates when the URL resolved to a pair, for
-    /// the 404 hint.
-    Ungranted(Option<AzureCoordinates>),
+    /// Send unsigned.
+    Ungranted,
     Granted(AzureCoordinates),
 }
 
@@ -227,7 +226,7 @@ impl AzureMiddleware {
         let options = entry.fetch(coordinates.as_ref());
         let grant = match coordinates {
             Some(coordinates) if options.auth.is_granted() => Grant::Granted(coordinates),
-            coordinates => Grant::Ungranted(coordinates),
+            _ => Grant::Ungranted,
         };
 
         Ok(Resolved {
@@ -268,7 +267,7 @@ impl AzureMiddleware {
         }
 
         let container = match grant {
-            Grant::Ungranted(_) => {
+            Grant::Ungranted => {
                 // The authority, not `host_str()`: a message naming a host the user
                 // could act on must carry the port, or it names a host that is not
                 // the one in their config.
@@ -376,53 +375,19 @@ impl Middleware for AzureMiddleware {
 
         let response = next.run(req, extensions).await?;
 
-        if let Grant::Ungranted(container) = &grant
+        if let Grant::Ungranted = &grant
             && response.status() == http::StatusCode::NOT_FOUND
-            && first_404_for(channel.host(), container.as_ref())
         {
-            if let Some(container) = container {
-                tracing::warn!(
-                    "`{}` returned 404 and container `{container}` has no `azure-options` auth \
-                     grant. Azure answers an anonymous read of a *private* container with 404 \
-                     rather than 403, so a missing grant looks exactly like a missing file. If \
-                     the container is private, grant it in your user configuration with \
-                     `[azure-options.\"{}\".auth]` and `{container} = true`.",
-                    channel.canonical(),
-                    channel.host()
-                );
-            } else {
-                tracing::warn!(
-                    "`{}` returned 404 and names no container, so no `azure-options` auth grant \
-                     can apply to it. Azure answers an anonymous read of a *private* container \
-                     with 404 rather than 403, so a missing grant looks exactly like a missing \
-                     file. Check that the URL names a container, and that \
-                     `[azure-options.\"{}\"]` spells `path-style` the way this endpoint expects \
-                     — under path-style the container is the second path segment, not the first.",
-                    channel.canonical(),
-                    channel.host()
-                );
-            }
+            tracing::warn!(
+                "404 from `{}`, which has no `azure-options` auth grant; Azure answers an \
+                 unauthorized read of a private container with 404, so grant the container if it \
+                 is private",
+                channel.canonical()
+            );
         }
 
         Ok(response)
     }
-}
-
-/// Whether this container still owes the 404 hint, claiming it if so.
-///
-/// A 404 is the *normal* answer to plenty of requests a healthy public channel
-/// makes: the repodata gateway probes for a shard index under every subdir, and a
-/// non-sharded channel misses every time. Per container and not per host, because
-/// the line to add differs per container. A URL naming no container gets one hint
-/// of its own per host.
-fn first_404_for(host: &AzureHost, coordinates: Option<&AzureCoordinates>) -> bool {
-    type Hinted = std::collections::HashSet<(AzureHost, Option<AzureCoordinates>)>;
-    static HINTED: std::sync::LazyLock<std::sync::Mutex<Hinted>> =
-        std::sync::LazyLock::new(Default::default);
-    HINTED
-        .lock()
-        .expect("the 404-hint set is never held across a panic")
-        .insert((host.clone(), coordinates.cloned()))
 }
 
 #[cfg(test)]
@@ -564,11 +529,11 @@ mod tests {
             ),
             (
                 "az://mycompany.blob.core.windows.net/public/x.json",
-                Grant::Ungranted(Some(container("public"))),
+                Grant::Ungranted,
             ),
             (
                 "az://mycompany.blob.core.windows.net/staging/x.json",
-                Grant::Ungranted(Some(container("staging"))),
+                Grant::Ungranted,
             ),
         ] {
             assert_eq!(resolve(&middleware, url).grant, expected, "{url}");
@@ -604,7 +569,7 @@ mod tests {
             &host_style,
             "az://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json",
         );
-        assert_eq!(resolved.grant, Grant::Ungranted(None));
+        assert_eq!(resolved.grant, Grant::Ungranted);
     }
 
     #[test]
@@ -619,11 +584,7 @@ mod tests {
             "az://mycompany.blob.core.windows.net/",
             "az://mycompany.blob.core.windows.net/?comp=list",
         ] {
-            assert_eq!(
-                resolve(&middleware, url).grant,
-                Grant::Ungranted(None),
-                "{url}"
-            );
+            assert_eq!(resolve(&middleware, url).grant, Grant::Ungranted, "{url}");
         }
     }
 
@@ -734,12 +695,7 @@ mod tests {
         let channel = channel_of(&req);
 
         middleware
-            .sign(
-                &mut req,
-                &Grant::Ungranted(None),
-                &channel,
-                AzureScheme::Https,
-            )
+            .sign(&mut req, &Grant::Ungranted, &channel, AzureScheme::Https)
             .await
             .expect("an ungranted request must pass through unsigned");
 
@@ -1001,77 +957,18 @@ mod tests {
 
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn the_404_hint_names_the_config_block_for_an_ungranted_container() {
+    async fn a_404_for_an_ungranted_container_warns() {
         let host = spawn_404_server().await;
         let middleware = middleware(options(&host.to_string(), emulator_entry([])));
 
         assert_eq!(get_az(middleware, &host, "general").await, 404);
 
-        assert!(logs_contain(&format!("[azure-options.\"{host}\".auth]")));
-        assert!(logs_contain("general = true"));
-    }
-
-    /// A URL naming no container cannot be fixed by granting one, so its hint points
-    /// at the URL and the host's addressing instead.
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn the_404_hint_for_a_container_less_url_points_at_the_addressing() {
-        let host = spawn_404_server().await;
-        let middleware = middleware(options(&host.to_string(), emulator_entry([])));
-
-        let status = reqwest_middleware::ClientBuilder::new(Client::new())
-            .with(middleware)
-            .build()
-            .get(format!("az://{host}/"))
-            .send()
-            .await
-            .expect("request through azure middleware failed")
-            .status();
-        assert_eq!(status, 404);
-
-        assert!(logs_contain("names no container"));
-        assert!(logs_contain("path-style"));
+        assert!(logs_contain("azure-options"));
     }
 
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn the_404_hint_is_emitted_once_per_container() {
-        let host = spawn_404_server().await;
-        let client = reqwest_middleware::ClientBuilder::new(Client::new())
-            .with(middleware(options(&host.to_string(), emulator_entry([]))))
-            .build();
-
-        for container in ["general", "staging"] {
-            for subdir in ["noarch", "linux-64", "osx-64"] {
-                let status = client
-                    .get(format!(
-                        "az://{host}/devstoreaccount1/{container}/{subdir}/\
-                         repodata_shards.msgpack.zst"
-                    ))
-                    .send()
-                    .await
-                    .expect("request through azure middleware failed")
-                    .status();
-                assert_eq!(status, 404);
-            }
-        }
-
-        for container in ["general", "staging"] {
-            logs_assert(move |lines: &[&str]| {
-                let hints = lines
-                    .iter()
-                    .filter(|line| line.contains(&format!("{container} = true")))
-                    .count();
-                (hints == 1).then_some(()).ok_or_else(|| {
-                    format!("expected exactly one hint for {container}, got {hints}")
-                })
-            });
-        }
-    }
-
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn the_404_hint_is_silent_for_a_granted_container() {
+    async fn a_404_for_a_granted_container_is_silent() {
         use reqsign_azure_storage::StaticCredentialProvider;
 
         let host = spawn_404_server().await;
