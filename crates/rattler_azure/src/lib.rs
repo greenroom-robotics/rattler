@@ -49,16 +49,10 @@ pub enum AzureUrlError {
 
     /// Host-style addressing was requested but the host has no account label: it
     /// is an IP literal, or a domain with only one label.
-    ///
-    /// The fix is a config line rather than a URL change, so the message names
-    /// that line. The host is spelled the way [`AzureHost`] spells it, which is
-    /// how the config table is keyed, so a key copied out of this message matches.
     #[error(
         "Azure blob URL host `{0}` is not a dotted domain of the form `<account>.blob.<suffix>`, \
-         so its first label cannot be a storage account. Such a host needs path-style addressing, \
-         where the storage account is the first path segment instead; that is not selectable from \
-         configuration yet, and will be enabled by `[azure-options.\"{0}\"]` with \
-         `path-style = true`"
+         so its first label cannot be a storage account; such a host needs path-style addressing, \
+         where the storage account is the first path segment instead"
     )]
     InvalidHost(String),
 
@@ -310,8 +304,7 @@ impl From<AzureCoordinates> for String {
 ///   IP literals and single-label hosts fail with
 ///   [`AzureUrlError::InvalidHost`].
 /// - [`Addressing::PathStyle`]: account is the first path segment, container the
-///   second. On a host under a known Azure Blob suffix this only warns, since the
-///   suffix list cannot cover a proxy or a private endpoint.
+///   second.
 ///
 /// Both derived names are held to Azure's naming rules under both styles, since
 /// path-style takes the account from user-controlled path text.
@@ -330,23 +323,10 @@ pub fn account_and_container(
                 .ok_or_else(|| AzureUrlError::InvalidHost(host.to_string()))?;
             (account, container_segment()?)
         }
-        Addressing::PathStyle => {
-            if host.is_known_azure_blob_endpoint() {
-                tracing::warn!(
-                    "`path-style = true` is set for `{host}`, which is a real Azure Blob endpoint \
-                     addressed host-style: its storage account is `{}`, not the first path \
-                     segment. Requests still come out identical, but anything that needs the \
-                     account on its own — minting a user-delegation SAS, for one — will use the \
-                     path segment instead. Remove `path-style = true` from \
-                     `[azure-options.\"{host}\"]` unless you meant it",
-                    host.account_label().unwrap_or("<none>"),
-                );
-            }
-            (
-                segment(channel, 0).ok_or(AzureUrlError::NoAccount)?,
-                container_segment()?,
-            )
-        }
+        Addressing::PathStyle => (
+            segment(channel, 0).ok_or(AzureUrlError::NoAccount)?,
+            container_segment()?,
+        ),
     };
 
     Ok(AzureCoordinates {
@@ -525,20 +505,6 @@ impl AzureHost {
         self.port
     }
 
-    /// This host with its port dropped, when it carries one that `scheme` reaches
-    /// by default.
-    ///
-    /// `host` and `host:443` name the same endpoint over https, but not over http,
-    /// so the two spellings can only be collapsed by something holding the scheme.
-    /// A grant written either way must match a URL written the other, since a
-    /// missed grant is reported by Azure as a 404 rather than as an auth failure.
-    pub fn without_default_port(&self, scheme: AzureScheme) -> Option<Self> {
-        (self.port? == scheme.default_port()).then(|| Self {
-            host: self.host.clone(),
-            port: None,
-        })
-    }
-
     /// The storage account label under host-style addressing.
     ///
     /// `None` whenever the host cannot carry an account name. The stored
@@ -562,10 +528,9 @@ impl AzureHost {
     /// Whether this host sits under a suffix Microsoft operates, where the account
     /// is by definition the first label.
     ///
-    /// Advisory only, never a security boundary: it exists to warn about a
-    /// `path-style = true` that cannot be what the user meant. A proxy or private
-    /// endpoint in front of real Azure answers `false`, so a `false` proves
-    /// nothing.
+    /// A `true` is the only evidence that a host is really Azure, which is what
+    /// gates the ambient credential chain. A proxy or private endpoint in front of
+    /// real Azure answers `false`, so a `false` proves nothing.
     pub fn is_known_azure_blob_endpoint(&self) -> bool {
         const SUFFIXES: &[&str] = &[
             "blob.core.windows.net",
@@ -1320,30 +1285,8 @@ mod tests {
         }
     }
 
-    #[test]
-    #[tracing_test::traced_test]
-    fn path_style_on_a_real_azure_host_warns_and_proceeds() {
-        let coords = account_and_container(
-            &channel("az://acct.blob.core.windows.net/general/mychannel"),
-            Addressing::PathStyle,
-        )
-        .expect("addressing is the user's call, so this is a warning and not an error");
-        assert_eq!(coords.account.as_str(), "general");
-
-        assert!(logs_contain("path-style = true"));
-        assert!(logs_contain("acct.blob.core.windows.net"));
-
-        let coords = account_and_container(
-            &channel("az://acct.blob.example.com/devstoreaccount1/general"),
-            Addressing::PathStyle,
-        )
-        .unwrap();
-        assert_eq!(coords.account.as_str(), "devstoreaccount1");
-        assert!(!logs_contain("acct.blob.example.com"));
-    }
-
-    /// A sloppy suffix match would warn about hosts Microsoft does not operate and
-    /// stay silent on ones it does.
+    /// A sloppy suffix match would accept hosts Microsoft does not operate and
+    /// reject ones it does.
     #[test]
     fn known_azure_endpoints_are_matched_on_a_label_boundary() {
         for host in [
@@ -1375,35 +1318,26 @@ mod tests {
         }
     }
 
-    /// Host-style must reject hosts it cannot derive an account from, and the
-    /// rejection must name a config key that would actually match: port included,
-    /// host spelled the way [`AzureHost`] spells it.
+    /// Host-style must reject hosts it cannot derive an account from.
     #[test]
-    fn host_style_rejects_undottable_hosts_with_a_guided_error() {
-        for (host, expected_key) in [
-            ("127.0.0.1:10000", "127.0.0.1:10000"),
-            ("azurite:10000", "azurite:10000"),
-            ("localhost", "localhost"),
-            ("[::1]:10000", "[::1]:10000"),
+    fn host_style_rejects_undottable_hosts() {
+        for host in [
+            "127.0.0.1:10000",
+            "azurite:10000",
+            "localhost",
+            "[::1]:10000",
             // A trailing dot is the DNS root label, not a second label: this host
             // must not sneak past the dotted-domain gate.
-            ("localhost.", "localhost"),
-            ("LocalHost", "localhost"),
-            // A port equal to a wire scheme's default: it is part of the key, and
-            // only survives because the channel — not a `Url` — is what is read.
-            ("azurite:443", "azurite:443"),
-            ("azurite:80", "azurite:80"),
+            "localhost.",
+            "LocalHost",
+            "azurite:443",
+            "azurite:80",
         ] {
             let channel = channel(&format!("az://{host}/devstoreaccount1/general"));
             let err = account_and_container(&channel, Addressing::HostStyle)
                 .expect_err("host-style must not accept an undottable host");
             assert!(matches!(err, AzureUrlError::InvalidHost(_)), "{err}");
-
-            let message = err.to_string();
-            assert!(message.contains("path-style = true"), "{message}");
-            let key = format!("[azure-options.\"{expected_key}\"]");
-            assert!(message.contains(&key), "{message}");
-            assert_eq!(expected_key, channel.host().to_string(), "{host}");
+            assert!(err.to_string().contains("path-style"), "{err}");
         }
     }
 

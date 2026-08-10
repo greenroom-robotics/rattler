@@ -79,18 +79,6 @@ impl AzureScheme {
             AzureScheme::Http => "http",
         }
     }
-
-    /// The port this scheme reaches when an authority does not spell one.
-    ///
-    /// `AzureHost` keeps a written port, because it cannot know the scheme its
-    /// host will be used with — so `host` and `host:443` are different keys until
-    /// something that does know the scheme says otherwise. This is that thing.
-    pub fn default_port(self) -> u16 {
-        match self {
-            AzureScheme::Https => 443,
-            AzureScheme::Http => 80,
-        }
-    }
 }
 
 impl std::fmt::Display for AzureScheme {
