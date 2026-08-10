@@ -27,8 +27,9 @@ pub(crate) const AZURE_UPLOAD_SAS_PERMISSIONS: &str = "rcw";
 /// Uploads packages to a channel in an Azure Blob Storage container.
 ///
 /// The account name, endpoint, container and root prefix all come from `location`
-/// (see `azblob_config`). A path-style location is what makes an IP, single-label
-/// or Azurite endpoint uploadable.
+/// (see `azblob_config`). `--path-style` is what makes an IP, single-label or
+/// Azurite endpoint uploadable: it reads the account off the first path segment,
+/// which such a host has no other way to name.
 pub async fn upload_package_to_azure(
     location: &AzureLocation,
     credentials: AzureCredentials,

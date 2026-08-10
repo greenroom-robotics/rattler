@@ -119,7 +119,7 @@ enum Commands {
     Azblob {
         /// The Azure Blob channel URL, e.g.
         /// `az://<account>.blob.core.windows.net/<container>/<channel>`.
-        // Not a wire `Url`: the wire scheme comes from the host's `azure-options`
+        // Not a wire `Url`: the wire scheme comes from the matched `azure-options`
         // entry, which is only read after clap has run.
         channel: AzureChannelUrl,
 
@@ -280,8 +280,9 @@ async fn main() -> anyhow::Result<()> {
 /// The `azure-options` entry a channel falls under: the key that says where its
 /// account and container are, and the scheme to reach them over.
 ///
-/// A missing entry and an empty entry behave identically, so this never reports
-/// which it found. Grants are not part of the result: indexing signs with the
+/// Entry *presence* is the whole selection mechanism: it is what picks the
+/// path-style reading, and so which segment is the account and which the
+/// container. Grants are not part of the result: indexing signs with the
 /// credential its caller supplied, so there is no ambient chain to gate. A URL
 /// matching no entry is read host-style, which fails for a host that names no
 /// account — indexing has to know the account.
