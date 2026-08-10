@@ -2,10 +2,16 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use rattler_azure::{AzureChannelUrl, AzureEndpointOptions, AzureHost, AzureScheme, ContainerName};
-use reqsign_azure_storage::{Credential, DefaultCredentialProvider, RequestSigner};
+use rattler_azure::{
+    AzureChannelUrl, AzureCoordinates, AzureEndpointOptions, AzureHost, AzureScheme, AzureUrlError,
+};
+use reqsign_azure_storage::{
+    Credential, DefaultCredentialProvider, EnvCredentialProvider, RequestSigner,
+};
 use reqsign_command_execute_tokio::TokioCommandExecute;
-use reqsign_core::{Context, OsEnv, ProvideCredential, Signer};
+#[cfg(test)]
+use reqsign_core::ProvideCredential;
+use reqsign_core::{Context, OsEnv, Signer};
 use reqsign_file_read_tokio::TokioFileRead;
 use reqsign_http_send_reqwest::ReqwestHttpSend;
 use reqwest::{Client, Request, Response};
@@ -48,8 +54,9 @@ const X_MS_VERSION: &str = "2021-12-02";
 /// rattler's [`crate::AuthenticationStorage`] has no Azure variant.
 #[derive(Clone)]
 pub struct AzureMiddleware {
-    /// reqsign signer; caches the resolved credential internally.
-    signer: Signer<Credential>,
+    /// The credential chains this middleware may sign from. Each signer caches
+    /// its resolved credential internally.
+    signers: Signers,
 
     /// Whole `azure-options` entries, keyed by the same normalized authority the
     /// config table is keyed by. An absent host behaves as a defaulted entry, so a
@@ -68,13 +75,49 @@ struct Resolved {
     scheme: AzureScheme,
 }
 
-/// The container a request addresses, and whether it may be signed.
+/// The credential chains a middleware signs from.
+#[derive(Clone)]
+enum Signers {
+    /// The ambient chain, narrowed off Azure. `any` reaches everything reqsign
+    /// can find — Azure CLI, IMDS, workload identity — and so is only reached for
+    /// a host that is demonstrably Azure over TLS; `explicit` reads
+    /// `AZURE_STORAGE_*` and nothing else, and covers every other granted host.
+    /// See [`AzureMiddleware::signer_for`].
+    Ambient {
+        any: Signer<Credential>,
+        explicit: Signer<Credential>,
+    },
+
+    /// A single caller-supplied chain, used for every host. Nothing here was
+    /// discovered from the environment, so there is nothing ambient to narrow.
+    #[cfg(test)]
+    Given(Signer<Credential>),
+}
+
+/// The account and container a request addresses, and whether it may be signed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Grant {
-    /// Send unsigned. Carries the container when the URL named one, for the 404
-    /// hint.
-    Ungranted(Option<ContainerName>),
-    Granted(ContainerName),
+    /// Send unsigned. Carries the coordinates when the URL resolved to a pair, for
+    /// the 404 hint.
+    Ungranted(Option<AzureCoordinates>),
+    Granted(AzureCoordinates),
+}
+
+/// Whether the ambient credential chain may be reached for this request: a
+/// public Azure blob endpoint, over TLS. See [`AzureMiddleware::signer_for`].
+fn ambient_is_safe(channel: &AzureChannelUrl, scheme: AzureScheme) -> bool {
+    scheme == AzureScheme::Https && channel.host().is_known_azure_blob_endpoint()
+}
+
+/// The reqsign context every signer shares. `client` also carries reqsign's
+/// credential resolution (IMDS, managed identity, AAD token fetches), so its
+/// proxy, CA bundle and TLS settings apply there too.
+fn signing_context(client: Client) -> Context {
+    Context::new()
+        .with_file_read(TokioFileRead)
+        .with_http_send(ReqwestHttpSend::new(client))
+        .with_command_execute(TokioCommandExecute)
+        .with_env(OsEnv)
 }
 
 impl AzureMiddleware {
@@ -91,7 +134,18 @@ impl AzureMiddleware {
         client: Client,
         options: impl IntoIterator<Item = (AzureHost, AzureEndpointOptions)>,
     ) -> Self {
-        Self::with_credential_provider(client, DefaultCredentialProvider::new(), options)
+        let ctx = signing_context(client);
+        Self {
+            signers: Signers::Ambient {
+                any: Signer::new(
+                    ctx.clone(),
+                    DefaultCredentialProvider::new(),
+                    RequestSigner::new(),
+                ),
+                explicit: Signer::new(ctx, EnvCredentialProvider::new(), RequestSigner::new()),
+            },
+            options: options.into_iter().collect(),
+        }
     }
 
     /// Create a middleware that grants no host, so every `az://` request is sent
@@ -100,20 +154,48 @@ impl AzureMiddleware {
         Self::new(client, [])
     }
 
+    /// A middleware signing from one named provider, whatever the host.
+    #[cfg(test)]
     fn with_credential_provider(
         client: Client,
         provider: impl ProvideCredential<Credential = Credential> + 'static,
         options: impl IntoIterator<Item = (AzureHost, AzureEndpointOptions)>,
     ) -> Self {
-        let ctx = Context::new()
-            .with_file_read(TokioFileRead)
-            .with_http_send(ReqwestHttpSend::new(client))
-            .with_command_execute(TokioCommandExecute)
-            .with_env(OsEnv);
-        let signer = Signer::new(ctx, provider, RequestSigner::new());
         Self {
-            signer,
+            signers: Signers::Given(Signer::new(
+                signing_context(client),
+                provider,
+                RequestSigner::new(),
+            )),
             options: options.into_iter().collect(),
+        }
+    }
+
+    /// The signer whose credential sources are safe to reach for `host`.
+    ///
+    /// An AAD access token is audience-wide by construction — Azure issues it for
+    /// `https://storage.azure.com/`, valid against every account the principal can
+    /// reach — and a Shared Key signature names the account from the *credential*,
+    /// not the request, so it replays verbatim against production. Neither can be
+    /// scoped down at the point of use. So the ambient chain is only reached for a
+    /// host that is demonstrably Azure over TLS; anywhere else — an emulator, a
+    /// proxy, a private endpoint under its own name — the user must name a
+    /// credential explicitly, which is a secret they chose to put on that host.
+    ///
+    /// This is what makes granting a non-Azure host safe, and it is why the config
+    /// layer no longer refuses cleartext grants: the credential that a cleartext
+    /// grant could have leaked can no longer be resolved for such a host at all.
+    fn signer_for(&self, channel: &AzureChannelUrl, scheme: AzureScheme) -> &Signer<Credential> {
+        match &self.signers {
+            #[cfg(test)]
+            Signers::Given(signer) => signer,
+            Signers::Ambient { any, explicit } => {
+                if ambient_is_safe(channel, scheme) {
+                    any
+                } else {
+                    explicit
+                }
+            }
         }
     }
 
@@ -139,13 +221,34 @@ impl AzureMiddleware {
         // A URL with no container segment resolves to no grant; a container segment
         // Azure could never accept is a malformed endpoint, and saying so beats an
         // anonymous request that comes back as an unexplained 401.
-        let container = rattler_azure::container(&channel, entry.endpoint().addressing)
-            .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::Error::from(e)))?;
+        // `account_and_container`, the derivation the write path also uses: a grant
+        // is keyed by both, so deriving only the container here would look one up
+        // for `accta/general` and spend it on `acctb/general` under path-style.
+        //
+        // A URL that simply does not carry the pair — no container segment, or a
+        // host with no account label to read host-style — has nothing to attribute
+        // a grant to, so it goes out anonymous. A name that is *present but
+        // malformed* is a broken endpoint, and saying so beats an anonymous request
+        // that comes back as an unexplained 404.
+        let coordinates =
+            match rattler_azure::account_and_container(&channel, entry.endpoint().addressing) {
+                Ok(coordinates) => Some(coordinates),
+                Err(
+                    AzureUrlError::NoContainer
+                    | AzureUrlError::NoAccount
+                    | AzureUrlError::InvalidHost(_),
+                ) => None,
+                Err(e) => {
+                    return Err(reqwest_middleware::Error::Middleware(anyhow::Error::from(
+                        e,
+                    )));
+                }
+            };
 
-        let options = entry.fetch(container.as_ref());
-        let grant = match container {
-            Some(container) if options.auth.is_granted() => Grant::Granted(container),
-            container => Grant::Ungranted(container),
+        let options = entry.fetch(coordinates.as_ref());
+        let grant = match coordinates {
+            Some(coordinates) if options.auth.is_granted() => Grant::Granted(coordinates),
+            coordinates => Grant::Ungranted(coordinates),
         };
 
         Ok(Resolved {
@@ -158,14 +261,24 @@ impl AzureMiddleware {
     /// Whether the URL already carries an explicit SAS token (a `sig` query
     /// parameter). Such a URL is self-authenticating and must not be re-signed.
     fn has_sas_token(url: &Url) -> bool {
-        url.query_pairs().any(|(key, _)| key == "sig")
+        // Case-insensitively: Azure matches query parameter names that way, so
+        // `?SIG=…` is just as much a pre-signed URL, and re-signing one would
+        // replace the caller's own credential.
+        url.query_pairs()
+            .any(|(key, _)| key.eq_ignore_ascii_case("sig"))
     }
 
     /// Under [`Grant::Ungranted`] the credential is not *resolved* either. reqsign
     /// would otherwise probe the managed-identity / IMDS endpoint and block until it
     /// times out, and would pull an ambient credential into memory for a host the user
     /// never granted.
-    async fn sign(&self, req: &mut Request, grant: &Grant) -> MiddlewareResult<()> {
+    async fn sign(
+        &self,
+        req: &mut Request,
+        grant: &Grant,
+        channel: &AzureChannelUrl,
+        scheme: AzureScheme,
+    ) -> MiddlewareResult<()> {
         if Self::has_sas_token(req.url()) {
             return Ok(());
         }
@@ -202,13 +315,37 @@ impl AzureMiddleware {
         })?;
         let (mut parts, ()) = http_req.into_parts();
 
+        // Shared Key signs `Content-Length`, so it has to be on the request
+        // *before* signing and match what goes on the wire. reqwest sets it later,
+        // from the body, and a signature computed without it is rejected with a
+        // 403 that names nothing.
+        match req.body().and_then(reqwest::Body::as_bytes) {
+            Some(body) => {
+                parts.headers.insert(
+                    http::header::CONTENT_LENGTH,
+                    http::HeaderValue::from(body.len()),
+                );
+            }
+            // A streaming body has no length to sign, and reqwest will send it
+            // chunked. Azure's Shared Key scheme has nothing to say about that, so
+            // the signature would be wrong in a way only the server sees.
+            None if req.body().is_some() => {
+                return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                    "cannot sign a streaming request body for `{}`: Shared Key signs                      `Content-Length`, which a body of unknown size does not have",
+                    req.url().authority()
+                )));
+            }
+            None => {}
+        }
+
         // reqsign says only "failed to load signing credential": its chain walks
         // past a provider that errors exactly as it walks past one that finds
         // nothing, so an expired `az login` and an empty environment arrive here
         // indistinguishable, after however long the chain took to give up. The host
         // and the grant that asked for signing are both in scope here and nowhere
         // further up, so this is where they get attached.
-        self.signer.sign(&mut parts, None).await.map_err(|e| {
+        let signer = self.signer_for(channel, scheme);
+        signer.sign(&mut parts, None).await.map_err(|e| {
             let authority = req.url().authority();
             reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                 "could not resolve an Azure credential for `{container}` on `{authority}`, which \
@@ -226,9 +363,15 @@ impl AzureMiddleware {
 
         *req.headers_mut() = parts.headers;
         let signed_url = Url::parse(&parts.uri.to_string()).map_err(|e| {
+            // The signed URI carries the signature reqsign just attached, so it is
+            // reported masked — an error message is the one place a credential
+            // reliably ends up in a log.
             reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                 "failed to parse signed azure URL '{}': {e}",
-                parts.uri
+                rattler_redaction::redact_signatures_in_text(
+                    &parts.uri.to_string(),
+                    rattler_redaction::DEFAULT_REDACTION_STR,
+                )
             ))
         })?;
         *req.url_mut() = signed_url;
@@ -254,7 +397,7 @@ impl Middleware for AzureMiddleware {
             scheme,
         } = self.resolve(req.url())?;
         *req.url_mut() = channel.wire(scheme);
-        self.sign(&mut req, &grant).await?;
+        self.sign(&mut req, &grant, &channel, scheme).await?;
 
         let response = next.run(req, extensions).await?;
 
@@ -297,14 +440,14 @@ impl Middleware for AzureMiddleware {
 /// non-sharded channel misses every time. Per container and not per host, because
 /// the line to add differs per container. A URL naming no container gets one hint
 /// of its own per host.
-fn first_404_for(host: &AzureHost, container: Option<&ContainerName>) -> bool {
-    type Hinted = std::collections::HashSet<(AzureHost, Option<ContainerName>)>;
+fn first_404_for(host: &AzureHost, coordinates: Option<&AzureCoordinates>) -> bool {
+    type Hinted = std::collections::HashSet<(AzureHost, Option<AzureCoordinates>)>;
     static HINTED: std::sync::LazyLock<std::sync::Mutex<Hinted>> =
         std::sync::LazyLock::new(Default::default);
     HINTED
         .lock()
         .expect("the 404-hint set is never held across a panic")
-        .insert((host.clone(), container.cloned()))
+        .insert((host.clone(), coordinates.cloned()))
 }
 
 #[cfg(test)]
@@ -313,8 +456,13 @@ mod tests {
 
     use super::*;
 
-    fn container(name: &str) -> ContainerName {
-        ContainerName::new(name).expect("test container name")
+    fn coords(account: &str, container: &str) -> AzureCoordinates {
+        AzureCoordinates::parse(&format!("{account}/{container}")).expect("test coordinates")
+    }
+
+    /// The account every host-style test host carries.
+    fn container(name: &str) -> AzureCoordinates {
+        coords("mycompany", name)
     }
 
     fn options(
@@ -331,8 +479,22 @@ mod tests {
         )
     }
 
+    fn granting_on(account: &str, container_name: &str) -> AzureEndpointOptions {
+        AzureEndpointOptions::new(
+            [(coords(account, container_name), Auth::DefaultChain)],
+            AzureEndpoint::default(),
+        )
+    }
+
     fn middleware(options: HashMap<AzureHost, AzureEndpointOptions>) -> AzureMiddleware {
         AzureMiddleware::new(Client::new(), options)
+    }
+
+    /// The channel URL a already-rewritten request came from, for the `sign`
+    /// tests, which build the wire request directly rather than via `handle`.
+    fn channel_of(req: &Request) -> AzureChannelUrl {
+        let az = req.url().as_str().replacen("https://", "az://", 1);
+        AzureChannelUrl::parse(&az).expect("test channel url")
     }
 
     fn wire_of(middleware: &AzureMiddleware, url: &str) -> String {
@@ -445,15 +607,18 @@ mod tests {
             &path_style,
             "az://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json",
         );
-        assert_eq!(resolved.grant, Grant::Granted(container("general")));
+        assert_eq!(
+            resolved.grant,
+            Grant::Granted(coords("devstoreaccount1", "general"))
+        );
 
-        // Host-style on the same URL reads the account segment as the container, so
-        // the grant does not apply — the addressing is what decides which name a
-        // grant is even about.
+        // Host-style on the same URL has no account label to read — an IP literal
+        // cannot carry one — so there are no coordinates to attribute a grant to.
+        // The addressing is what decides whether a URL names a grant at all.
         let host_style = middleware(options(
             "127.0.0.1:10000",
             AzureEndpointOptions::new(
-                [(container("general"), Auth::DefaultChain)],
+                [(coords("devstoreaccount1", "general"), Auth::DefaultChain)],
                 AzureEndpoint {
                     scheme: AzureScheme::Http,
                     addressing: Addressing::HostStyle,
@@ -464,10 +629,7 @@ mod tests {
             &host_style,
             "az://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json",
         );
-        assert_eq!(
-            resolved.grant,
-            Grant::Ungranted(Some(container("devstoreaccount1")))
-        );
+        assert_eq!(resolved.grant, Grant::Ungranted(None));
     }
 
     #[test]
@@ -542,6 +704,43 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn the_ambient_chain_is_reached_only_for_azure_over_tls() {
+        for (url, scheme, safe) in [
+            (
+                "az://acct.blob.core.windows.net/pub/x.json",
+                AzureScheme::Https,
+                true,
+            ),
+            // Azure by name, but the entry downgrades the wire to cleartext, where
+            // the credential the ambient chain would resolve is on the wire.
+            (
+                "az://acct.blob.core.windows.net/pub/x.json",
+                AzureScheme::Http,
+                false,
+            ),
+            // A proxy or private endpoint under its own name: an AAD token minted
+            // here is valid against every account the principal can reach.
+            (
+                "az://blobs.mycompany.com/acct/pub/x.json",
+                AzureScheme::Https,
+                false,
+            ),
+            (
+                "az://127.0.0.1:10000/devstoreaccount1/pub/x.json",
+                AzureScheme::Http,
+                false,
+            ),
+        ] {
+            let channel = AzureChannelUrl::parse(url).expect(url);
+            assert_eq!(
+                ambient_is_safe(&channel, scheme),
+                safe,
+                "{url} over {scheme:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn an_ungranted_container_sends_unsigned_without_resolving_a_credential() {
         use std::sync::{
@@ -572,9 +771,15 @@ mod tests {
             .get("https://acct.blob.core.windows.net/pub/noarch/repodata.json")
             .build()
             .unwrap();
+        let channel = channel_of(&req);
 
         middleware
-            .sign(&mut req, &Grant::Ungranted(None))
+            .sign(
+                &mut req,
+                &Grant::Ungranted(None),
+                &channel,
+                AzureScheme::Https,
+            )
             .await
             .expect("an ungranted request must pass through unsigned");
 
@@ -601,15 +806,24 @@ mod tests {
             // A valid base64 account key, so the provider yields a usable
             // SharedKey credential.
             StaticCredentialProvider::new_shared_key("acct", "dGVzdF9rZXk="),
-            options("acct.blob.core.windows.net", granting("releases")),
+            options(
+                "acct.blob.core.windows.net",
+                granting_on("acct", "releases"),
+            ),
         );
         let mut req = Client::new()
             .get("https://acct.blob.core.windows.net/releases/noarch/repodata.json")
             .build()
             .unwrap();
+        let channel = channel_of(&req);
 
         middleware
-            .sign(&mut req, &Grant::Granted(container("releases")))
+            .sign(
+                &mut req,
+                &Grant::Granted(coords("acct", "releases")),
+                &channel,
+                AzureScheme::Https,
+            )
             .await
             .unwrap();
 
@@ -623,6 +837,77 @@ mod tests {
         );
     }
 
+    /// Shared Key signs `Content-Length`, so a body whose length is only known
+    /// once it has been streamed cannot be signed at all — better a message than
+    /// a 403 from Azure that explains nothing.
+    #[tokio::test]
+    async fn a_streaming_body_is_refused_rather_than_signed_without_its_length() {
+        use reqsign_azure_storage::StaticCredentialProvider;
+
+        let middleware = AzureMiddleware::with_credential_provider(
+            Client::new(),
+            StaticCredentialProvider::new_shared_key("acct", "dGVzdF9rZXk="),
+            options(
+                "acct.blob.core.windows.net",
+                granting_on("acct", "releases"),
+            ),
+        );
+        let stream = futures::stream::once(async { Ok::<_, std::io::Error>("chunk") });
+        let mut req = Client::new()
+            .put("https://acct.blob.core.windows.net/releases/noarch/x.conda")
+            .body(reqwest::Body::wrap_stream(stream))
+            .build()
+            .unwrap();
+        let channel = channel_of(&req);
+
+        let error = middleware
+            .sign(
+                &mut req,
+                &Grant::Granted(coords("acct", "releases")),
+                &channel,
+                AzureScheme::Https,
+            )
+            .await
+            .expect_err("a body of unknown size must not be signed");
+        assert!(error.to_string().contains("Content-Length"), "{error}");
+    }
+
+    /// The signature covers `Content-Length`, so it has to be on the request
+    /// before signing and match what reqwest puts on the wire.
+    #[tokio::test]
+    async fn a_sized_body_is_signed_with_its_content_length() {
+        use reqsign_azure_storage::StaticCredentialProvider;
+
+        let middleware = AzureMiddleware::with_credential_provider(
+            Client::new(),
+            StaticCredentialProvider::new_shared_key("acct", "dGVzdF9rZXk="),
+            options(
+                "acct.blob.core.windows.net",
+                granting_on("acct", "releases"),
+            ),
+        );
+        let mut req = Client::new()
+            .put("https://acct.blob.core.windows.net/releases/noarch/x.conda")
+            .body("body")
+            .build()
+            .unwrap();
+        let channel = channel_of(&req);
+
+        middleware
+            .sign(
+                &mut req,
+                &Grant::Granted(coords("acct", "releases")),
+                &channel,
+                AzureScheme::Https,
+            )
+            .await
+            .expect("a sized body must be signable");
+        assert_eq!(
+            req.headers().get(http::header::CONTENT_LENGTH),
+            Some(&http::HeaderValue::from_static("4"))
+        );
+    }
+
     #[tokio::test]
     async fn a_granted_container_with_broken_credentials_is_a_hard_error() {
         use reqsign_core::ProvideCredentialChain;
@@ -630,15 +915,24 @@ mod tests {
         let middleware = AzureMiddleware::with_credential_provider(
             Client::new(),
             ProvideCredentialChain::<Credential>::new(),
-            options("acct.blob.core.windows.net", granting("releases")),
+            options(
+                "acct.blob.core.windows.net",
+                granting_on("acct", "releases"),
+            ),
         );
         let mut req = Client::new()
             .get("https://acct.blob.core.windows.net/releases/noarch/repodata.json")
             .build()
             .unwrap();
+        let channel = channel_of(&req);
 
         let result = middleware
-            .sign(&mut req, &Grant::Granted(container("releases")))
+            .sign(
+                &mut req,
+                &Grant::Granted(coords("acct", "releases")),
+                &channel,
+                AzureScheme::Https,
+            )
             .await;
 
         assert!(
@@ -671,15 +965,24 @@ mod tests {
         let middleware = AzureMiddleware::with_credential_provider(
             Client::new(),
             StaticCredentialProvider::new_shared_key("acct", "dGVzdF9rZXk="),
-            options("acct.blob.core.windows.net", granting("releases")),
+            options(
+                "acct.blob.core.windows.net",
+                granting_on("acct", "releases"),
+            ),
         );
         let mut req = Client::new()
             .get("https://acct.blob.core.windows.net/releases/x.json?sv=2021&sig=abc")
             .build()
             .unwrap();
+        let channel = channel_of(&req);
 
         middleware
-            .sign(&mut req, &Grant::Granted(container("releases")))
+            .sign(
+                &mut req,
+                &Grant::Granted(coords("acct", "releases")),
+                &channel,
+                AzureScheme::Https,
+            )
             .await
             .unwrap();
 
@@ -705,11 +1008,13 @@ mod tests {
         AzureHost::parse(&addr.to_string()).unwrap()
     }
 
+    /// A path-style emulator entry, whose grants sit under the emulator's
+    /// well-known account name.
     fn emulator_entry<'a>(granted: impl IntoIterator<Item = &'a str>) -> AzureEndpointOptions {
         AzureEndpointOptions::new(
             granted
                 .into_iter()
-                .map(|name| (container(name), Auth::DefaultChain)),
+                .map(|name| (coords("devstoreaccount1", name), Auth::DefaultChain)),
             AzureEndpoint {
                 scheme: AzureScheme::Http,
                 addressing: Addressing::PathStyle,

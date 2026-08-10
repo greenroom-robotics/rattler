@@ -20,7 +20,7 @@ use std::{
 
 use async_trait::async_trait;
 use rattler_azure::{
-    Addressing, Auth, AzureEndpoint, AzureEndpointOptions, AzureHost, AzureScheme, ContainerName,
+    Addressing, Auth, AzureCoordinates, AzureEndpoint, AzureEndpointOptions, AzureHost, AzureScheme,
 };
 use rattler_networking::AzureMiddleware;
 use reqwest::{
@@ -78,7 +78,8 @@ fn azurite_entry(auth: Auth) -> HashMap<AzureHost, AzureEndpointOptions> {
         AzureHost::parse(AUTHORITY).expect("azurite authority is a valid host:port"),
         AzureEndpointOptions::new(
             [(
-                ContainerName::new(CONTAINER).expect("azurite container name"),
+                AzureCoordinates::parse(&format!("{ACCOUNT}/{CONTAINER}"))
+                    .expect("azurite account and container names"),
                 auth,
             )],
             AzureEndpoint {

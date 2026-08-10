@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use rattler_azure::{Auth, AzureEndpoint, AzureEndpointOptions, AzureHost, ContainerName};
+use rattler_azure::{Auth, AzureCoordinates, AzureEndpoint, AzureEndpointOptions, AzureHost};
 use rattler_networking::AzureMiddleware;
 use reqwest_middleware::ClientBuilder;
 
@@ -42,7 +42,8 @@ async fn azure_middleware_fetches_real_repodata() {
         AzureHost::parse(&host).expect("AZURE_TEST_HOST is not a valid host[:port]"),
         AzureEndpointOptions::new(
             [(
-                ContainerName::new(&container).expect("AZURE_TEST_CONTAINER is not a valid name"),
+                AzureCoordinates::parse(&format!("{account}/{container}"))
+                    .expect("AZURE_TEST_ACCOUNT/AZURE_TEST_CONTAINER are not valid names"),
                 Auth::DefaultChain,
             )],
             AzureEndpoint::default(),
