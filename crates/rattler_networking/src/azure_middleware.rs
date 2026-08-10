@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use rattler_azure::{
-    AzureChannelUrl, AzureCoordinates, AzureEndpointOptions, AzureHost, AzureScheme, AzureUrlError,
+    AzureChannelUrl, AzureEndpointKey, AzureEndpointOptions, AzureScheme, ContainerName,
 };
 use reqsign_azure_storage::{
     Credential, DefaultCredentialProvider, EnvCredentialProvider, RequestSigner,
@@ -37,14 +37,14 @@ pub struct AzureMiddleware {
     /// its resolved credential internally.
     signers: Signers,
 
-    /// Whole `azure-options` entries, keyed by the same normalized authority the
-    /// config table is keyed by. An absent host behaves as a defaulted entry, so a
-    /// miss is never a separate code path.
+    /// Whole `azure-options` entries, keyed the same way the config table is. A
+    /// URL matching no entry behaves as a defaulted entry, so a miss is never a
+    /// separate code path.
     ///
     /// A plain `HashMap` rather than `rattler_config::AzureOptionsMap`, as in
     /// [`crate::S3Middleware`]: the config type would force a `rattler_config` edge
     /// on the `azure` feature.
-    options: HashMap<AzureHost, AzureEndpointOptions>,
+    options: HashMap<AzureEndpointKey, AzureEndpointOptions>,
 }
 
 #[derive(Debug)]
@@ -73,12 +73,15 @@ enum Signers {
     Given(Signer<Credential>),
 }
 
-/// The account and container a request addresses, and whether it may be signed.
+/// Whether a request may be signed, and the entry and container that say so.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Grant {
     /// Send unsigned.
     Ungranted,
-    Granted(AzureCoordinates),
+    Granted {
+        key: AzureEndpointKey,
+        container: ContainerName,
+    },
 }
 
 /// Whether the ambient credential chain may be reached for this request: a
@@ -110,7 +113,7 @@ impl AzureMiddleware {
     /// every `az://` request is anonymous.
     pub fn new(
         client: Client,
-        options: impl IntoIterator<Item = (AzureHost, AzureEndpointOptions)>,
+        options: impl IntoIterator<Item = (AzureEndpointKey, AzureEndpointOptions)>,
     ) -> Self {
         let ctx = signing_context(client);
         Self {
@@ -137,7 +140,7 @@ impl AzureMiddleware {
     fn with_credential_provider(
         client: Client,
         provider: impl ProvideCredential<Credential = Credential> + 'static,
-        options: impl IntoIterator<Item = (AzureHost, AzureEndpointOptions)>,
+        options: impl IntoIterator<Item = (AzureEndpointKey, AzureEndpointOptions)>,
     ) -> Self {
         Self {
             signers: Signers::Given(Signer::new(
@@ -182,10 +185,14 @@ impl AzureMiddleware {
     ///
     /// [`AzureChannelUrl`] rejects userinfo and normalizes the authority to the
     /// spelling the options table is keyed by, so a grant cannot miss over case, a
-    /// trailing dot or an IDNA name. The container comes from
-    /// [`rattler_azure::container`], the derivation the write path also uses; two
-    /// that disagreed would look a grant up for one container and send it to
-    /// another.
+    /// trailing dot or an IDNA name. Key and container come out of
+    /// [`rattler_azure::locate`] together, so a grant cannot be looked up for one
+    /// container and sent to another.
+    ///
+    /// A URL that names no container has nothing to attribute a grant to, so it
+    /// goes out anonymous. A container name that is *present but malformed* is a
+    /// broken endpoint, and saying so beats an anonymous request that comes back as
+    /// an unexplained 404.
     fn resolve(&self, url: &Url) -> MiddlewareResult<Resolved> {
         let channel = AzureChannelUrl::parse(url.as_str()).map_err(|e| {
             // The URL is not echoed back: the one rejection a user hits here is
@@ -193,39 +200,21 @@ impl AzureMiddleware {
             reqwest_middleware::Error::Middleware(anyhow::Error::from(e))
         })?;
 
+        let location = rattler_azure::locate(&channel, |key| self.options.contains_key(key))
+            .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::Error::from(e)))?;
+
         let unconfigured = AzureEndpointOptions::default();
-        let entry = self.options.get(channel.host()).unwrap_or(&unconfigured);
+        let entry = location
+            .key()
+            .and_then(|key| self.options.get(key))
+            .unwrap_or(&unconfigured);
 
-        // A URL with no container segment resolves to no grant; a container segment
-        // Azure could never accept is a malformed endpoint, and saying so beats an
-        // anonymous request that comes back as an unexplained 401.
-        // `account_and_container`, the derivation the write path also uses: a grant
-        // is keyed by both, so deriving only the container here would look one up
-        // for `accta/general` and spend it on `acctb/general` under path-style.
-        //
-        // A URL that simply does not carry the pair — no container segment, or a
-        // host with no account label to read host-style — has nothing to attribute
-        // a grant to, so it goes out anonymous. A name that is *present but
-        // malformed* is a broken endpoint, and saying so beats an anonymous request
-        // that comes back as an unexplained 404.
-        let coordinates =
-            match rattler_azure::account_and_container(&channel, entry.endpoint().addressing) {
-                Ok(coordinates) => Some(coordinates),
-                Err(
-                    AzureUrlError::NoContainer
-                    | AzureUrlError::NoAccount
-                    | AzureUrlError::InvalidHost(_),
-                ) => None,
-                Err(e) => {
-                    return Err(reqwest_middleware::Error::Middleware(anyhow::Error::from(
-                        e,
-                    )));
-                }
-            };
-
-        let options = entry.fetch(coordinates.as_ref());
-        let grant = match coordinates {
-            Some(coordinates) if options.auth.is_granted() => Grant::Granted(coordinates),
+        let options = entry.fetch(location.container());
+        let grant = match (location.key(), location.container()) {
+            (Some(key), Some(container)) if options.auth.is_granted() => Grant::Granted {
+                key: key.clone(),
+                container: container.clone(),
+            },
             _ => Grant::Ungranted,
         };
 
@@ -266,7 +255,7 @@ impl AzureMiddleware {
                 .insert("x-ms-version", http::HeaderValue::from_static(X_MS_VERSION));
         }
 
-        let container = match grant {
+        let (key, container) = match grant {
             Grant::Ungranted => {
                 // The authority, not `host_str()`: a message naming a host the user
                 // could act on must carry the port, or it names a host that is not
@@ -277,7 +266,7 @@ impl AzureMiddleware {
                 );
                 return Ok(());
             }
-            Grant::Granted(container) => container,
+            Grant::Granted { key, container } => (key, container),
         };
 
         let (mut parts, ()) = http::Request::new(()).into_parts();
@@ -320,10 +309,9 @@ impl AzureMiddleware {
         // further up, so this is where they get attached.
         let signer = self.signer_for(channel, scheme);
         signer.sign(&mut parts, None).await.map_err(|e| {
-            let authority = req.url().authority();
             reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                "could not resolve an Azure credential for `{container}` on `{authority}`, which \
-                 `[azure-options.\"{authority}\".auth]` `{container} = true` requires: {e}\n\
+                "could not resolve an Azure credential for `{container}` on `{key}`, which \
+                 `[azure-options.\"{key}\".auth]` `{container} = true` requires: {e}\n\
                  \n\
                  Try one of:\n\
                  \x20 - `az login`\n\
@@ -392,41 +380,40 @@ impl Middleware for AzureMiddleware {
 
 #[cfg(test)]
 mod tests {
-    use rattler_azure::{Addressing, Auth, AzureEndpoint, AzureScheme};
+    use rattler_azure::{Auth, AzureScheme};
 
     use super::*;
 
-    fn coords(account: &str, container: &str) -> AzureCoordinates {
-        AzureCoordinates::parse(&format!("{account}/{container}")).expect("test coordinates")
+    fn key(written: &str) -> AzureEndpointKey {
+        AzureEndpointKey::parse(written).expect("test key")
     }
 
-    /// The account every host-style test host carries.
-    fn container(name: &str) -> AzureCoordinates {
-        coords("mycompany", name)
+    fn container(name: &str) -> ContainerName {
+        ContainerName::new(name).expect("test container name")
     }
 
     fn options(
-        authority: &str,
+        written_key: &str,
         options: AzureEndpointOptions,
-    ) -> HashMap<AzureHost, AzureEndpointOptions> {
-        HashMap::from([(AzureHost::parse(authority).expect("test host"), options)])
+    ) -> HashMap<AzureEndpointKey, AzureEndpointOptions> {
+        HashMap::from([(key(written_key), options)])
     }
 
     fn granting(container_name: &str) -> AzureEndpointOptions {
         AzureEndpointOptions::new(
             [(container(container_name), Auth::DefaultChain)],
-            AzureEndpoint::default(),
+            AzureScheme::Https,
         )
     }
 
-    fn granting_on(account: &str, container_name: &str) -> AzureEndpointOptions {
-        AzureEndpointOptions::new(
-            [(coords(account, container_name), Auth::DefaultChain)],
-            AzureEndpoint::default(),
-        )
+    fn granted(written_key: &str, container_name: &str) -> Grant {
+        Grant::Granted {
+            key: key(written_key),
+            container: container(container_name),
+        }
     }
 
-    fn middleware(options: HashMap<AzureHost, AzureEndpointOptions>) -> AzureMiddleware {
+    fn middleware(options: HashMap<AzureEndpointKey, AzureEndpointOptions>) -> AzureMiddleware {
         AzureMiddleware::new(Client::new(), options)
     }
 
@@ -473,7 +460,10 @@ mod tests {
     /// cleartext, and the port has to survive the rewrite under either scheme.
     #[test]
     fn rewrites_to_http_for_an_emulator_entry() {
-        let emulator = middleware(options("127.0.0.1:10000", emulator_entry(["general"])));
+        let emulator = middleware(options(
+            "127.0.0.1:10000/devstoreaccount1",
+            emulator_entry(["general"]),
+        ));
         assert_eq!(
             wire_of(
                 &emulator,
@@ -492,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_applies_regardless_of_how_the_host_is_spelled() {
+    fn a_grant_applies_regardless_of_how_the_key_is_spelled() {
         let middleware = middleware(options(
             "MyCompany.blob.core.windows.net.",
             granting("releases"),
@@ -503,7 +493,7 @@ mod tests {
                 "az://mycompany.blob.core.windows.net/releases/x.json"
             )
             .grant,
-            Grant::Granted(container("releases"))
+            granted("mycompany.blob.core.windows.net", "releases")
         );
     }
 
@@ -518,14 +508,14 @@ mod tests {
                     // unsigned" rather than "forgotten".
                     (container("public"), Auth::Anonymous),
                 ],
-                AzureEndpoint::default(),
+                AzureScheme::Https,
             ),
         ));
 
         for (url, expected) in [
             (
                 "az://mycompany.blob.core.windows.net/releases/x.json",
-                Grant::Granted(container("releases")),
+                granted("mycompany.blob.core.windows.net", "releases"),
             ),
             (
                 "az://mycompany.blob.core.windows.net/public/x.json",
@@ -540,36 +530,71 @@ mod tests {
         }
     }
 
+    /// The key's shape is what decides which segment the container is, so the
+    /// grant follows the key the URL matched.
     #[test]
-    fn a_container_is_read_through_the_hosts_addressing() {
-        let path_style = middleware(options("127.0.0.1:10000", emulator_entry(["general"])));
-        let resolved = resolve(
-            &path_style,
-            "az://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json",
-        );
+    fn a_container_is_read_through_the_matched_key() {
+        let path_style = middleware(options(
+            "127.0.0.1:10000/devstoreaccount1",
+            emulator_entry(["general"]),
+        ));
         assert_eq!(
-            resolved.grant,
-            Grant::Granted(coords("devstoreaccount1", "general"))
+            resolve(
+                &path_style,
+                "az://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json",
+            )
+            .grant,
+            granted("127.0.0.1:10000/devstoreaccount1", "general")
         );
 
-        // Host-style on the same URL has no account label to read — an IP literal
-        // cannot carry one — so there are no coordinates to attribute a grant to.
-        // The addressing is what decides whether a URL names a grant at all.
-        let host_style = middleware(options(
-            "127.0.0.1:10000",
-            AzureEndpointOptions::new(
-                [(coords("devstoreaccount1", "general"), Auth::DefaultChain)],
-                AzureEndpoint {
-                    scheme: AzureScheme::Http,
-                    addressing: Addressing::HostStyle,
-                },
-            ),
-        ));
-        let resolved = resolve(
-            &host_style,
-            "az://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json",
+        // With no entry the same URL is read host-style, and an IP literal carries
+        // no account label — so there is no key to attribute a grant to.
+        assert_eq!(
+            resolve(
+                &middleware(HashMap::new()),
+                "az://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json",
+            )
+            .grant,
+            Grant::Ungranted
         );
-        assert_eq!(resolved.grant, Grant::Ungranted);
+    }
+
+    /// The case the key exists for: two accounts behind one proxy, each with its
+    /// own grant table. The longer key wins, and neither account's grant reaches
+    /// the other's identically-named container.
+    #[test]
+    fn two_accounts_on_one_host_do_not_share_grants() {
+        let middleware = middleware(HashMap::from([
+            (key("proxy.internal/accta"), granting("general")),
+            (
+                key("proxy.internal/acctb"),
+                AzureEndpointOptions::new([], AzureScheme::Https),
+            ),
+        ]));
+
+        assert_eq!(
+            resolve(&middleware, "az://proxy.internal/accta/general/x.json").grant,
+            granted("proxy.internal/accta", "general")
+        );
+        assert_eq!(
+            resolve(&middleware, "az://proxy.internal/acctb/general/x.json").grant,
+            Grant::Ungranted
+        );
+    }
+
+    /// Both candidates configured: the one naming the account wins, so a
+    /// host-style grant on the proxy cannot swallow a path-style one.
+    #[test]
+    fn the_longest_matching_key_wins() {
+        let middleware = middleware(HashMap::from([
+            (key("proxy.internal"), granting("accta")),
+            (key("proxy.internal/accta"), granting("general")),
+        ]));
+
+        assert_eq!(
+            resolve(&middleware, "az://proxy.internal/accta/general/x.json").grant,
+            granted("proxy.internal/accta", "general")
+        );
     }
 
     #[test]
@@ -722,10 +747,7 @@ mod tests {
             // A valid base64 account key, so the provider yields a usable
             // SharedKey credential.
             StaticCredentialProvider::new_shared_key("acct", "dGVzdF9rZXk="),
-            options(
-                "acct.blob.core.windows.net",
-                granting_on("acct", "releases"),
-            ),
+            options("acct.blob.core.windows.net", granting("releases")),
         );
         let mut req = Client::new()
             .get("https://acct.blob.core.windows.net/releases/noarch/repodata.json")
@@ -736,7 +758,7 @@ mod tests {
         middleware
             .sign(
                 &mut req,
-                &Grant::Granted(coords("acct", "releases")),
+                &granted("acct.blob.core.windows.net", "releases"),
                 &channel,
                 AzureScheme::Https,
             )
@@ -763,10 +785,7 @@ mod tests {
         let middleware = AzureMiddleware::with_credential_provider(
             Client::new(),
             StaticCredentialProvider::new_shared_key("acct", "dGVzdF9rZXk="),
-            options(
-                "acct.blob.core.windows.net",
-                granting_on("acct", "releases"),
-            ),
+            options("acct.blob.core.windows.net", granting("releases")),
         );
         let stream = futures::stream::once(async { Ok::<_, std::io::Error>("chunk") });
         let mut req = Client::new()
@@ -779,7 +798,7 @@ mod tests {
         let error = middleware
             .sign(
                 &mut req,
-                &Grant::Granted(coords("acct", "releases")),
+                &granted("acct.blob.core.windows.net", "releases"),
                 &channel,
                 AzureScheme::Https,
             )
@@ -797,10 +816,7 @@ mod tests {
         let middleware = AzureMiddleware::with_credential_provider(
             Client::new(),
             StaticCredentialProvider::new_shared_key("acct", "dGVzdF9rZXk="),
-            options(
-                "acct.blob.core.windows.net",
-                granting_on("acct", "releases"),
-            ),
+            options("acct.blob.core.windows.net", granting("releases")),
         );
         let mut req = Client::new()
             .put("https://acct.blob.core.windows.net/releases/noarch/x.conda")
@@ -812,7 +828,7 @@ mod tests {
         middleware
             .sign(
                 &mut req,
-                &Grant::Granted(coords("acct", "releases")),
+                &granted("acct.blob.core.windows.net", "releases"),
                 &channel,
                 AzureScheme::Https,
             )
@@ -831,10 +847,7 @@ mod tests {
         let middleware = AzureMiddleware::with_credential_provider(
             Client::new(),
             ProvideCredentialChain::<Credential>::new(),
-            options(
-                "acct.blob.core.windows.net",
-                granting_on("acct", "releases"),
-            ),
+            options("acct.blob.core.windows.net", granting("releases")),
         );
         let mut req = Client::new()
             .get("https://acct.blob.core.windows.net/releases/noarch/repodata.json")
@@ -845,7 +858,7 @@ mod tests {
         let result = middleware
             .sign(
                 &mut req,
-                &Grant::Granted(coords("acct", "releases")),
+                &granted("acct.blob.core.windows.net", "releases"),
                 &channel,
                 AzureScheme::Https,
             )
@@ -881,10 +894,7 @@ mod tests {
         let middleware = AzureMiddleware::with_credential_provider(
             Client::new(),
             StaticCredentialProvider::new_shared_key("acct", "dGVzdF9rZXk="),
-            options(
-                "acct.blob.core.windows.net",
-                granting_on("acct", "releases"),
-            ),
+            options("acct.blob.core.windows.net", granting("releases")),
         );
         let mut req = Client::new()
             .get("https://acct.blob.core.windows.net/releases/x.json?sv=2021&sig=abc")
@@ -895,7 +905,7 @@ mod tests {
         middleware
             .sign(
                 &mut req,
-                &Grant::Granted(coords("acct", "releases")),
+                &granted("acct.blob.core.windows.net", "releases"),
                 &channel,
                 AzureScheme::Https,
             )
@@ -916,39 +926,34 @@ mod tests {
         );
     }
 
-    async fn spawn_404_server() -> AzureHost {
+    /// The path-style key of a loopback server that answers everything with a 404.
+    async fn spawn_404_server() -> AzureEndpointKey {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = axum::Router::new().fallback(axum::http::StatusCode::NOT_FOUND);
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        AzureHost::parse(&addr.to_string()).unwrap()
+        key(&format!("{addr}/devstoreaccount1"))
     }
 
-    /// A path-style emulator entry, whose grants sit under the emulator's
-    /// well-known account name.
+    /// The emulator's entry, whose key names the emulator's well-known account.
     fn emulator_entry<'a>(granted: impl IntoIterator<Item = &'a str>) -> AzureEndpointOptions {
         AzureEndpointOptions::new(
             granted
                 .into_iter()
-                .map(|name| (coords("devstoreaccount1", name), Auth::DefaultChain)),
-            AzureEndpoint {
-                scheme: AzureScheme::Http,
-                addressing: Addressing::PathStyle,
-            },
+                .map(|name| (container(name), Auth::DefaultChain)),
+            AzureScheme::Http,
         )
     }
 
     async fn get_az(
         middleware: AzureMiddleware,
-        host: &AzureHost,
+        key: &AzureEndpointKey,
         container: &str,
     ) -> reqwest::StatusCode {
         reqwest_middleware::ClientBuilder::new(Client::new())
             .with(middleware)
             .build()
-            .get(format!(
-                "az://{host}/devstoreaccount1/{container}/noarch/repodata.json"
-            ))
+            .get(format!("az://{key}/{container}/noarch/repodata.json"))
             .send()
             .await
             .expect("request through azure middleware failed")
@@ -958,10 +963,10 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn a_404_for_an_ungranted_container_warns() {
-        let host = spawn_404_server().await;
-        let middleware = middleware(options(&host.to_string(), emulator_entry([])));
+        let key = spawn_404_server().await;
+        let middleware = middleware(HashMap::from([(key.clone(), emulator_entry([]))]));
 
-        assert_eq!(get_az(middleware, &host, "general").await, 404);
+        assert_eq!(get_az(middleware, &key, "general").await, 404);
 
         assert!(logs_contain("azure-options"));
     }
@@ -971,14 +976,14 @@ mod tests {
     async fn a_404_for_a_granted_container_is_silent() {
         use reqsign_azure_storage::StaticCredentialProvider;
 
-        let host = spawn_404_server().await;
+        let key = spawn_404_server().await;
         let middleware = AzureMiddleware::with_credential_provider(
             Client::new(),
             StaticCredentialProvider::new_shared_key("devstoreaccount1", "dGVzdF9rZXk="),
-            options(&host.to_string(), emulator_entry(["general"])),
+            [(key.clone(), emulator_entry(["general"]))],
         );
 
-        assert_eq!(get_az(middleware, &host, "general").await, 404);
+        assert_eq!(get_az(middleware, &key, "general").await, 404);
 
         assert!(!logs_contain("azure-options"));
     }

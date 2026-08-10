@@ -15,9 +15,7 @@
 
 use std::collections::HashMap;
 
-use rattler_azure::{
-    Addressing, Auth, AzureCoordinates, AzureEndpoint, AzureEndpointOptions, AzureHost, AzureScheme,
-};
+use rattler_azure::{Auth, AzureEndpointKey, AzureEndpointOptions, AzureScheme, ContainerName};
 use rattler_networking::AzureMiddleware;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 
@@ -27,9 +25,8 @@ const ACCOUNT: &str = "devstoreaccount1";
 const ACCOUNT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
-/// The authority, which is also the exact `azure-options` table key. Host-style
-/// addressing cannot read an account out of an IP literal, so this needs
-/// path-style.
+/// The authority. An IP literal carries no account label, so the table key below
+/// has to name the account as a path segment.
 const AUTHORITY: &str = "127.0.0.1:10000";
 
 /// Azurite creates containers as private, which is what makes the ungranted case
@@ -62,19 +59,16 @@ fn channel_url() -> String {
 /// variable. It names `CONTAINER` specifically, so the ungranted case tests the
 /// per-container lookup rather than an empty table: `Auth::Anonymous` is the
 /// container named and *refused*.
-fn azurite_entry(auth: Auth) -> HashMap<AzureHost, AzureEndpointOptions> {
+fn azurite_entry(auth: Auth) -> HashMap<AzureEndpointKey, AzureEndpointOptions> {
     HashMap::from([(
-        AzureHost::parse(AUTHORITY).expect("azurite authority is a valid host:port"),
+        AzureEndpointKey::parse(&format!("{AUTHORITY}/{ACCOUNT}"))
+            .expect("azurite authority and account name"),
         AzureEndpointOptions::new(
             [(
-                AzureCoordinates::parse(&format!("{ACCOUNT}/{CONTAINER}"))
-                    .expect("azurite account and container names"),
+                ContainerName::new(CONTAINER).expect("azurite container name"),
                 auth,
             )],
-            AzureEndpoint {
-                scheme: AzureScheme::Http,
-                addressing: Addressing::PathStyle,
-            },
+            AzureScheme::Http,
         ),
     )])
 }

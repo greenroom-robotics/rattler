@@ -13,12 +13,13 @@
 //! cargo test -p rattler_networking --features azure --test azure_real_fetch -- --ignored --nocapture
 //! ```
 //!
-//! Set `AZURE_TEST_HOST` to target a sovereign cloud or emulator directly
-//! (overrides the default `{account}.blob.core.windows.net` host).
+//! Set `AZURE_TEST_HOST` to target a sovereign cloud directly (overrides the
+//! default `{account}.blob.core.windows.net` host). Its first label must be the
+//! account, since that is what makes it an `azure-options` key on its own.
 
 use std::collections::HashMap;
 
-use rattler_azure::{Auth, AzureCoordinates, AzureEndpoint, AzureEndpointOptions, AzureHost};
+use rattler_azure::{Auth, AzureEndpointKey, AzureEndpointOptions, AzureScheme, ContainerName};
 use rattler_networking::AzureMiddleware;
 use reqwest_middleware::ClientBuilder;
 
@@ -39,14 +40,14 @@ async fn azure_middleware_fetches_real_repodata() {
     // the same account are unaffected, which is the point of keying it per
     // container.
     let options = HashMap::from([(
-        AzureHost::parse(&host).expect("AZURE_TEST_HOST is not a valid host[:port]"),
+        AzureEndpointKey::parse(&host).expect("AZURE_TEST_HOST is not a valid endpoint key"),
         AzureEndpointOptions::new(
             [(
-                AzureCoordinates::parse(&format!("{account}/{container}"))
-                    .expect("AZURE_TEST_ACCOUNT/AZURE_TEST_CONTAINER are not valid names"),
+                ContainerName::new(&container)
+                    .expect("AZURE_TEST_CONTAINER is not a valid container name"),
                 Auth::DefaultChain,
             )],
-            AzureEndpoint::default(),
+            AzureScheme::Https,
         ),
     )]);
 
