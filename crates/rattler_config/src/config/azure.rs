@@ -244,36 +244,32 @@ releases = true
 
     #[test]
     fn keys_are_normalized_the_same_way_lookups_are() {
-        for (written, looked_up) in [(
-            "MyCompany.blob.core.windows.net",
-            "mycompany.blob.core.windows.net",
-        )] {
-            let map: AzureOptionsMap = toml::from_str(&format!(
-                "[\"{written}\".auth]\n\"mycompany/releases\" = true\n"
-            ))
-            .unwrap();
+        let written = "MyCompany.blob.core.windows.net";
+        let looked_up = "mycompany.blob.core.windows.net";
+        let map: AzureOptionsMap = toml::from_str(&format!(
+            "[\"{written}\".auth]\n\"mycompany/releases\" = true\n"
+        ))
+        .unwrap();
 
-            assert!(
-                map.get(&host(looked_up))
-                    .fetch(Some(&container("releases")))
-                    .auth
-                    .is_granted(),
-                "the grant written as `{written}` did not apply to `{looked_up}`"
-            );
-            assert_eq!(
-                map.keys(),
-                vec![
-                    format!("\"{looked_up}\""),
-                    format!("\"{looked_up}\".auth.\"mycompany/releases\""),
-                ],
-                "{written}"
-            );
-            let written_back = toml::to_string(&map).unwrap();
-            assert!(
-                written_back.contains(&format!("[\"{looked_up}\"")),
-                "{written} was written back as {written_back}"
-            );
-        }
+        assert!(
+            map.get(&host(looked_up))
+                .fetch(Some(&container("releases")))
+                .auth
+                .is_granted(),
+            "the grant written as `{written}` did not apply to `{looked_up}`"
+        );
+        assert_eq!(
+            map.keys(),
+            vec![
+                format!("\"{looked_up}\""),
+                format!("\"{looked_up}\".auth.\"mycompany/releases\""),
+            ],
+        );
+        let written_back = toml::to_string(&map).unwrap();
+        assert!(
+            written_back.contains(&format!("[\"{looked_up}\"")),
+            "{written} was written back as {written_back}"
+        );
     }
 
     #[test]

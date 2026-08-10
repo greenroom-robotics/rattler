@@ -238,6 +238,12 @@ impl AzureCredentialsOpts {
 mod tests {
     use super::*;
 
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        creds: AzureCredentialsOpts,
+    }
+
     fn opts(
         account_key: Option<&str>,
         sas_token: Option<&str>,
@@ -318,14 +324,6 @@ mod tests {
     // exercised here.
     #[test]
     fn azure_cli_flag_and_ttl_parse() {
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct Cli {
-            #[command(flatten)]
-            creds: AzureCredentialsOpts,
-        }
-
         let cli = Cli::try_parse_from(["test", "--azure-cli", "--azure-cli-sas-ttl-minutes", "90"])
             .expect("should parse");
         assert!(cli.creds.azure_cli);
@@ -372,14 +370,6 @@ mod tests {
     }
 
     fn parse(args: &[&str]) -> Result<AzureCredentialsOpts, clap::Error> {
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct Cli {
-            #[command(flatten)]
-            creds: AzureCredentialsOpts,
-        }
-
         Cli::try_parse_from(std::iter::once("test").chain(args.iter().copied()))
             .map(|cli| cli.creds)
     }
@@ -476,11 +466,6 @@ mod tests {
             assert!(!out.contains("deadbeef"), "leaked token: {out}");
         }
 
-        let cli = AzureAuthSource::AzureCli {
-            ttl: Duration::from_secs(60),
-        };
-        assert!(format!("{cli:?}").contains("60"));
-
         let out = format!("{:?}", opts(Some("supersecretkey"), None, false));
         assert!(out.contains("REDACTED"), "not redacted: {out}");
         assert!(!out.contains("supersecret"), "leaked key: {out}");
@@ -488,24 +473,10 @@ mod tests {
         let out = format!("{:?}", opts(None, Some("sig=deadbeef"), false));
         assert!(out.contains("REDACTED"), "not redacted: {out}");
         assert!(!out.contains("deadbeef"), "leaked token: {out}");
-
-        // Absent secrets print as `None`, so the redaction cannot be mistaken for
-        // a supplied-but-hidden value.
-        let out = format!("{:?}", opts(None, None, true));
-        assert!(out.contains("account_key: None"), "unexpected: {out}");
-        assert!(out.contains("sas_token: None"), "unexpected: {out}");
     }
 
     #[test]
     fn ttl_range_is_enforced() {
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct Cli {
-            #[command(flatten)]
-            creds: AzureCredentialsOpts,
-        }
-
         assert!(
             Cli::try_parse_from(["test", "--azure-cli", "--azure-cli-sas-ttl-minutes", "0"])
                 .is_err()

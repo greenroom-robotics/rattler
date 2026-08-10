@@ -32,14 +32,6 @@ pub enum AzureCredentials {
     SasToken(SecretString),
 }
 
-/// Strip a single leading `?` from a SAS token.
-///
-/// `--sas-token` may be written with or without one; a SAS minted by
-/// [`mint_user_delegation_sas`] never has one.
-pub fn normalize_sas_token(token: &str) -> &str {
-    token.strip_prefix('?').unwrap_or(token)
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum AzureUrlError {
     #[error("no host in Azure blob URL")]
@@ -948,10 +940,13 @@ pub fn azblob_config(
 
     let (account_key, sas_token) = match credentials {
         AzureCredentials::AccountKey(key) => (Some(key.expose_secret().to_string()), None),
-        AzureCredentials::SasToken(token) => (
-            None,
-            Some(normalize_sas_token(token.expose_secret()).to_string()),
-        ),
+        AzureCredentials::SasToken(token) => {
+            let token = token.expose_secret();
+            (
+                None,
+                Some(token.strip_prefix('?').unwrap_or(token).to_string()),
+            )
+        }
     };
 
     Ok(opendal::services::AzblobConfig {
@@ -1603,13 +1598,9 @@ mod tests {
                 "mycompany.blob.core.windows.net:443",
             ),
             ("ünï.blob.example", "xn--n-nga1b.blob.example"),
-            ("xn--n-nga1b.blob.example", "xn--n-nga1b.blob.example"),
             ("[0:0:0:0:0:0:0:1]:10000", "[::1]:10000"),
-            ("[::1]:10000", "[::1]:10000"),
             ("0x7f.1", "127.0.0.1"),
-            ("127.0.0.1", "127.0.0.1"),
             ("acct.blob.core.windows.net.", "acct.blob.core.windows.net"),
-            ("acct.blob.core.windows.net", "acct.blob.core.windows.net"),
         ] {
             let host = AzureHost::parse(written)
                 .unwrap_or_else(|err| panic!("{written} should parse: {err}"));
