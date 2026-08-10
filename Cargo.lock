@@ -5384,6 +5384,7 @@ dependencies = [
  "netrc-rs",
  "rattler_azure",
  "rattler_config",
+ "rattler_redaction",
  "regex",
  "reqsign-azure-storage",
  "reqsign-command-execute-tokio",
