@@ -74,14 +74,9 @@ impl AzureAuthSource {
             AzureAuthSource::SasToken(token) => Ok(AzureCredentials::SasToken(token)),
             AzureAuthSource::AzureCli { ttl } => {
                 let container = key.container_in(channel)?;
-                let token = mint_user_delegation_sas(
-                    key.account(),
-                    &container,
-                    permissions,
-                    ttl,
-                    scheme,
-                )
-                .await?;
+                let token =
+                    mint_user_delegation_sas(key.account(), &container, permissions, ttl, scheme)
+                        .await?;
                 Ok(AzureCredentials::SasToken(token))
             }
         }

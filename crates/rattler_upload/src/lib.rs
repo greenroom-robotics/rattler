@@ -92,17 +92,12 @@ pub async fn upload_from_args(args: UploadOpts) -> miette::Result<()> {
             // normally run) is unreachable. Lifting it means giving `rattler_upload`
             // a `--config` of its own, which neither `rattler upload` nor
             // rattler-build passes today.
-            let key = rattler_azure::AzureEndpointKey::host_style(channel.host())
-                .into_diagnostic()?;
+            let key =
+                rattler_azure::AzureEndpointKey::host_style(channel.host()).into_diagnostic()?;
             let scheme = rattler_azure::AzureScheme::default();
             let credentials = azure_opts
                 .credentials
-                .resolve(
-                    upload::AZURE_UPLOAD_SAS_PERMISSIONS,
-                    &channel,
-                    &key,
-                    scheme,
-                )
+                .resolve(upload::AZURE_UPLOAD_SAS_PERMISSIONS, &channel, &key, scheme)
                 .await
                 .into_diagnostic()?;
             upload::upload_package_to_azure(

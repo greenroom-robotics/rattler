@@ -108,9 +108,8 @@ impl AzureMiddleware {
     /// identity, AAD token fetches), so its proxy, CA bundle and TLS settings apply
     /// there too.
     ///
-    /// `options` is the `azure-options` table, as
-    /// `rattler_config::AzureOptionsMap::endpoint_options` yields it. Empty means
-    /// every `az://` request is anonymous.
+    /// `options` is the `azure-options` table, keyed as the config file keys it.
+    /// Empty means every `az://` request is anonymous.
     pub fn new(
         client: Client,
         options: impl IntoIterator<Item = (AzureEndpointKey, AzureEndpointOptions)>,

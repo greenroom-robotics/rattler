@@ -191,7 +191,10 @@ mod tests {
         let user: AzureOptionsMap =
             toml::from_str("[\"host.example\".auth]\ninternal = true\n").unwrap();
 
-        let entry = system.merge_config(&user).unwrap().get(&key("host.example"));
+        let entry = system
+            .merge_config(&user)
+            .unwrap()
+            .get(&key("host.example"));
         assert!(entry.fetch(Some(&container("internal"))).auth.is_granted());
         // The higher-precedence file states the whole grant table for the key, so
         // a grant it does not restate is revoked rather than inherited: a table

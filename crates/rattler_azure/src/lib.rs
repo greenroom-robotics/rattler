@@ -56,9 +56,6 @@ pub enum AzureUrlError {
     )]
     InvalidHost(String),
 
-    #[error("could not derive account name from Azure blob URL")]
-    NoAccount,
-
     /// An `azure-options` key names more than an endpoint and an account.
     #[error(
         "`{0}` is not an `azure-options` key: a key is a channel URL prefix up to the container, \
@@ -1179,18 +1176,12 @@ mod tests {
     #[test]
     fn a_written_key_round_trips() {
         for (written, canonical) in [
-            (
-                "acct.blob.core.windows.net",
-                "acct.blob.core.windows.net",
-            ),
+            ("acct.blob.core.windows.net", "acct.blob.core.windows.net"),
             (
                 "MyCompany.blob.core.windows.net",
                 "mycompany.blob.core.windows.net",
             ),
-            (
-                "acct.blob.core.windows.net.",
-                "acct.blob.core.windows.net",
-            ),
+            ("acct.blob.core.windows.net.", "acct.blob.core.windows.net"),
             (
                 "acct.blob.core.windows.net:443",
                 "acct.blob.core.windows.net:443",

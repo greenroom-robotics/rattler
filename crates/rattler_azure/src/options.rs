@@ -58,7 +58,7 @@ impl Auth {
 /// storage service and is one import away.
 ///
 /// Defaults to [`AzureScheme::Https`]. `Http` exists for local emulators such as
-/// Azurite, and selecting it is an explicit per-host decision in config.
+/// Azurite, and selecting it is an explicit per-endpoint decision in config.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
@@ -98,9 +98,9 @@ pub struct AzureFetchOptions {
 /// One `azure-options` entry, as the config file spells it.
 ///
 /// This is the serde surface. Each consumer takes the narrower view it can act
-/// on, via [`Self::endpoint`] or [`Self::fetch`], and the fields are private so
+/// on, via [`Self::scheme`] or [`Self::fetch`], and the fields are private so
 /// that view is the only way in. The default value is the no-entry behaviour, so
-/// callers can look an absent host up and fall back to `default()`.
+/// callers can look an absent key up and fall back to `default()`.
 ///
 /// # Why the grant is per container
 ///
@@ -152,10 +152,7 @@ pub struct AzureEndpointOptions {
 }
 
 impl AzureEndpointOptions {
-    pub fn new(
-        auth: impl IntoIterator<Item = (ContainerName, Auth)>,
-        scheme: AzureScheme,
-    ) -> Self {
+    pub fn new(auth: impl IntoIterator<Item = (ContainerName, Auth)>, scheme: AzureScheme) -> Self {
         Self {
             scheme,
             auth: auth.into_iter().collect(),

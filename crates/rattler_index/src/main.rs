@@ -296,10 +296,11 @@ fn azure_endpoint(
             .as_ref()
             .is_some_and(|config| config.azure_options.contains(key))
     })?;
-    let key = located
-        .key()
-        .cloned()
-        .ok_or(rattler_azure::AzureUrlError::NoAccount)?;
+    let key = match located.key() {
+        Some(key) => key.clone(),
+        // Re-derived only for the error, which names the key to add.
+        None => AzureEndpointKey::host_style(channel.host())?,
+    };
     let scheme = config
         .as_ref()
         .map(|config| config.azure_options.get(&key).scheme())
