@@ -55,7 +55,10 @@ impl<'g> SubdirBuilder<'g> {
             || url.scheme() == "gcs"
             || url.scheme() == "oci"
             || url.scheme() == "s3"
-            || url.scheme() == "az"
+            // `az://` only resolves when the azure middleware is compiled in;
+            // without it reqwest rejects the scheme deep inside the request
+            // instead of reporting an unsupported url here.
+            || (cfg!(feature = "azure") && url.scheme() == "az")
         {
             let source_config = self.gateway.channel_config.get(&self.channel.base_url);
 
