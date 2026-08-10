@@ -96,12 +96,38 @@ pub enum AzureUrlError {
         source: url::ParseError,
     },
 
+    /// The path contains a `.` or `..` segment, in any spelling.
+    ///
+    /// The URL parser resolves these before anything here sees a segment, so
+    /// `az://acct.blob.core.windows.net/general/a/../../evil/x` would arrive
+    /// addressing container `evil` while reading as `general` — a credential
+    /// granted for one container spent on another.
     #[error(
-        "Azure blob channel URL path `{written}` is not the path it resolves to, `{resolved}`; a \
-         channel URL must name the location it addresses, so write `{resolved}` if that is the \
-         location you mean"
+        "Azure blob channel URL segment `{0}` is a relative path segment; a channel URL must name \
+         the container it addresses directly, so write the path without `.` or `..`"
     )]
-    NonCanonicalPath { written: String, resolved: String },
+    DotSegmentInPath(String),
+
+    /// The path has an empty segment somewhere other than the end.
+    ///
+    /// `az://host//container/...` would otherwise read as having no container at
+    /// all, which silently downgrades a granted fetch to an anonymous one.
+    #[error(
+        "Azure blob channel URL path `{path}` has an empty segment at position {index}; a doubled \
+         `/` names nothing, so write the path with single separators"
+    )]
+    EmptyPathSegment { path: String, index: usize },
+
+    /// A path segment contains a `%` that does not begin a percent-escape.
+    ///
+    /// Percent-decoding passes it through literally, so the fetch path would send
+    /// it raw while the index path re-encodes it to `%25` and writes to a different
+    /// blob than the one that gets read.
+    #[error(
+        "Azure blob channel URL segment `{segment}` contains `{escape}`, which is not a valid \
+         percent-escape; write a literal `%` as `%25`"
+    )]
+    MalformedPercentEscape { segment: String, escape: String },
 
     /// A path segment percent-decodes to bytes that are not UTF-8.
     ///
@@ -116,17 +142,6 @@ pub enum AzureUrlError {
         #[source]
         source: std::str::Utf8Error,
     },
-
-    /// A path segment contains `%2F`, an encoded slash.
-    ///
-    /// One segment holding a slash and two segments are different blob paths, and
-    /// the URL Standard does not resolve `%2F`, so either reading would address a
-    /// place the URL text does not say.
-    #[error(
-        "Azure blob channel URL segment `{0}` contains an encoded slash (`%2F`); write the path \
-         separator as `/` if you mean a new segment"
-    )]
-    EncodedSlashInPath(String),
 
     #[error(
         "Azure blob channel URL must use the `az://` scheme, e.g. \
@@ -312,10 +327,32 @@ pub fn container(
 }
 
 fn segment(channel: &AzureChannelUrl, index: usize) -> Option<&str> {
+    // The `is_empty` filter is only sound because `AzureChannelUrl::parse` rejects
+    // an empty segment anywhere but the end: the sole one that can reach here is a
+    // trailing slash, where "absent" is the right reading. Without that guarantee
+    // `az://host//general` would read as having no container and silently fetch a
+    // granted one anonymously.
     channel
         .path_segments()
         .nth(index)
         .filter(|segment| !segment.is_empty())
+}
+
+/// The first `%` in `segment` that does not begin a two-hex-digit escape, with
+/// whatever follows it, for the error message.
+fn malformed_percent_escape(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    bytes.iter().enumerate().find_map(|(index, byte)| {
+        if *byte != b'%' {
+            return None;
+        }
+        let escape = bytes
+            .get(index..index + 3)
+            .filter(|escape| escape[1..].iter().all(u8::is_ascii_hexdigit));
+        escape
+            .is_none()
+            .then(|| segment[index..].chars().take(3).collect())
+    })
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -599,26 +636,63 @@ impl AzureChannelUrl {
 
         // Dot segments — `%2e%2e` as much as `..` — are resolved by that parser
         // before anything here has looked at a segment, so a path reading as one
-        // container (path-style: one *account*) can address another. Nothing needs
-        // to guess which rewrites are benign: a path that is not already the path
-        // it resolves to is not the path the user can be assumed to have meant.
+        // container (path-style: one *account*) can address another. They are
+        // checked against the text the user wrote, because by the time `url` exists
+        // the evidence is gone. One anywhere is enough: `/general/a/../../evil/x`
+        // eats backwards into the container from a segment that reads as harmless.
+        //
+        // Nothing else about the path is this parser's business. Which blob a
+        // well-formed path names is the user's to get right; only the segments that
+        // decide *which container gets a credential* are load-bearing here, and
+        // those are guarded by `AccountName`/`ContainerName`, whose charsets admit
+        // neither `/` nor `%`.
         let written = match tail.split(['?', '#']).next().unwrap_or_default() {
             "" => "/",
             path => path,
         };
-        if written != url.path() {
-            return Err(AzureUrlError::NonCanonicalPath {
-                written: written.to_string(),
-                resolved: url.path().to_string(),
+        for segment in written.trim_start_matches('/').split('/') {
+            let decoded = percent_encoding::percent_decode_str(segment)
+                .decode_utf8()
+                .map_err(|source| AzureUrlError::NonUtf8Path {
+                    segment: segment.to_string(),
+                    source,
+                })?;
+            if decoded == "." || decoded == ".." {
+                return Err(AzureUrlError::DotSegmentInPath(segment.to_string()));
+            }
+        }
+
+        // An empty segment is not a blob name and not a container name, but
+        // `path_segments()` yields it, so without this `az://host//general` reads as
+        // "no container" and downgrades a granted fetch to anonymous. A trailing one
+        // is just a trailing slash.
+        let segments = url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let last = segments.len().saturating_sub(1);
+        if let Some(index) = segments
+            .iter()
+            .take(last)
+            .position(|segment| segment.is_empty())
+        {
+            return Err(AzureUrlError::EmptyPathSegment {
+                path: url.path().to_string(),
+                index,
             });
         }
 
-        // Every segment must survive the round trip to a blob name. `%2F` is checked
-        // before decoding, because after it there is no telling it from a `/` the
-        // user wrote.
-        for segment in url.path_segments().into_iter().flatten() {
-            if segment.to_ascii_uppercase().contains("%2F") {
-                return Err(AzureUrlError::EncodedSlashInPath(segment.to_string()));
+        // A `%` that does not start an escape is the one encoding defect the user
+        // cannot be left to own: `percent_decode` passes it through literally, so
+        // the fetch path sends `gen%eral` while opendal re-encodes the decoded form
+        // to `gen%25eral` and indexes under a different blob.
+        for segment in &segments {
+            if let Some(escape) = malformed_percent_escape(segment) {
+                return Err(AzureUrlError::MalformedPercentEscape {
+                    segment: segment.to_string(),
+                    escape,
+                });
             }
             percent_encoding::percent_decode_str(segment)
                 .decode_utf8()
@@ -655,7 +729,13 @@ impl AzureChannelUrl {
         }
         if let Some(fragment) = &self.fragment {
             text.push('#');
-            text.push_str(fragment);
+            // Masked on the same terms as the query: this spelling is the one that
+            // reaches logs and error messages, and a `sig` is no less a signature
+            // for having been written after a `#`.
+            match sas {
+                Sas::Exposed => text.push_str(fragment),
+                Sas::Masked => text.push_str(&mask_sas_signature(fragment)),
+            }
         }
         // Cannot fail: the authority re-serializes to the normalized form it was
         // parsed from, and the path, query and fragment are already-encoded output
@@ -1645,34 +1725,69 @@ mod tests {
     /// out to.
     #[test]
     fn a_rewritten_path_is_rejected() {
-        for (input, resolved) in [
-            (
-                "az://acct.blob.core.windows.net/general/%2e%2e/%2e%2e/othercontainer/x",
-                "/othercontainer/x",
-            ),
-            (
-                "az://127.0.0.1:10000/devstoreaccount1/general/%2e%2e/%2e%2e/otheraccount/othercontainer",
-                "/otheraccount/othercontainer",
-            ),
-            (
-                "az://acct.blob.core.windows.net/general/../../othercontainer",
-                "/othercontainer",
-            ),
-            (
-                "az://acct.blob.core.windows.net/general/./noarch",
-                "/general/noarch",
-            ),
+        for input in [
+            "az://acct.blob.core.windows.net/general/%2e%2e/%2e%2e/othercontainer/x",
+            "az://127.0.0.1:10000/devstoreaccount1/general/%2e%2e/%2e%2e/otheraccount/othercontainer",
+            "az://acct.blob.core.windows.net/general/../../othercontainer",
+            "az://acct.blob.core.windows.net/general/./noarch",
+            // A dot segment behind an encoded slash still climbs, because the
+            // decode happens before the comparison.
+            "az://acct.blob.core.windows.net/general/%2E%2E/othercontainer",
         ] {
-            let Err(err) = AzureChannelUrl::parse(input) else {
-                panic!("expected a rejection for {input}");
-            };
             assert!(
-                matches!(&err, AzureUrlError::NonCanonicalPath { resolved: got, .. } if got == resolved),
-                "unexpected error for {input}: {err}"
+                matches!(
+                    AzureChannelUrl::parse(input),
+                    Err(AzureUrlError::DotSegmentInPath(_))
+                ),
+                "expected a rejection for {input}"
             );
-            let message = err.to_string();
-            assert!(message.contains(resolved), "{message}");
-            assert!(message.contains("/general/"), "{message}");
+        }
+    }
+
+    /// The container is what a grant is spent on, so an empty leading segment must
+    /// not read as "no container" — that fetches a private container anonymously
+    /// and reports the 404 as a missing channel.
+    #[test]
+    fn an_empty_segment_is_rejected() {
+        for input in [
+            "az://acct.blob.core.windows.net//general/noarch",
+            "az://acct.blob.core.windows.net/general//noarch",
+            "az://127.0.0.1:10000//devstoreaccount1/general",
+        ] {
+            assert!(
+                matches!(
+                    AzureChannelUrl::parse(input),
+                    Err(AzureUrlError::EmptyPathSegment { .. })
+                ),
+                "expected a rejection for {input}"
+            );
+        }
+
+        // A trailing slash is a trailing slash, not an empty segment.
+        assert_eq!(
+            channel("az://acct.blob.core.windows.net/general/")
+                .canonical()
+                .path(),
+            "/general/"
+        );
+    }
+
+    /// A lone `%` decodes to itself, so the fetch path would send it raw while
+    /// opendal re-encodes the decoded form to `%25` and indexes a different blob.
+    #[test]
+    fn a_malformed_percent_escape_is_rejected() {
+        for input in [
+            "az://acct.blob.core.windows.net/general/gen%eral",
+            "az://acct.blob.core.windows.net/general/100%",
+            "az://acct.blob.core.windows.net/general/%zz",
+        ] {
+            assert!(
+                matches!(
+                    AzureChannelUrl::parse(input),
+                    Err(AzureUrlError::MalformedPercentEscape { .. })
+                ),
+                "expected a rejection for {input}"
+            );
         }
     }
 
@@ -1712,18 +1827,35 @@ mod tests {
             Err(AzureUrlError::NonUtf8Path { .. })
         ));
 
-        // Both spellings: `url` normalizes the hex digits' case but not the escape.
+        // An encoded slash past the container is a blob name containing a slash,
+        // which Azure supports. It cannot move the container: `container()` reads a
+        // separate raw segment, and `ContainerName`'s charset admits neither `/`
+        // nor `%`, so the boundary is held by the type rather than by banning the
+        // escape everywhere.
         for input in [
             "az://acct.blob.core.windows.net/general/a%2Fb",
             "az://acct.blob.core.windows.net/general/a%2fb",
         ] {
-            assert!(
-                matches!(
-                    AzureChannelUrl::parse(input),
-                    Err(AzureUrlError::EncodedSlashInPath(_))
-                ),
+            let parsed = channel(input);
+            assert_eq!(
+                container(&parsed, Addressing::HostStyle).unwrap(),
+                Some(ContainerName::new("general").unwrap()),
                 "{input}"
             );
+        }
+
+        // Unencoded UTF-8 and spaces are the user's to write; we encode them.
+        for (input, path) in [
+            (
+                "az://acct.blob.core.windows.net/general/café",
+                "/general/caf%C3%A9",
+            ),
+            (
+                "az://acct.blob.core.windows.net/general/with space",
+                "/general/with%20space",
+            ),
+        ] {
+            assert_eq!(channel(input).canonical().path(), path, "{input}");
         }
 
         assert_eq!(
@@ -1798,6 +1930,19 @@ mod debug_redaction_tests {
             assert!(!shown.contains("SECRETSIG"), "signature leaked: {shown}");
             assert!(shown.contains("sv=2024-11-04"), "over-redacted: {shown}");
             assert!(shown.contains("se=z"), "over-redacted: {shown}");
+        }
+
+        // A `sig` is no less a signature for having been written after a `#`, and
+        // the fragment reaches every printed spelling the query does.
+        let fragmented =
+            AzureChannelUrl::parse("az://acct.blob.core.windows.net/general/p?sv=1#sig=SECRETFRAG")
+                .unwrap();
+        for shown in [
+            fragmented.canonical().to_string(),
+            fragmented.to_string(),
+            format!("{fragmented:?}"),
+        ] {
+            assert!(!shown.contains("SECRETFRAG"), "signature leaked: {shown}");
         }
 
         assert!(
