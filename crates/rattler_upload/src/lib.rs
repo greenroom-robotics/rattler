@@ -88,9 +88,7 @@ pub async fn upload_from_args(args: UploadOpts) -> miette::Result<()> {
             // `[azure-options."<key>"]` entry to come from, and nothing to state a
             // cleartext endpoint. Giving `rattler_upload` a `--config` of its own is
             // what would lift that, and neither `rattler upload` nor rattler-build
-            // passes one today. Where the account lives is the one bit that cannot be
-            // defaulted, since the URL reads either way: absent `--path-style` the
-            // host's first label is taken as the account.
+            // passes one today.
             let location =
                 rattler_azure::locate_as(&azure_opts.channel, azure_opts.path_style.into())
                     .into_diagnostic()?;

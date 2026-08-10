@@ -8,11 +8,11 @@ on:
       - crates/rattler_index/**
       - crates/rattler_networking/**
       - crates/rattler_upload/**
-      # The gateway owns the shard-index revalidation path, and its bare-304
-      # handling exists because that is what Azure answers with.
+      # The gateway's bare-304 handling exists because that is what Azure answers
+      # a conditional GET with.
       - crates/rattler_repodata_gateway/**
-      # `az://` URLs and their credentials pass through redaction on the way to
-      # logs and errors, and the bindings and the CLI both wire the middleware.
+      # `az://` credentials pass through redaction on the way to logs and errors,
+      # and the bindings and the CLI both wire the middleware.
       - crates/rattler_redaction/**
       - crates/rattler-bin/**
       - py-rattler/**
@@ -42,19 +42,8 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Enable sccache.
-      #
-      # This environment variable is picked up by pixi build which will then
-      # set up the rust build using sccache.
       SCCACHE_GHA_ENABLED: "true"
 
-    # No secrets: the emulator's `devstoreaccount1` credentials are published
-    # constants, spelled out in the tests, and only ever reach loopback.
-    #
-    # There is no `--health-cmd` here on purpose. It would run inside the
-    # container and so could only reach the container's own loopback, which
-    # says nothing about the published port the tests actually connect to. The
-    # readiness check runs on the runner instead, as the first step below.
     services:
       azurite:
         image: mcr.microsoft.com/azure-storage/azurite:3.36.0
@@ -71,11 +60,11 @@ jobs:
         timeout-minutes: 3
         run: |
           set -euo pipefail
-          # Speak HTTP to the published port from the runner, which is exactly
-          # what the tests do. Azurite refuses an unsigned container list, so
-          # any HTTP status is the proof we want: the blob service is bound to
-          # a routable address and answering. `000` means curl never got a
-          # response.
+          # Probe the published port from the runner, as the tests do — a service
+          # `--health-cmd` would run inside the container and could only reach the
+          # container's own loopback. Azurite refuses an unsigned container list, so
+          # any HTTP status proves the blob service is bound and answering; `000`
+          # means curl never got a response.
           for _ in $(seq 1 60); do
             status="$(curl --silent --output /dev/null --max-time 5 \
               --write-out '%{http_code}' \

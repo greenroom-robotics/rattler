@@ -38,9 +38,7 @@ fn parse_s3_url(value: &str) -> Result<Url, String> {
     }
 }
 
-/// SAS permissions requested when minting a user-delegation SAS for indexing.
-/// Indexing read-modify-writes repodata and lists packages, so it needs read,
-/// write, list and create.
+/// The SAS permissions indexing needs: read, write, list, create.
 #[cfg(feature = "azure")]
 const AZURE_INDEX_SAS_PERMISSIONS: &str = "rwlc";
 
@@ -277,15 +275,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `azure-options` entry a channel falls under: the key that says where its
-/// account and container are, and the scheme to reach them over.
-///
-/// Entry *presence* is the whole selection mechanism: it is what picks the
-/// path-style reading, and so which segment is the account and which the
-/// container. Grants are not part of the result: indexing signs with the
-/// credential its caller supplied, so there is no ambient chain to gate. A URL
-/// matching no entry is read host-style, which fails for a host that names no
-/// account — indexing has to know the account.
 #[cfg(feature = "azure")]
 fn azure_endpoint(
     config: &Option<Config>,
@@ -296,7 +285,8 @@ fn azure_endpoint(
             .as_ref()
             .is_some_and(|config| config.azure_options.contains(key))
     })?;
-    // Re-derived only for the error, which names the key to add.
+    // Re-derived because the scheme lookup below is keyed by it; the `?` arm is
+    // where the error names the key to add.
     let key = match located.key() {
         Some(key) => key.clone(),
         None => AzureEndpointKey::host_style(channel.host())?,
@@ -309,9 +299,6 @@ fn azure_endpoint(
 }
 
 /// The `[index-config."…"]` key a channel is looked up under.
-///
-/// Each backend builds it one way only, so a channel cannot be looked up under a
-/// spelling no user writes.
 struct IndexConfigKey(String);
 
 impl IndexConfigKey {
@@ -369,7 +356,6 @@ fn effective_index_options(
 mod tests {
     use super::*;
 
-    /// Load a config from TOML through a real file, the way `--config` does.
     fn config_from(toml: &str) -> Option<Config> {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rattler-config.toml");
@@ -396,8 +382,6 @@ mod tests {
         assert_ne!(key.0, channel.wire(AzureScheme::Https).to_string());
     }
 
-    /// The key is what tells the index the account is a path segment, and a wrong
-    /// one fails silently.
     #[test]
     fn a_path_style_entry_drives_the_azurite_index_config() {
         let config = config_from(
@@ -423,8 +407,6 @@ mod tests {
         assert_eq!(container.as_str(), "general");
     }
 
-    /// Without an entry the same channel is read host-style, and an IP literal
-    /// names no account for the index to write to.
     #[test]
     fn an_unconfigured_ip_literal_channel_is_refused() {
         let channel =

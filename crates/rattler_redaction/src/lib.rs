@@ -5,8 +5,8 @@ use url::Url;
 /// A default string to use for redaction.
 pub const DEFAULT_REDACTION_STR: &str = "********";
 
-/// The query parameter holding an Azure SAS signature, which is the credential
-/// itself. The rest of such a URL is inert without it and stays readable.
+/// The signature is the credential itself; the rest of such a URL is inert without
+/// it and stays readable.
 const SIGNATURE_PARAM: &str = "sig";
 
 /// Mask the signature of a pre-signed URL wherever one appears in `text`.
@@ -78,10 +78,9 @@ pub fn redact_known_secrets_from_url(url: &Url, redaction: &str) -> Option<Url> 
         url.set_query(Some(&masked[1..]));
     }
 
-    // A URL that cannot be a base has no path segments and so no `/t/<token>/`
-    // to mask, but it may still have carried a signature above — returning `None`
-    // here would throw that masking away, since callers fall back to the
-    // unredacted URL.
+    // A URL that cannot be a base has no `/t/<token>/` to mask but may still have
+    // carried a signature above; returning `None` would throw that masking away,
+    // since callers fall back to the unredacted URL.
     let token_prefixed = url.path_segments().is_some_and(|mut segments| {
         matches!((segments.next(), segments.next()), (Some("t"), Some(_)))
     });
@@ -238,8 +237,6 @@ mod test {
         );
     }
 
-    /// A URL with no path segments still has a signature worth masking, and
-    /// callers fall back to the unredacted URL when this returns `None`.
     #[test]
     fn a_url_that_cannot_be_a_base_still_has_its_signature_masked() {
         let redacted = redact_known_secrets_from_url(

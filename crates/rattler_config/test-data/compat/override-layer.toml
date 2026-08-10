@@ -19,8 +19,6 @@ endpoint-url = "https://minio.example.com"
 region = "auto"
 force-path-style = false
 
-# An entry replaces the lower layer's wholesale, so the `releases = true` written
-# there does not survive this layer restating the table.
 [azure-options."mycompany.blob.core.windows.net".auth]
 staging = true
 public = false

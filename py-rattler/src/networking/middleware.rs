@@ -126,8 +126,7 @@ impl From<PyGCSMiddleware> for GCSMiddleware {
 }
 
 /// Azure middleware with no `azure-options` entries: every `az://` fetch is
-/// anonymous over https. Exposing the per-host options table to Python, as
-/// `PyS3Config` does for buckets, is follow-up work.
+/// anonymous over https.
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyAzureMiddleware {}

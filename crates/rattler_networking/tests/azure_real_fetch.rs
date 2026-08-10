@@ -33,12 +33,7 @@ async fn azure_middleware_fetches_real_repodata() {
     let host = std::env::var("AZURE_TEST_HOST")
         .unwrap_or_else(|_| format!("{account}.blob.core.windows.net"));
 
-    // The grant is what makes this the AAD test rather than an anonymous read: an
-    // `azure-options` entry naming this container is the only thing that lets the
-    // `az login` credential attach to it, and it makes a broken credential fail
-    // loudly instead of falling through to an unsigned 404. Sibling containers on
-    // the same account are unaffected, which is the point of keying it per
-    // container.
+    // The grant is what makes this the AAD test rather than an anonymous read.
     let options = HashMap::from([(
         AzureEndpointKey::parse(&host).expect("AZURE_TEST_HOST is not a valid endpoint key"),
         AzureEndpointOptions::new(

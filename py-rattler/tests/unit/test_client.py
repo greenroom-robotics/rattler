@@ -8,9 +8,6 @@ from rattler.networking.middleware import AuthenticationMiddleware, AzureMiddlew
 
 
 def test_azure_before_authentication_is_rejected() -> None:
-    # AzureMiddleware rewrites `az://` to `https://`, and AuthenticationMiddleware
-    # skips anything that is not already http(s). Azure first would therefore hand
-    # a stored blob-host credential to an ungranted container.
     with pytest.raises(ValueError, match="AzureMiddleware must come after AuthenticationMiddleware"):
         Client([AzureMiddleware(), AuthenticationMiddleware()])
 

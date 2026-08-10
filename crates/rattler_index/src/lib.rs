@@ -146,7 +146,8 @@ const REPODATA_SHARDS: &str = "repodata_shards.msgpack.zst";
 const CHANNEL_NOTICES: &str = "notices.json";
 const ZSTD_REPODATA_COMPRESSION_LEVEL: i32 = 19;
 const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
-const CACHE_CONTROL_REPODATA: &str = "public, max-age=300"; // 5 minutes
+/// The `Cache-Control` written on generated repodata.
+pub const CACHE_CONTROL_REPODATA: &str = "public, max-age=300"; // 5 minutes
 
 /// Returns a retry policy optimized for write operations with potential lock contention.
 ///
@@ -1526,12 +1527,11 @@ pub async fn index_s3_with_channel_metadata(
 /// Configuration for `index_azure`
 #[cfg(feature = "azure")]
 pub struct IndexAzureConfig {
-    /// The channel to index, with the `azure-options` entry it falls under and the
-    /// container it addresses under that entry.
+    /// The channel to index.
     pub location: AzureLocation,
     /// The credentials to use for Azure Blob access.
     pub credentials: AzureCredentials,
-    /// The wire scheme requests are sent over.
+    /// The wire scheme.
     pub scheme: AzureScheme,
     /// The target platform to index.
     pub target_platform: Option<Platform>,
@@ -1551,22 +1551,18 @@ pub struct IndexAzureConfig {
     pub max_parallel: usize,
     /// The multi-progress bar to use for the index.
     pub multi_progress: Option<MultiProgress>,
-    // NOTE: no `precondition_checks` field. opendal's azblob service supports
-    // `if_not_exists` and conditional reads but not conditional (`if_match`)
-    // writes, so any index of an already-populated channel fails under `Enabled`.
-    // The Azure path hardcodes `Disabled` rather than exposing a knob that only
-    // works on a first index; the conditional read is lost along with it.
+    // NOTE: no `precondition_checks` field. opendal's azblob service supports no
+    // conditional (`if_match`) writes, so any index of an already-populated channel
+    // would fail under `Enabled`; the Azure path hardcodes `Disabled`.
 }
 
-/// Create a new `repodata.json` for all packages in the channel at the given
-/// Azure Blob URL.
+/// Create a new `repodata.json` for all packages in the Azure Blob channel.
 #[cfg(feature = "azure")]
 pub async fn index_azure(config: IndexAzureConfig) -> anyhow::Result<()> {
     index_azure_with_channel_metadata(config, ChannelMetadata::default()).await
 }
 
-/// Create a new `repodata.json` for all packages in the channel at the given
-/// Azure Blob URL and write channel metadata into the generated repodata.
+/// As [`index_azure`], writing channel metadata into the generated repodata.
 #[cfg(feature = "azure")]
 pub async fn index_azure_with_channel_metadata(
     IndexAzureConfig {
@@ -1586,13 +1582,10 @@ pub async fn index_azure_with_channel_metadata(
     channel_metadata: ChannelMetadata,
 ) -> anyhow::Result<()> {
     let azblob_config = rattler_azure::azblob_config(&credentials, &location, scheme)?;
-    // The key and container every request below is aimed at. `azblob_config` reads
-    // the same pair, but an opendal error names neither it nor the account.
     let (key, container) = location.addressed()?;
     let builder = azblob_config.into_builder();
-    // opendal's default retry interceptor logs the error with its `url` context,
-    // and for a SAS the credential is *in* that URL — once per retry, at warn
-    // level. Same message, signature masked.
+    // opendal's default retry interceptor logs the error with its `url` context, and
+    // for a SAS the credential is *in* that URL. Same message, signature masked.
     let op = Operator::new(builder)?
         .layer(
             RetryLayer::new().with_notify(|event: opendal::layers::RetryEvent<'_>| {
@@ -1611,10 +1604,9 @@ pub async fn index_azure_with_channel_metadata(
         )
         .finish();
 
-    // The index's first act is to list the channel root, and a container that is
-    // not there answers that with the same `NotFound` an empty prefix would give a
-    // blob. Ask once here, where the answer can still be attributed to the
-    // container and account the run was pointed at.
+    // A missing container answers a list with the same `NotFound` an empty prefix
+    // does, so ask once here, where the answer can still be attributed to the
+    // container and account.
     if let Err(e) = op.list_with("").await {
         return Err(explain_azure_error(e, key, container));
     }
@@ -1638,8 +1630,7 @@ pub async fn index_azure_with_channel_metadata(
     .map_err(|e| annotate_azure_failure(e, key, container))
 }
 
-/// Explains an opendal error in terms of the account and container the request
-/// was aimed at, neither of which opendal's own error mentions.
+/// Names the account and container an opendal error does not mention.
 #[cfg(feature = "azure")]
 fn explain_azure_error(
     error: opendal::Error,
@@ -1661,10 +1652,6 @@ fn explain_azure_error(
     }
 }
 
-/// A 403 part-way through a run is usually a SAS that expired under the index,
-/// since nothing renews one mid-run. A 403 on the first request is as likely to be
-/// the wrong account: under host-style addressing the account was never written
-/// down, it was read off the host, and signing canonicalizes over whatever it read.
 #[cfg(feature = "azure")]
 fn azure_permission_denied_hint(
     key: &AzureEndpointKey,
@@ -1686,9 +1673,6 @@ fn azure_permission_denied_hint(
     )
 }
 
-/// Adds the hint above to a failure that carries a 403 anywhere in its chain, and
-/// leaves every other failure as it was: the index reports its own errors in its
-/// own terms, and only this one needs Azure's.
 #[cfg(feature = "azure")]
 fn annotate_azure_failure(
     error: anyhow::Error,

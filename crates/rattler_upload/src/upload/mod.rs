@@ -83,8 +83,7 @@ pub(crate) mod object_store {
             Self {
                 kind: err.kind(),
                 // `Debug` rather than `Display`: it is the spelling that keeps the
-                // source chain and the operation, and it is also the one the leak
-                // was found in.
+                // source chain and the operation.
                 message: rattler_redaction::redact_signatures_in_text(
                     &format!("{err:?}"),
                     rattler_redaction::DEFAULT_REDACTION_STR,
@@ -173,10 +172,8 @@ pub(crate) mod object_store {
     /// (`PACKAGE_CONCURRENCY * PART_CONCURRENCY * DESIRED_CHUNK_SIZE`).
     pub(crate) const DESIRED_CHUNK_SIZE: usize = 1024 * 1024 * 10;
 
-    /// Number of chunks of a single package that are uploaded concurrently.
     const PART_CONCURRENCY: usize = 4;
 
-    /// Number of packages that are uploaded concurrently.
     pub(crate) const PACKAGE_CONCURRENCY: usize = 4;
 
     pub(crate) struct BlobUploadTarget {
@@ -239,18 +236,12 @@ pub(crate) mod object_store {
     /// explain its own store errors: only the caller knows which account,
     /// container or bucket the request was aimed at.
     pub(crate) enum UploadFailure {
-        /// The blob is already there and `--force` was not given.
         AlreadyExists,
-        /// The object store refused or failed a request.
         Store(BlobStoreError),
-        /// Reading or hashing the local package failed.
         Local(miette::Report),
     }
 
     impl UploadFailure {
-        /// Renders the failure for `destination`, the blob as the user addressed
-        /// it. A caller that can say more about a [`UploadFailure::Store`] should
-        /// handle that variant before falling back to this.
         pub(crate) fn into_report(self, destination: &str) -> miette::Report {
             match self {
                 UploadFailure::AlreadyExists => {
@@ -266,8 +257,6 @@ pub(crate) mod object_store {
         }
     }
 
-    /// Streams `package_file` to `target`'s key through `op`.
-    ///
     /// `destination` is the blob as the user addressed it, used only in the log
     /// line. `if_not_exists` is only asked of the backend, which may drop it; the
     /// caller owns any guard on top.
@@ -335,8 +324,6 @@ pub(crate) mod object_store {
         }
     }
 
-    /// Feeds exactly `size` bytes of `reader` to `writer`, which buffers them into
-    /// correctly sized parts and uploads `PART_CONCURRENCY` at a time.
     async fn stream_chunks(
         writer: &mut BlobWriter,
         reader: &mut (impl AsyncReadExt + Unpin),

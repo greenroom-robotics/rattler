@@ -24,12 +24,6 @@ use crate::upload::{
 /// overwrite guard `stat`s each blob first, and a `stat` (HEAD Blob) is a read.
 pub(crate) const AZURE_UPLOAD_SAS_PERMISSIONS: &str = "rcw";
 
-/// Uploads packages to a channel in an Azure Blob Storage container.
-///
-/// The account name, endpoint, container and root prefix all come from `location`
-/// (see `azblob_config`). `--path-style` is what makes an IP, single-label or
-/// Azurite endpoint uploadable: it reads the account off the first path segment,
-/// which such a host has no other way to name.
 pub async fn upload_package_to_azure(
     location: &AzureLocation,
     credentials: AzureCredentials,
@@ -47,11 +41,8 @@ pub async fn upload_package_to_azure(
     let builder = config.into_builder();
     let op = BlobStore::new(builder).into_diagnostic()?;
 
-    // Upload multiple packages concurrently. Each package is written to its own
-    // key, so the individual uploads are independent. Every upload runs to
-    // completion even once one has failed, matching the S3 path: a future dropped
-    // mid-upload never reaches the code that discards its staged blocks, and Azure
-    // bills for uncommitted blocks until they age out a week later.
+    // Every upload runs to completion even once another has failed, so no future is
+    // dropped mid-upload: see `discard_partial_upload` for what that would cost.
     let outcomes: Vec<(PathBuf, miette::Result<()>)> = futures::stream::iter(package_files.iter())
         .map(|package_file| {
             let op = op.clone();
@@ -88,8 +79,6 @@ pub async fn upload_package_to_azure(
     }
 }
 
-/// Renders the per-package outcomes of a run, which cover every package: no
-/// upload is abandoned once another has failed.
 fn summarize(outcomes: &[(PathBuf, miette::Result<()>)]) -> String {
     let failed: Vec<_> = outcomes
         .iter()
@@ -107,8 +96,6 @@ fn summarize(outcomes: &[(PathBuf, miette::Result<()>)]) -> String {
     summary
 }
 
-/// Explains a store error in terms of the account and container the request was
-/// aimed at, neither of which opendal's own error mentions.
 fn explain(
     error: BlobStoreError,
     account: &AccountName,
@@ -123,8 +110,6 @@ fn explain(
             "could not reach {blob_url}: container `{container}` in account `{account}` may not \
              exist"
         ),
-        // A SAS minted by `--azure-cli` is short-lived and is never renewed, so a
-        // long run can outlive its own credential.
         ErrorKind::PermissionDenied => format!(
             "access to container `{container}` in account `{account}` was denied for {blob_url}; \
              a SAS minted by `--azure-cli` expires after `--azure-cli-sas-ttl-minutes` (30 by \
@@ -159,8 +144,6 @@ async fn upload_single_package(
         format!("{channel_url}/{}", target.key())
     };
 
-    // Guard against overwriting an existing blob when `--force` was not passed.
-    //
     // TODO(opendal#7990): the fix is merged upstream but unreleased. opendal 0.57
     // honours `if_not_exists` only on the single-shot Put Blob path, so a package
     // above `DESIRED_CHUNK_SIZE` commits through Put Block List unguarded. This
@@ -180,12 +163,10 @@ async fn upload_single_package(
         }
     }
 
-    // azblob attaches user metadata and content-disposition on the single-shot Put
-    // Blob path only, never on the Put Block List commit a larger package takes,
-    // and there is no set-metadata operation on the backend to repair it
-    // afterwards. The blob therefore lands without `package-sha256`,
-    // `package-md5` or its content-disposition. Say so, rather than letting the
-    // schema of an uploaded blob depend silently on its size.
+    // For what azblob drops above a single block, see
+    // `stream_package_to_object_store`. No set-metadata operation exists on the
+    // backend to repair it afterwards, so warn rather than letting the schema of
+    // an uploaded blob depend silently on its size.
     let size = fs_err::metadata(package_file).into_diagnostic()?.len();
     if size > DESIRED_CHUNK_SIZE as u64 {
         tracing::warn!(
@@ -223,8 +204,6 @@ mod test {
         AzureChannelUrl::parse("az://account.blob.core.windows.net/container/prefix").unwrap()
     }
 
-    /// The location `test_channel` falls under, read host-style as the upload CLI
-    /// reads one by default.
     fn test_location() -> rattler_azure::AzureLocation {
         rattler_azure::locate_as(&test_channel(), rattler_azure::AzureAddressing::HostStyle)
             .unwrap()

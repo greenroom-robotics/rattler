@@ -273,16 +273,14 @@ pub async fn fetch_index(
                         SystemTime::now(),
                     );
 
-                    // A 304 is taken as "the cached body still stands" on the
-                    // status alone, rather than left to `after_response`, which
-                    // reports `NotModified` only when the 304 echoes back the
-                    // validator it matched. Azure Blob does not echo one: it answers a
-                    // conditional GET with a bare 304 carrying no `etag` and no
-                    // `last-modified`, just `x-ms-error-code: ConditionNotMet`. That
-                    // reads as `Modified`, and the 304 then reaches `from_response`,
-                    // which rejects it for not being a success — so every `az://`
-                    // sharded channel failed on the *second* fetch, once there was a
-                    // cache entry to revalidate.
+                    // A 304 is taken as "the cached body still stands" on the status
+                    // alone, rather than left to `after_response`, which reports
+                    // `NotModified` only when the 304 echoes back the validator it
+                    // matched. Azure Blob does not echo one: it answers a conditional
+                    // GET with a bare 304 carrying no `etag` and no `last-modified`,
+                    // just `x-ms-error-code: ConditionNotMet`. That reads as
+                    // `Modified`, and the 304 then reaches `from_response`, which
+                    // rejects it for not being a success.
                     //
                     // What is required in return is that the request actually asked a
                     // conditional question. A cache entry with no validator revalidates
@@ -313,17 +311,14 @@ pub async fn fetch_index(
                     };
 
                     if let Some(refreshed_policy) = unmodified_policy {
-                        // The cached file is still valid
                         match read_cached_shard_index(&mut cache_reader).await {
                             Ok((body, shard_index)) => {
                                 tracing::debug!("shard index cache was not modified");
 
-                                // Store the refreshed policy so a server that sends
-                                // caching headers along with its 304 does not have to
-                                // be revalidated again on the next run. A policy that
-                                // is already stale teaches us nothing, so the rewrite
-                                // is skipped in that case — which is what a bare 304
-                                // carrying no `cache-control` produces.
+                                // Store the refreshed policy so a 304 that carries
+                                // caching headers spares the next run a revalidation.
+                                // An already-stale policy teaches us nothing, so the
+                                // rewrite is skipped in that case.
                                 if !refreshed_policy.is_stale(SystemTime::now())
                                     && let Err(e) = write_shard_index_cache(
                                         cache_reader.into_inner().inner_mut(),
@@ -527,9 +522,6 @@ pub async fn read_shard_index_from_reader<R: AsyncRead + Unpin>(
         .map(|(_, shard_index)| shard_index)
 }
 
-/// Read the shard index from a reader and deserialize it, also handing back the
-/// raw bytes it was parsed from so the entry can be rewritten without a second
-/// read.
 async fn read_cached_shard_index<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
 ) -> Result<(Bytes, ShardedRepodata), GatewayError> {
@@ -644,7 +636,6 @@ mod tests {
 
     use super::*;
 
-    /// The headers a mock response carries beyond its status.
     #[derive(Clone, Copy, Default)]
     struct MockHeaders {
         etag: Option<&'static str>,
@@ -666,8 +657,6 @@ mod tests {
         }
     }
 
-    /// Serves the shard index once with a 200 and answers every request after
-    /// that with a 304.
     struct RevalidatingIndexServer {
         local_addr: SocketAddr,
         requests: Arc<AtomicUsize>,
@@ -675,9 +664,6 @@ mod tests {
     }
 
     impl RevalidatingIndexServer {
-        /// The default shape: nothing keeps the entry fresh, and the 304 is
-        /// bare — no validator, no caching headers — which is what Azure Blob
-        /// answers a conditional GET with.
         async fn new(etag: Option<&'static str>) -> Self {
             Self::with_headers(
                 MockHeaders {
@@ -781,10 +767,6 @@ mod tests {
         fetch(&base_url, cache_dir.path()).await
     }
 
-    /// A cache entry with no validator revalidates with a plain GET. A 304
-    /// answering that question means nothing — a proxy or CDN that sends one
-    /// would otherwise pin the cached index forever — so it must not be
-    /// honored.
     #[tokio::test]
     async fn unconditional_304_is_not_honored() {
         let err = fetch_twice(None)
@@ -796,8 +778,6 @@ mod tests {
         );
     }
 
-    /// The counterpart: once we do send a validator, a bare 304 carrying no
-    /// `etag` of its own is the real answer, and the cached index is served.
     #[tokio::test]
     async fn conditional_bare_304_is_honored() {
         fetch_twice(Some("\"abc\""))
@@ -805,18 +785,14 @@ mod tests {
             .expect("a 304 answering our `if-none-match` serves the cached index");
     }
 
-    /// The freshness a 304 carries has to be stored, or the entry stays stale
-    /// forever and every later run pays for a revalidation it was told it
-    /// could skip.
     #[tokio::test]
     async fn a_304_refreshes_the_stored_cache_policy() {
         let server = RevalidatingIndexServer::with_headers(
-            // Cached, but stale on arrival, so the next fetch revalidates.
+            // Stale on arrival, so the next fetch revalidates.
             MockHeaders {
                 etag: Some("\"abc\""),
                 cache_control: Some("max-age=0"),
             },
-            // The 304 says the entry is good for an hour.
             MockHeaders {
                 etag: Some("\"abc\""),
                 cache_control: Some("max-age=3600"),

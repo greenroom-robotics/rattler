@@ -1,9 +1,5 @@
 //! Live fetch-path integration tests against a local Azurite emulator.
 //!
-//! Everything is driven through the single `azure-options` entry built by
-//! `azurite_entry` below; there is no out-of-band account or endpoint
-//! configuration on the fetch path.
-//!
 //! Run with:
 //!
 //! ```text
@@ -25,8 +21,8 @@ const ACCOUNT: &str = "devstoreaccount1";
 const ACCOUNT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
-/// The authority. An IP literal carries no account label, so the table key below
-/// has to name the account as a path segment.
+/// An IP literal carries no account label, so the table key below has to name the
+/// account as a path segment.
 const AUTHORITY: &str = "127.0.0.1:10000";
 
 /// Azurite creates containers as private, which is what makes the ungranted case
@@ -55,10 +51,8 @@ fn channel_url() -> String {
     format!("az://{AUTHORITY}/{ACCOUNT}/{CONTAINER}")
 }
 
-/// The one `azure-options` entry these tests run on, with the grant as the only
-/// variable. It names `CONTAINER` specifically, so the ungranted case tests the
-/// per-container lookup rather than an empty table: `Auth::Anonymous` is the
-/// container named and *refused*.
+/// Names `CONTAINER` specifically, so the ungranted case exercises the
+/// per-container lookup, not an empty table.
 fn azurite_entry(auth: Auth) -> HashMap<AzureEndpointKey, AzureEndpointOptions> {
     HashMap::from([(
         AzureEndpointKey::parse(&format!("{AUTHORITY}/{ACCOUNT}"))
@@ -82,8 +76,6 @@ fn client(auth: Auth) -> ClientWithMiddleware {
         .build()
 }
 
-/// Create the container and put a `noarch/repodata.json` in it.
-///
 /// Seeding runs through the granted middleware rather than a separate SDK, which
 /// also proves the signature works for a request carrying a query string:
 /// `?restype=container` participates in the canonicalized signing resource.
@@ -100,11 +92,8 @@ async fn seed(client: &ClientWithMiddleware) {
         created.status()
     );
 
-    // `Content-Length` is set by hand because shared-key signing covers it, and
-    // reqwest only materializes the header inside hyper at send time — after the
-    // middleware has already signed. That gap is invisible to production, where the
-    // middleware only ever carries bodyless `az://` reads, but a seeding PUT walks
-    // straight into it and gets a 403 for a length mismatch.
+    // `Content-Length` is set by hand: the middleware signs before reqwest
+    // materializes the header.
     let put = client
         .put(format!("{}/noarch/repodata.json", channel_url()))
         .header("x-ms-blob-type", "BlockBlob")
@@ -168,9 +157,8 @@ async fn azurite_ungranted_entry_is_refused_by_a_private_container() {
             ("AZURE_STORAGE_ACCOUNT_KEY", Some(ACCOUNT_KEY)),
         ],
         async {
-            // Seed with a grant, then read without one. The credential is present in
-            // the environment throughout, so a success below would mean the grant
-            // check leaked it
+            // The credential stays in the environment, so a success here would mean
+            // the grant check leaked it.
             seed(&client(Auth::DefaultChain)).await;
 
             let url = format!("{}/noarch/repodata.json", channel_url());

@@ -4,23 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-/// Options for Azure Blob channels, keyed by the channel URL prefix that runs up
-/// to the container: `mycompany.blob.core.windows.net`, or
-/// `proxy.internal/mycompany` where the account is a path segment instead
-/// (including a port where one is used, e.g. `127.0.0.1:10000/devstoreaccount1`).
-///
-/// An entry is a *grant*: it is the only way a container gets credentials, or an
-/// endpoint a non-default scheme. A URL matching no entry is fetched anonymously
-/// over https and read host-style. Grants are keyed per container inside the entry
-/// (see [`AzureEndpointOptions`]), because Azure assigns RBAC per container.
-///
-/// The key is an [`AzureEndpointKey`] rather than a `String` because a missed
-/// grant fails silently: Azure answers an unauthorized request for a private
-/// container with a 404, so the user is told "not found". Every host
-/// normalization would be such a miss (`MyCompany.blob…`,
-/// `[0:0:0:0:0:0:0:1]:10000`). Deserializing the key through the parser that also
-/// produces the lookup value removes the class. The inner map is private for the
-/// same reason.
+/// Azure Blob channel options, keyed by [`AzureEndpointKey`] with
+/// [`AzureEndpointOptions`] as the entry.
 ///
 /// Entries are **user-scoped by contract**. Read from a project manifest, a
 /// checked-out repository could name a host and be sent ambient credentials.
@@ -37,8 +22,6 @@ impl AzureOptionsMap {
     }
 }
 
-/// Reject a document that spells one endpoint two ways.
-///
 /// Both spellings reach serde, which silently keeps whichever the table iterated
 /// last — byte order of the raw keys, not the order they were written — so one
 /// entry's grants vanish and Azure reports the private container as a 404. TOML's
@@ -189,8 +172,6 @@ mod tests {
         assert_eq!(unlisted, AzureEndpointOptions::default());
     }
 
-    /// The case the key exists to make expressible: one proxy fronting two
-    /// accounts, each with its own grant table.
     #[test]
     fn two_accounts_on_one_host_have_independent_grants() {
         let map: AzureOptionsMap = toml::from_str(
@@ -243,9 +224,6 @@ mod tests {
             .unwrap()
             .get(&key("host.example"));
         assert!(entry.fetch(Some(&container("internal"))).auth.is_granted());
-        // The higher-precedence file states the whole grant table for the key, so
-        // a grant it does not restate is revoked rather than inherited: a table
-        // half-read from a file the user is not looking at is the worse surprise.
         assert!(
             !entry.fetch(Some(&container("releases"))).auth.is_granted(),
             "a grant the higher-precedence file omits must not survive the merge"
@@ -318,8 +296,6 @@ general = true
         assert!(error.contains("proxy.internal"), "{error}");
     }
 
-    /// Two accounts behind one proxy is the case the path-style key exists for, so
-    /// it must survive the walk.
     #[test]
     fn two_path_style_keys_on_one_host_are_allowed() {
         let document = r#"
@@ -332,8 +308,6 @@ general = true
         assert!(ensure_no_colliding_keys(&document.parse().unwrap()).is_ok());
     }
 
-    /// A key carries at most one path segment, read as the account, so anything
-    /// past that is refused whatever the writer meant it to be.
     #[test]
     fn a_key_past_the_account_is_rejected() {
         let err = toml::from_str::<AzureOptionsMap>(

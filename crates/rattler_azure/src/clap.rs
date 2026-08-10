@@ -9,13 +9,11 @@ use crate::{
     mint_user_delegation_sas,
 };
 
-/// Default lifetime, in minutes, of a SAS minted from an `az login` session.
-///
 /// A SAS cannot be individually revoked, so a short lifetime bounds the damage if
 /// one leaks. Thirty minutes covers a typical index or upload run.
 const DEFAULT_AZURE_CLI_SAS_TTL_MINUTES: u64 = 30;
 
-/// Upper bound, in minutes, accepted for `--azure-cli-sas-ttl-minutes`.
+/// Seven days, because Azure caps the lifetime of a user-delegation key there.
 const MAX_AZURE_CLI_SAS_TTL_MINUTES: u64 = 7 * 24 * 60;
 
 #[derive(Debug, thiserror::Error)]
@@ -38,8 +36,6 @@ pub enum AzureCredentialsError {
     Cli(#[from] AzureCliSasError),
 }
 
-/// A resolved, unambiguous choice of authentication source.
-///
 /// [`AzureCredentialsOpts`] can express several inputs at once. This enum is the
 /// single winner after precedence is applied, so downstream code never reasons
 /// about combinations.
@@ -53,13 +49,9 @@ pub enum AzureAuthSource {
 }
 
 impl AzureAuthSource {
-    /// Resolve this source into concrete [`AzureCredentials`].
-    ///
-    /// `permissions`, `location` and `scheme` are consulted only for the
-    /// [`AzureAuthSource::AzureCli`] arm, which mints a SAS scoped to the
-    /// channel's container. Taking the location rather than a pre-derived account
-    /// and container keeps the account the SAS is minted for and the container it
-    /// is scoped to from coming from two different places.
+    /// Taking the location rather than a pre-derived account and container keeps the
+    /// account the SAS is minted for and the container it is scoped to from coming
+    /// from two different places.
     pub async fn resolve(
         self,
         permissions: &str,
@@ -87,11 +79,12 @@ pub struct AzureCredentialsOpts {
     /// The Azure Storage account key.
     ///
     /// Lowest precedence of the three: `--sas-token` wins over it, and
-    /// `--azure-cli` over both. The three are deliberately not `conflicts_with`
-    /// each other, because clap applies a conflict to a value it read from the
-    /// environment too, and exporting both `AZURE_STORAGE_KEY` and
-    /// `AZURE_STORAGE_SAS_TOKEN` — what the `az` documentation tells you to do — is
-    /// not a usage error the user can undo from the command line.
+    /// `--azure-cli` over both.
+    // The three are deliberately not `conflicts_with` each other, because clap
+    // applies a conflict to a value it read from the environment too, and exporting
+    // both `AZURE_STORAGE_KEY` and `AZURE_STORAGE_SAS_TOKEN` — what the `az`
+    // documentation tells you to do — is not a usage error the user can undo from
+    // the command line.
     #[arg(
         long,
         env = "AZURE_STORAGE_KEY",
@@ -174,10 +167,6 @@ fn typed_on_command_line(var: &str, value: &SecretString) -> bool {
 }
 
 impl AzureCredentialsOpts {
-    /// The flags carrying a credential that was typed on the command line.
-    ///
-    /// Empty when the credentials only came from the environment, which
-    /// `--azure-cli` overrides silently.
     fn explicit_credential_flags(&self) -> Vec<&'static str> {
         [
             (
@@ -253,8 +242,6 @@ mod tests {
         }
     }
 
-    /// A location naming no container, proving that resolving a verbatim credential
-    /// does not need one.
     fn unaddressable() -> AzureLocation {
         let channel = crate::AzureChannelUrl::parse("az://acct.blob.core.windows.net").unwrap();
         let location = crate::locate_as(&channel, crate::AzureAddressing::HostStyle).unwrap();
@@ -366,10 +353,6 @@ mod tests {
             .map(|cli| cli.creds)
     }
 
-    /// The regression this file was missing: both standard Azure variables
-    /// exported at once, which is what the `az` documentation tells users to do.
-    /// Driven through clap rather than by building the struct by hand, since the
-    /// bug lived in the parse.
     #[test]
     fn both_credential_env_vars_parse_and_resolve_by_precedence() {
         with_env(
@@ -384,16 +367,14 @@ mod tests {
                     Ok(AzureAuthSource::SasToken(t)) if t.expose_secret() == "sv=env"
                 ));
 
-                // `--azure-cli` overrides environment-sourced credentials rather
-                // than refusing them: there is no argv-side way to unset them.
                 let opts = parse(&["--azure-cli"]).expect("--azure-cli must parse alongside them");
                 assert!(matches!(
                     opts.source(),
                     Ok(AzureAuthSource::AzureCli { .. })
                 ));
 
-                // A credential typed on the command line still wins over the
-                // variable it shares a name with.
+                // Precedence is by flag, not by source: the SAS token wins even
+                // when it came from the environment and the account key was typed.
                 let opts = parse(&["--account-key", "typed"]).expect("should parse");
                 assert!(matches!(
                     opts.source(),

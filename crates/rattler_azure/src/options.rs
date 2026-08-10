@@ -1,17 +1,10 @@
-//! Per-endpoint options for Azure Blob channels.
-//!
-//! An entry in the `azure-options` config table is the only thing that grants an
-//! endpoint or one of its containers anything. Without one, a channel is fetched
-//! anonymously over https and read host-style. There is no hardcoded list of
-//! "official" Azure suffixes, which is what lets custom endpoints and the Azurite
-//! emulator work.
+//! Custom endpoints and the Azurite emulator can be granted, but the ambient
+//! credential chain is gated on [`crate::AzureHost::is_known_azure_blob_endpoint`],
+//! so a grant on any other host resolves only `AZURE_STORAGE_*`.
 
 use crate::ContainerName;
 
 /// Whether credentials may attach to requests for a container.
-///
-/// Defaults to [`Auth::Anonymous`], and serializes as the bool a container is
-/// spelled with in an `azure-options` `auth` table.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
@@ -24,9 +17,11 @@ pub enum Auth {
     #[default]
     Anonymous,
 
-    /// Run the standard Azure credential chain and sign with what it returns.
-    /// Since this is an explicit grant, an unusable credential is a hard error
-    /// rather than a silent downgrade to anonymous.
+    /// Resolve a credential and sign with it. The full ambient chain is only
+    /// reached for a known Azure blob endpoint over TLS; anywhere else the signer
+    /// reads `AZURE_STORAGE_*` and nothing else. Since this is an explicit grant,
+    /// an unusable credential is a hard error rather than a silent downgrade to
+    /// anonymous.
     DefaultChain,
 }
 
@@ -56,9 +51,6 @@ impl Auth {
 ///
 /// Prefixed rather than spelled bare `Scheme`, because `opendal::Scheme` names a
 /// storage service and is one import away.
-///
-/// Defaults to [`AzureScheme::Https`]. `Http` exists for local emulators such as
-/// Azurite, and selecting it is an explicit per-endpoint decision in config.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
@@ -95,36 +87,17 @@ pub struct AzureFetchOptions {
     pub scheme: AzureScheme,
 }
 
-/// One `azure-options` entry, as the config file spells it.
-///
 /// This is the serde surface. Each consumer takes the narrower view it can act
 /// on, via [`Self::scheme`] or [`Self::fetch`], and the fields are private so
 /// that view is the only way in. The default value is the no-entry behaviour, so
 /// callers can look an absent key up and fall back to `default()`.
 ///
-/// # Why the grant is per container
-///
-/// Azure assigns RBAC per *container*, so one storage account routinely holds a
-/// mix of private and anonymous-read containers. A per-account grant cannot
-/// express that: signing the anonymous-read container 403s, and not signing
-/// breaks the private ones.
-///
-/// There is therefore no entry-level `auth` field at all. It is absent from the
+/// There is no entry-level `auth` field at all. It is absent from the
 /// type rather than defaulted to false, so a grant always names a container — a
 /// container *under the key's reading of the URL*. A key whose shape does not
 /// match the endpoint reads the account segment as the container: on a host that
 /// really fronts its accounts path-style, a host-style key's `accta = true` grants
 /// every URL whose first segment is `accta`, which is the whole account.
-///
-/// ```toml
-/// [azure-options."mycompany.blob.core.windows.net"]
-/// scheme = "https"
-///
-/// [azure-options."mycompany.blob.core.windows.net".auth]
-/// releases = true
-/// staging = true
-/// # a container not listed here is fetched anonymously
-/// ```
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
@@ -139,8 +112,6 @@ pub struct AzureFetchOptions {
 pub struct AzureEndpointOptions {
     scheme: AzureScheme,
 
-    /// Which containers under this key may be sent credentials.
-    ///
     /// An explicit `false` is legal and redundant with omission, so a
     /// higher-precedence config file can revoke rather than only add.
     ///
@@ -165,8 +136,6 @@ impl AzureEndpointOptions {
         self.scheme
     }
 
-    /// The grant and wire scheme for one container, for the fetch path.
-    ///
     /// `container` is an `Option` because a URL need not name one. That case is
     /// answered here rather than at the call site, and can only mean anonymous.
     pub fn fetch(&self, container: Option<&ContainerName>) -> AzureFetchOptions {
@@ -179,8 +148,6 @@ impl AzureEndpointOptions {
         }
     }
 
-    /// Every container this entry mentions, and what it grants it.
-    ///
     /// Includes the explicit `false`s: a caller validating or listing the table
     /// needs what the file says, not what it effectively means.
     pub fn grants(&self) -> impl Iterator<Item = (&ContainerName, Auth)> {
@@ -261,9 +228,6 @@ mod tests {
         assert!(err.to_string().contains("Releases"), "{err}");
     }
 
-    /// A misspelled field is a grant that can never match, and Azure reports the
-    /// resulting anonymous read of a private container as 404 rather than 403 — so
-    /// without this it surfaces as "channel not found".
     #[test]
     fn an_unknown_field_is_rejected() {
         for document in [

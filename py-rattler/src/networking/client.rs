@@ -23,13 +23,6 @@ pub struct PyClientWithMiddleware {
 }
 
 /// `AzureMiddleware` may not precede `AuthenticationMiddleware`.
-///
-/// `AuthenticationMiddleware` skips any URL whose scheme is not `http` or
-/// `https`, because its entries are keyed by host alone and `az://` carries its
-/// own grant model. `AzureMiddleware` rewrites `az://` to `https://` before it
-/// calls the rest of the stack. Put the azure middleware first and that gate
-/// never sees an `az://` URL, so a stored `*.blob.core.windows.net` credential
-/// attaches to a container that was never granted one.
 fn check_middleware_order(middlewares: &[PyMiddleware]) -> PyResult<()> {
     let azure = middlewares
         .iter()
@@ -54,10 +47,6 @@ fn check_middleware_order(middlewares: &[PyMiddleware]) -> PyResult<()> {
 
 #[pymethods]
 impl PyClientWithMiddleware {
-    /// Build a client from `middlewares`, applied in the order given.
-    ///
-    /// The one order this rejects is `AzureMiddleware` ahead of
-    /// `AuthenticationMiddleware`; see [`check_middleware_order`].
     #[new]
     #[pyo3(signature = (middlewares=None, headers=None, user_agent=None, timeout=None))]
     pub fn new(

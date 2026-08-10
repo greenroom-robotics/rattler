@@ -197,8 +197,6 @@ pub struct CommonConfig {
     #[serde(skip_serializing_if = "S3OptionsMap::is_default")]
     pub s3_options: S3OptionsMap,
 
-    /// Configuration for Azure Blob. User-scoped by contract; see
-    /// [`AzureOptionsMap`].
     #[serde(default)]
     #[serde(skip_serializing_if = "AzureOptionsMap::is_default")]
     pub azure_options: AzureOptionsMap,

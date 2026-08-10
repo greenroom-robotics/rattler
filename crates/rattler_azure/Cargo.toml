@@ -16,16 +16,15 @@ default = []
 # `tokio` to run `az` without blocking the async runtime).
 clap = ["dep:clap", "dep:jiff", "dep:which", "dep:tokio"]
 opendal = ["dep:opendal"]
-# Serde derives for the `azure-options` config table: the per-endpoint options,
-# the `AzureEndpointKey` used as their map key and the `ContainerName` keying
-# their per-container grants. The types themselves are always compiled; only the
-# derives are gated. Pulls in `serde` alone, so config crates can depend on this
-# crate with default features off.
+# Serde derives for the types of the `azure-options` config table. Pulls in
+# `serde` and `indexmap/serde` only, so config crates can depend on this crate
+# with default features off.
 serde = ["dep:serde", "indexmap/serde"]
 
 [dependencies]
 clap = { workspace = true, optional = true }
-# The per-container grant table, which keeps the order the config file wrote.
+# The per-container grant table. Order is kept for tables built in memory;
+# deserialized TOML arrives in byte order, since `toml::Table` is a `BTreeMap`.
 indexmap = { workspace = true }
 jiff = { workspace = true, optional = true }
 opendal = { workspace = true, default-features = false, features = [

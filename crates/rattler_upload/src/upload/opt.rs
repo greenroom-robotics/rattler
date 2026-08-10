@@ -425,8 +425,9 @@ pub struct S3Opts {
 
 /// Options for uploading to Azure Blob Storage.
 ///
-/// Authenticate with either an account key or a shared access signature (SAS)
-/// token. The two are mutually exclusive.
+/// Authenticate with `--account-key`, `--sas-token` or `--azure-cli`. More than
+/// one may be given: `--azure-cli` wins over `--sas-token`, which wins over
+/// `--account-key`.
 #[cfg(feature = "azure")]
 #[derive(Clone, Debug, PartialEq, Parser)]
 pub struct AzureOpts {
@@ -439,9 +440,9 @@ pub struct AzureOpts {
     /// than the host's first label.
     ///
     /// Needed for an endpoint that fronts an account instead of being named after
-    /// one — an IP literal, a single-label host, the Azurite emulator. The account
-    /// itself is not a flag: it is already at path segment 0 of the channel URL, and
-    /// naming it twice would let the two disagree.
+    /// one — an IP literal, a single-label host, the Azurite emulator.
+    // The account itself is not a flag: it is already at path segment 0 of the
+    // channel URL, and naming it twice would let the two disagree.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub path_style: bool,
 
@@ -650,8 +651,6 @@ mod test {
     use super::{AzureOpts, ForceOverwrite};
     use clap::Parser;
 
-    /// The flag is the only thing that says where the account is, and getting it
-    /// wrong signs over a resource that does not exist.
     #[test]
     fn test_azure_path_style_selects_the_account_from_the_path() {
         let args = [
@@ -677,8 +676,6 @@ mod test {
         assert_eq!(container.as_str(), "general");
     }
 
-    /// An endpoint that names no account in its host is unaddressable without the
-    /// flag, and says so rather than signing for a first label that is not one.
     #[test]
     fn test_azure_host_style_refuses_a_host_with_no_account_label() {
         let opts = AzureOpts::try_parse_from([
