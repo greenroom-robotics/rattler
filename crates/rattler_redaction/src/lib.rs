@@ -82,28 +82,38 @@ pub fn redact_known_secrets_from_url(url: &Url, redaction: &str) -> Option<Url> 
         url.set_query(Some(&masked[1..]));
     }
 
-    let mut segments = url.path_segments()?;
-    match (segments.next(), segments.next()) {
-        (Some("t"), Some(_)) => {
-            let remainder = segments.collect::<Vec<_>>();
-            let mut redacted_path = format!(
-                "t/{redaction}{separator}",
-                separator = if remainder.is_empty() { "" } else { "/" },
-            );
+    // A URL that cannot be a base has no path segments and so no `/t/<token>/`
+    // to mask, but it may still have carried a signature above — returning `None`
+    // here would throw that masking away, since callers fall back to the
+    // unredacted URL.
+    let token_prefixed = url.path_segments().is_some_and(|mut segments| {
+        matches!((segments.next(), segments.next()), (Some("t"), Some(_)))
+    });
 
-            for (idx, segment) in remainder.iter().enumerate() {
-                redacted_path.push_str(segment);
-                // if the original url ends with a slash, we need to add it to the redacted path
-                if idx < remainder.len() - 1 {
-                    redacted_path.push('/');
-                }
+    if token_prefixed {
+        let remainder = url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .skip(2)
+            .collect::<Vec<_>>();
+        let mut redacted_path = format!(
+            "t/{redaction}{separator}",
+            separator = if remainder.is_empty() { "" } else { "/" },
+        );
+
+        for (idx, segment) in remainder.iter().enumerate() {
+            redacted_path.push_str(segment);
+            // if the original url ends with a slash, we need to add it to the redacted path
+            if idx < remainder.len() - 1 {
+                redacted_path.push('/');
             }
-
-            url.set_path(&redacted_path);
-            Some(url)
         }
-        _ => Some(url),
+
+        url.set_path(&redacted_path);
     }
+
+    Some(url)
 }
 
 /// A trait to redact known secrets from a type.
@@ -238,5 +248,18 @@ mod test {
             redacted.to_string(),
             format!("https://user:{DEFAULT_REDACTION_STR}@prefix.dev/conda-forge/")
         );
+    }
+
+    /// A URL with no path segments still has a signature worth masking, and
+    /// callers fall back to the unredacted URL when this returns `None`.
+    #[test]
+    fn a_url_that_cannot_be_a_base_still_has_its_signature_masked() {
+        let redacted = redact_known_secrets_from_url(
+            &Url::from_str("az:container/repodata.json?sig=secret").unwrap(),
+            DEFAULT_REDACTION_STR,
+        )
+        .expect("a signature must be masked even with no path segments to inspect");
+
+        assert!(!redacted.to_string().contains("secret"), "{redacted}");
     }
 }
