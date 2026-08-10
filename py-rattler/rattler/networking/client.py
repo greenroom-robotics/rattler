@@ -75,8 +75,7 @@ class Client:
         timeout: int | None = None,
     ) -> Client:
         """
-        Returns a client with the standard middleware stack: retry,
-        authentication, OCI, GCS, Azure and S3.
+        Returns a client with the standard middleware stack.
 
         Args:
             max_retries: Maximum retry attempts for transient errors (default 3).

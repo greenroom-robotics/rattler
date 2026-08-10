@@ -18,12 +18,10 @@ use crate::upload::{
 };
 
 /// SAS permissions requested when minting a user-delegation SAS for uploads.
-/// Creating and writing blobs needs `c` + `w`; `r` is required on top of those
-/// because the overwrite guard `stat`s each blob before writing it, and a
-/// `stat` (HEAD Blob) is a read. The SAS stays container-scoped and short-lived.
+/// Creating and writing blobs needs `c` + `w`. `r` is needed on top because the
+/// overwrite guard `stat`s each blob first, and a `stat` (HEAD Blob) is a read.
 pub(crate) const AZURE_UPLOAD_SAS_PERMISSIONS: &str = "rcw";
 
-/// What became of one package in a concurrent upload run.
 enum PackageOutcome {
     Uploaded,
     Failed(String),
@@ -31,10 +29,9 @@ enum PackageOutcome {
 
 /// Uploads packages to a channel in an Azure Blob Storage container.
 ///
-/// The account name, endpoint, container and root prefix are all derived from the
-/// channel URL together with `endpoint` (see `azblob_config`), so a path-style entry
-/// is what makes an IP, single-label or emulator (Azurite) endpoint uploadable. The
-/// [`AzureCredentials`] supply only the account key or SAS token.
+/// The account name, endpoint, container and root prefix come from the channel
+/// URL and `endpoint` (see `azblob_config`). A path-style entry is what makes an
+/// IP, single-label or Azurite endpoint uploadable.
 pub async fn upload_package_to_azure(
     channel: AzureChannelUrl,
     credentials: AzureCredentials,
@@ -85,8 +82,6 @@ pub async fn upload_package_to_azure(
             tracing::info!("{summary}");
             Ok(())
         }
-        // Logged rather than attached to the error, so the counts are visible
-        // next to the failure that stopped the run without repeating it.
         Err(e) => {
             tracing::error!("{summary}");
             Err(e)
@@ -94,8 +89,8 @@ pub async fn upload_package_to_azure(
     }
 }
 
-/// Renders the per-package outcomes of a run. Packages without an outcome were
-/// dropped mid-upload by the fail-fast stream or never started.
+/// Renders the per-package outcomes of a run. A package without an outcome was
+/// dropped mid-upload by the fail-fast stream, or never started.
 fn summarize(outcomes: &[(PathBuf, PackageOutcome)], total: usize) -> String {
     let failed: Vec<_> = outcomes
         .iter()
@@ -120,7 +115,6 @@ fn summarize(outcomes: &[(PathBuf, PackageOutcome)], total: usize) -> String {
     summary
 }
 
-/// Uploads a single package file to the Azure Blob container via the given operator.
 async fn upload_single_package(
     op: &BlobStore,
     channel: &AzureChannelUrl,
@@ -197,18 +191,15 @@ mod test {
         )
     }
 
-    /// without `--force`, uploading over an existing blob must error rather
-    /// than silently overwrite it. The memory backend honours `if_not_exists` on
-    /// every path and the fixture is a single block, so this covers the small-blob
-    /// path only — for the multi-block behaviour see
-    /// `rattler_index/tests/azure_azurite.rs::azurite_if_not_exists_is_dropped_on_the_multi_block_path`.
+    /// Covers the small-blob path only: the fixture is a single block and the
+    /// memory backend honours `if_not_exists` everywhere. Multi-block behaviour is
+    /// in `rattler_index/tests/azure_azurite.rs`.
     #[tokio::test]
     async fn test_existing_blob_without_force_errors() {
         let op = memory_operator();
         let channel = test_channel();
         let package = test_package_path();
 
-        // Seed the target blob so the next upload finds it already present.
         upload_single_package(&op, &channel, &package, ForceOverwrite(true))
             .await
             .expect("initial force upload should succeed");
@@ -222,7 +213,6 @@ mod test {
         );
     }
 
-    /// A non-forced upload into an empty container succeeds.
     #[tokio::test]
     async fn test_upload_into_empty_container_succeeds() {
         let op = memory_operator();
@@ -240,9 +230,8 @@ mod test {
         assert_eq!(meta.content_length(), expected_size);
     }
 
-    /// The upload carries the same download metadata as its S3 twin. Only
-    /// the content disposition can be asserted here — the memory backend ignores
-    /// user metadata, as azblob does above a single block.
+    /// Only the content disposition can be asserted here: the memory backend
+    /// ignores user metadata, as azblob does above a single block.
     #[tokio::test]
     async fn test_upload_sets_content_disposition() {
         let op = memory_operator();
@@ -264,8 +253,6 @@ mod test {
         );
     }
 
-    /// A run that stops early must still say what landed, what failed and
-    /// how many uploads never got a verdict.
     #[test]
     fn test_summary_counts_and_names_outcomes() {
         let outcomes = vec![

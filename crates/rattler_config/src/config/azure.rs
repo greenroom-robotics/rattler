@@ -6,7 +6,7 @@ use crate::config::Config;
 
 /// Whether a credential may cross this host's network unencrypted.
 ///
-/// A single-label name (`localhost`, a `docker compose` service) has no public DNS
+/// A single-label name (`localhost`, a compose service) has no public DNS
 /// resolution, so it counts as local; anything with a dot does not.
 fn is_local(host: &AzureHost) -> bool {
     match host.host() {
@@ -23,43 +23,23 @@ fn is_local(host: &AzureHost) -> bool {
 ///
 /// An entry is a *grant*: it is the only way a container gets credentials, or a
 /// host a non-default scheme or path-style addressing. A host with no entry is
-/// fetched anonymously over https in host-style addressing, so an empty map is the
-/// safe default and [`AzureOptionsMap::get`] can answer for absent hosts too.
+/// fetched anonymously over https in host-style addressing. Grants are keyed per
+/// container inside the entry (see [`AzureEndpointOptions`]), because Azure
+/// assigns RBAC per container.
 ///
-/// The grant itself is keyed per container *inside* the entry (see
-/// [`AzureEndpointOptions`]), because Azure assigns RBAC per container. Container
-/// names need none of the normalization the host key below is about: Azure allows
-/// only lowercase in one, so a container has exactly one spelling and two keys that
-/// mean the same container cannot be written.
+/// The key is an [`AzureHost`] rather than a `String` because a missed grant
+/// fails silently: Azure answers an unauthorized request for a private container
+/// with a 404, so the user is told "not found". Every host normalization would be
+/// such a miss (`MyCompany.blob…`, `host:443`, `[0:0:0:0:0:0:0:1]:10000`).
+/// Deserializing the key through the parser that also produces the lookup value
+/// removes the class. The inner map is private for the same reason.
 ///
-/// # Why the key is an [`AzureHost`] and not a `String`
-///
-/// A silently-missed grant is the worst failure this table has: Azure answers an
-/// unauthorized request for a private container with a 404, so the user is told
-/// "not found" rather than "not authorized". Keyed by raw TOML text, every host
-/// normalization is such a miss — `MyCompany.blob…` , `host:443`, `ünï.blob…`,
-/// `[0:0:0:0:0:0:0:1]:10000` and `0x7f.1` are all spellings a lookup would arrive
-/// with in a different form. Keying by [`AzureHost`] deletes the class: the key is
-/// deserialized through the same parser that produces the lookup value, so the two
-/// cannot disagree. The inner map is private for the same reason — a key that did
-/// not go through that parser must be unrepresentable, not merely discouraged.
-///
-/// # Scope
-///
-/// Entries are **user-scoped by contract**. A tool must never read this table
-/// from a project- or workspace-level manifest: doing so would let a checked-out
-/// repository name a host and have the user's ambient Azure credentials sent to
-/// it. Keep it to user- and system-level config files.
+/// Entries are **user-scoped by contract**. Read from a project manifest, a
+/// checked-out repository could name a host and be sent ambient credentials.
 #[derive(Default, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AzureOptionsMap(IndexMap<AzureHost, AzureEndpointOptions>);
 
 impl AzureOptionsMap {
-    /// The options for `host`, or the defaults (anonymous, https, host-style)
-    /// when it has no entry.
-    ///
-    /// Callers should prefer this over indexing the map: "no entry" and "a
-    /// defaulted entry" are defined to behave identically, so branching on
-    /// presence only invites the two paths to drift apart.
     pub fn get(&self, host: &AzureHost) -> AzureEndpointOptions {
         self.0.get(host).cloned().unwrap_or_default()
     }
@@ -70,21 +50,10 @@ impl AzureOptionsMap {
         self.0.keys()
     }
 
-    /// Whether no host is configured, which is also "every `az://` host is
-    /// anonymous". Serializers skip the table on this.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    /// Grant `host` these options, returning what it was granted before.
-    ///
-    /// Taking an [`AzureHost`] rather than a string is what lets the inner map stay
-    /// private while still being writable: a caller editing config (`pixi config
-    /// set azure-options."…"`) has to have parsed its key, so it cannot install an
-    /// entry a lookup would fail to find. There is no `get_mut`, and none is
-    /// needed: editing an entry is [`get`](Self::get), change, insert. That copies
-    /// the entry's grant table, which is not worth a second mutable path into a
-    /// private map — config editing happens once per `config set`, not per request.
     pub fn insert(
         &mut self,
         host: AzureHost,
@@ -93,21 +62,16 @@ impl AzureOptionsMap {
         self.0.insert(host, options)
     }
 
-    /// Revoke `host`'s grant, returning it if there was one.
-    ///
-    /// Shift-removes, so the remaining entries keep their relative order and a
+    /// Revoke `host`'s grant, returning it if there was one. Shift-removes, so a
     /// serialized table does not reshuffle on an unrelated edit.
     pub fn remove(&mut self, host: &AzureHost) -> Option<AzureEndpointOptions> {
         self.0.shift_remove(host)
     }
 
-    /// The entries as the fetch middleware takes them, ready to hand to
-    /// `AzureMiddleware::new` without a caller rebuilding a map by hand.
+    /// The entries as `AzureMiddleware::new` takes them.
     ///
-    /// Whole entries, not the narrower `AzureFetchOptions`: the middleware has to
-    /// read a host's addressing before it can tell which path segment is the
-    /// container, and only then can it look the container's grant up. The narrowing
-    /// therefore happens per request, inside the middleware, and not here.
+    /// Whole entries, not the narrower `AzureFetchOptions`: the middleware needs a
+    /// host's addressing to tell which path segment is the container.
     pub fn endpoint_options(&self) -> impl Iterator<Item = (AzureHost, AzureEndpointOptions)> {
         self.0
             .iter()
@@ -117,10 +81,9 @@ impl AzureOptionsMap {
 
 /// Reject a document that spells one host two ways.
 ///
-/// Both spellings reach serde, which keeps whichever the table iterated last —
-/// silently dropping one spelling's whole entry, grants and all. TOML's own
-/// duplicate-key check runs on the raw text, so it cannot see the collision; this
-/// has to run while both spellings are still visible.
+/// Both spellings reach serde, which silently keeps whichever the table iterated
+/// last. TOML's own duplicate-key check runs on the raw text, so it cannot see
+/// the collision.
 pub(crate) fn ensure_no_colliding_hosts(document: &toml::Table) -> Result<(), String> {
     let Some(table) = document
         .get("azure-options")
@@ -226,8 +189,6 @@ mod tests {
         ContainerName::new(name).expect("test container name")
     }
 
-    /// A grant can be written and revoked without the inner map being public, and
-    /// a revoked host falls back to anonymous rather than lingering.
     #[test]
     fn a_grant_can_be_written_and_revoked() {
         let key = host("mycompany.blob.core.windows.net");
@@ -253,8 +214,6 @@ mod tests {
         assert_eq!(map.remove(&key), None);
     }
 
-    /// The table parses in the shape documented for users, and an absent host
-    /// answers with the anonymous defaults rather than requiring a presence check.
     #[test]
     fn table_parses_and_absent_hosts_default() {
         let map: AzureOptionsMap = toml::from_str(
@@ -288,8 +247,6 @@ mod tests {
         assert_eq!(azurite.endpoint().scheme, AzureScheme::Http);
         assert_eq!(azurite.endpoint().addressing, Addressing::PathStyle);
 
-        // Neither a container the account never granted nor an unlisted host gets
-        // anything, and the two are the same answer by construction.
         assert!(!real.fetch(Some(&container("public"))).auth.is_granted());
         let unlisted = map.get(&host("someoneelse.blob.core.windows.net"));
         assert!(
@@ -300,7 +257,6 @@ mod tests {
         );
         assert_eq!(unlisted, AzureEndpointOptions::default());
 
-        // The table feeds the fetch middleware directly, keys and all.
         assert_eq!(
             map.endpoint_options().collect::<Vec<_>>(),
             vec![
@@ -310,8 +266,6 @@ mod tests {
         );
     }
 
-    /// A grant may only ride cleartext to an endpoint that is not routable off
-    /// the machine or its LAN.
     #[test]
     fn cleartext_grants_are_confined_to_local_endpoints() {
         for authority in ["127.0.0.1:10000", "[::1]:10000", "azurite:10000"] {
@@ -328,13 +282,8 @@ mod tests {
             ))
             .unwrap();
             let err = map.validate().expect_err("{authority} is routable");
-            // The message names the container at fault: the entry may hold many, and
-            // only the granted ones are the problem.
             assert!(err.to_string().contains("releases"), "{err}");
 
-            // The same host over https, and the same cleartext scheme with no
-            // container granted, are both fine — it is only the pair that is
-            // refused, and an explicit `false` is not a grant.
             let https: AzureOptionsMap =
                 toml::from_str(&format!("[\"{authority}\".auth]\nreleases = true\n")).unwrap();
             assert!(https.validate().is_ok());
@@ -346,8 +295,6 @@ mod tests {
         }
     }
 
-    /// Two spellings of one host must be refused rather than one silently
-    /// winning: the loser here is an explicit `releases = false`.
     #[test]
     fn a_document_naming_one_host_twice_is_refused() {
         let document = r#"
@@ -362,8 +309,6 @@ releases = true
         assert!(error.contains("acct.blob.example"), "{error}");
     }
 
-    /// A later config file replaces a host's endpoint wholesale. It must not be
-    /// able to keep an earlier `path-style = true` while changing only the scheme.
     #[test]
     fn merge_replaces_the_endpoint_wholesale() {
         let base: AzureOptionsMap =
@@ -377,10 +322,6 @@ releases = true
         assert_eq!(entry.endpoint().addressing, Addressing::HostStyle);
     }
 
-    /// The grants, unlike the endpoint, merge per container: a user file naming one
-    /// container must not silently revoke a grant a system file made on another —
-    /// and, because an explicit `false` is legal, it can still revoke the one it
-    /// does name. Without that, per-container merging would be a one-way ratchet.
     #[test]
     fn merge_layers_grants_per_container() {
         let system: AzureOptionsMap =
@@ -403,10 +344,6 @@ releases = true
         assert!(entry.fetch(Some(&container("internal"))).auth.is_granted());
     }
 
-    /// The defect this key type exists to kill: every one of these keys is a
-    /// spelling a lookup arrives with in normalized form, and with a `String` key
-    /// each was a silent miss — an anonymous fetch, a 404, and a user told "not
-    /// found" instead of "not authorized".
     #[test]
     fn keys_are_normalized_the_same_way_lookups_are() {
         for (written, looked_up) in [
@@ -433,11 +370,6 @@ releases = true
                     .is_granted(),
                 "the grant written as `{written}` did not apply to `{looked_up}`"
             );
-            // The key is stored canonically, so `keys()` reports what a lookup
-            // would need rather than what happened to be typed — quoted, as the
-            // TOML path it has to be written as, with one key per grant so each is
-            // separately settable — and writing the table back out produces a key
-            // that parses to the same host.
             assert_eq!(
                 map.keys(),
                 vec![
@@ -454,8 +386,6 @@ releases = true
         }
     }
 
-    /// A key that cannot be a host is a config error worth naming, not an entry
-    /// that silently never matches.
     #[test]
     fn an_unparseable_key_is_rejected() {
         let err = toml::from_str::<AzureOptionsMap>(
@@ -468,8 +398,6 @@ releases = true
         );
     }
 
-    /// The same rule one level down: a container key Azure would refuse is a config
-    /// error, since it can never match a request either.
     #[test]
     fn an_unusable_container_key_is_rejected() {
         let err =

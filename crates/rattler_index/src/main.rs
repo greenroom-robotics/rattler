@@ -39,8 +39,8 @@ fn parse_s3_url(value: &str) -> Result<Url, String> {
 }
 
 /// SAS permissions requested when minting a user-delegation SAS for indexing.
-/// Indexing does a read-modify-write of repodata and lists/reads packages, so it
-/// needs read, write, list, and create (`r` + `w` + `l` + `c`).
+/// Indexing read-modify-writes repodata and lists packages, so it needs read,
+/// write, list and create.
 #[cfg(feature = "azure")]
 const AZURE_INDEX_SAS_PERMISSIONS: &str = "rwlc";
 
@@ -120,10 +120,8 @@ enum Commands {
         /// The Azure Blob channel URL, e.g.
         /// `az://<account>.blob.core.windows.net/<container>/<channel>`.
         ///
-        /// Parsed into an [`AzureChannelUrl`] rather than a wire `Url`: the wire
-        /// scheme comes from the host's `azure-options` entry, which is not read
-        /// until after clap has run, and the `az://` spelling is what
-        /// `[index-config."…"]` keys are matched against.
+        /// Not a wire `Url`: the wire scheme comes from the host's
+        /// `azure-options` entry, which is only read after clap has run.
         channel: AzureChannelUrl,
 
         #[clap(flatten)]
@@ -287,14 +285,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How to address a channel's host, from its `[azure-options."<host>"]` entry, or
-/// the https host-style defaults when there is no config file or no entry.
+/// How to address a channel's host, from its `[azure-options."<host>"]` entry.
 ///
-/// A host without an entry and a host with an empty entry are defined to behave
-/// identically, so this never has to report which of the two it found. The entry's
-/// per-container grants are not part of the result: indexing signs with the
-/// credential its caller supplied, so there is no ambient chain for a grant to
-/// gate.
+/// A missing entry and an empty entry behave identically, so this never reports
+/// which it found. Grants are not part of the result: indexing signs with the
+/// credential its caller supplied, so there is no ambient chain to gate.
 #[cfg(feature = "azure")]
 fn azure_endpoint(config: &Option<Config>, host: &AzureHost) -> AzureEndpoint {
     config
@@ -336,8 +331,7 @@ mod tests {
 
     use super::*;
 
-    /// Load a config from TOML the way `--config` does, through a real file, so
-    /// the test exercises the same deserialization the CLI does.
+    /// Load a config from TOML through a real file, the way `--config` does.
     fn config_from(toml: &str) -> Option<Config> {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rattler-config.toml");
@@ -345,9 +339,6 @@ mod tests {
         Some(Config::load_from_files(vec![path]).expect("config should load"))
     }
 
-    /// Reviewer issue 5: `[index-config."az://…"]` is the only spelling a user
-    /// would write for an Azure channel, and matching the https wire URL meant it
-    /// never applied to anything.
     #[test]
     fn index_config_is_keyed_by_the_canonical_az_url() {
         let config = config_from(
@@ -362,8 +353,6 @@ mod tests {
         let resolved = resolve_index_channel_config(&config, channel.canonical().as_str());
         assert_eq!(resolved.write_shards, Some(false));
 
-        // The spelling this used to match against, kept as the negative half of
-        // the proof: had the key been written in wire form it would still be dead.
         let wire = channel.wire(AzureScheme::Https).to_string();
         assert_eq!(
             resolve_index_channel_config(&config, &wire).write_shards,
@@ -371,9 +360,8 @@ mod tests {
         );
     }
 
-    /// An Azurite entry has to carry all the way to the opendal config, because
-    /// every one of these four fields is derived differently under path-style and
-    /// a wrong one fails silently.
+    /// All four fields are derived differently under path-style, and a wrong one
+    /// fails silently.
     #[test]
     fn a_path_style_entry_drives_the_azurite_index_config() {
         let config = config_from(
@@ -410,9 +398,8 @@ mod tests {
         assert_eq!(azblob.root.as_deref(), Some("/mychannel"));
     }
 
-    /// Without an entry the same URL is an error, not a silently different
-    /// endpoint: host-style cannot read an account out of an IP literal, and the
-    /// error names the config line that fixes it.
+    /// Without an entry the same URL errors instead of silently addressing
+    /// something else, and the error names the config line that fixes it.
     #[test]
     fn an_emulator_host_without_an_entry_is_a_guided_error() {
         let channel =

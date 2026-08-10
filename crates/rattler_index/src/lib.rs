@@ -1518,13 +1518,11 @@ pub async fn index_s3_with_channel_metadata(
 /// Configuration for `index_azure`
 #[cfg(feature = "azure")]
 pub struct IndexAzureConfig {
-    /// The channel to index, as an `az://` Azure Blob channel URL.
+    /// The channel to index.
     pub channel: AzureChannelUrl,
     /// The credentials to use for Azure Blob access.
     pub credentials: AzureCredentials,
-    /// How to address the channel's host: the wire scheme, and whether the account
-    /// is read from the host or the path. The defaults (https, host-style) describe
-    /// real Azure.
+    /// How to address the channel's host. See [`AzureEndpoint`].
     pub endpoint: AzureEndpoint,
     /// The target platform to index.
     pub target_platform: Option<Platform>,
@@ -1612,8 +1610,6 @@ pub async fn index_azure_with_channel_metadata(
         force,
         max_parallel,
         multi_progress,
-        // opendal's azblob service can't do conditional writes, so preconditions
-        // must be disabled (matching the filesystem backend).
         PreconditionChecks::Disabled,
         channel_metadata,
     )

@@ -3,23 +3,16 @@
 //!
 //! # Host model
 //!
-//! This crate does not police which hosts are legitimate Azure endpoints: the
-//! host a channel URL names is taken to be the storage endpoint it says it is.
-//! What is *granted* — credentials, wire scheme, addressing style — is declared in
-//! [`options`] and never inferred from the host name: the wire scheme and the
-//! addressing per host, and credentials per *container*, because that is the scope
-//! Azure's own RBAC has. The default grant is [`Auth::Anonymous`], so naming a host
-//! or a container in a URL by itself sends nothing to it. Nothing here signs or
-//! sends a request either — that lives in `rattler_networking` — but two functions
-//! do handle a credential:
-//! `azblob_config` embeds the account key or SAS it is handed into the config it
-//! returns, and `mint_user_delegation_sas` spends the user's `az login` session to
-//! obtain one. Deriving coordinates from a URL ([`account_and_container`])
-//! touches no credential at all.
+//! The host a channel URL names is taken to be the storage endpoint it claims to
+//! be. Credentials, wire scheme and addressing are declared in [`options`], never
+//! inferred from the host name. Scheme and addressing are per host; credentials
+//! are per *container*, the scope Azure's own RBAC has. The default grant is
+//! [`Auth::Anonymous`], so naming a host in a URL by itself sends nothing to it.
+//! Signing and sending live in `rattler_networking`, not here.
 //!
-//! Userinfo (`user:pass@host`) is rejected wherever a host is parsed, because
+//! Userinfo (`user:pass@host`) is rejected wherever a host is parsed:
 //! `az://real.host@evil.example/…` reads as the real host while addressing the
-//! attacker's and provides no real functionality.
+//! attacker's.
 
 #[cfg(feature = "clap")]
 pub mod clap;
@@ -33,44 +26,25 @@ pub use options::{
 pub use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
-/// Credentials for authenticating to Azure Blob storage.
-///
-/// Exactly one authentication method is carried, so the ambiguous "both a key
-/// and a SAS token" and "neither" states are unrepresentable. The storage
-/// account name, endpoint, and container are not stored here: they are derived
-/// by the consumer from the channel URL together with the host's addressing
-/// style (see [`account_and_container`]).
-///
-/// Both variants hold a [`SecretString`], so `Debug` redacts them, the bytes are
-/// zeroized on drop, and every read is a visible `expose_secret()`. The type has
-/// no `Serialize`/`Deserialize` either, so it cannot reach disk.
 #[derive(Clone, Debug)]
 pub enum AzureCredentials {
-    /// A shared storage account key.
     AccountKey(SecretString),
-
-    /// A shared access signature (SAS) token.
     SasToken(SecretString),
 }
 
 /// Strip a single leading `?` from a SAS token.
 ///
-/// `--sas-token` may be supplied with or without a leading `?`, but a SAS minted
-/// by [`mint_user_delegation_sas`] never has one. Normalizing at the single point
-/// where a token is handed to opendal means both sources behave identically.
+/// `--sas-token` may be written with or without one; a SAS minted by
+/// [`mint_user_delegation_sas`] never has one.
 pub fn normalize_sas_token(token: &str) -> &str {
     token.strip_prefix('?').unwrap_or(token)
 }
 
-/// Errors that can occur while deriving Azure Blob coordinates from a channel
-/// URL.
 #[derive(Debug, thiserror::Error)]
 pub enum AzureUrlError {
-    /// The URL has no host component.
     #[error("no host in Azure blob URL")]
     NoHost,
 
-    /// The URL carries userinfo (`user:pass@host`).
     #[error(
         "Azure blob URL must not contain userinfo (`user:pass@host`): the `user@host` form is a \
          host-spoofing vector that can disguise the real target host, and userinfo is invalid in \
@@ -78,26 +52,15 @@ pub enum AzureUrlError {
     )]
     UserInfoNotAllowed,
 
-    /// The text handed to [`AzureHost::parse`] is not a usable `host[:port]`.
-    ///
-    /// This is what a malformed `azure-options` key produces, so it quotes the
-    /// text back and says what was expected instead.
     #[error("`{authority}` is not a valid Azure host: {reason}; expected `host` or `host:port`")]
-    InvalidHostAuthority {
-        /// The offending authority text.
-        authority: String,
-        /// Why it was rejected.
-        reason: String,
-    },
+    InvalidHostAuthority { authority: String, reason: String },
 
     /// Host-style addressing was requested but the host has no account label: it
     /// is an IP literal, or a domain with only one label.
     ///
-    /// This is the error an Azurite or custom-endpoint user hits first, and the
-    /// fix is a config line rather than a URL change, so the message names that
-    /// line verbatim instead of leaving the user to discover `path-style`. The
-    /// host is spelled the way [`AzureHost`] spells it, which is the way the
-    /// config table is keyed — a key copied out of this message matches.
+    /// The fix is a config line rather than a URL change, so the message names
+    /// that line. The host is spelled the way [`AzureHost`] spells it, which is
+    /// how the config table is keyed, so a key copied out of this message matches.
     #[error(
         "Azure blob URL host `{0}` is not a dotted domain of the form `<account>.blob.<suffix>`, \
          so its first label cannot be a storage account. Such a host needs path-style addressing, \
@@ -107,22 +70,18 @@ pub enum AzureUrlError {
     )]
     InvalidHost(String),
 
-    /// The URL has no path segment to read the account from (path-style only).
     #[error("could not derive account name from Azure blob URL")]
     NoAccount,
 
-    /// The URL has no container path segment.
     #[error("no container in Azure blob URL")]
     NoContainer,
 
-    /// The derived account name is not a legal Azure storage account name.
     #[error(
         "`{0}` is not a valid Azure storage account name: account names are 3-24 characters of \
          lowercase letters and digits only"
     )]
     InvalidAccountName(String),
 
-    /// The derived container name is not a legal Azure blob container name.
     #[error(
         "`{0}` is not a valid Azure blob container name: container names are 3-63 characters of \
          lowercase letters, digits and hyphens, must start and end with a letter or digit, and \
@@ -130,47 +89,30 @@ pub enum AzureUrlError {
     )]
     InvalidContainerName(String),
 
-    /// The channel URL string could not be parsed.
     #[error("`{value}` is not a valid URL")]
     InvalidUrl {
-        /// The offending input.
         value: String,
-        /// The underlying parse error.
         #[source]
         source: url::ParseError,
     },
 
-    /// The written path is not the path the URL Standard resolves it to.
-    ///
-    /// `..` segments — including percent-encoded ones — are resolved before any
-    /// segment is validated, so a path that reads as one container (or, path-style,
-    /// one account) can address another. The resolved form is quoted so the user
-    /// can see where the URL would actually have gone.
     #[error(
         "Azure blob channel URL path `{written}` is not the path it resolves to, `{resolved}`; a \
          channel URL must name the location it addresses, so write `{resolved}` if that is the \
          location you mean"
     )]
-    NonCanonicalPath {
-        /// The path as written.
-        written: String,
-        /// The path it resolves to.
-        resolved: String,
-    },
+    NonCanonicalPath { written: String, resolved: String },
 
     /// A path segment percent-decodes to bytes that are not UTF-8.
     ///
-    /// Blob names are UTF-8, so there is nothing to send such a segment as. Decoding
-    /// lossily would substitute U+FFFD and address a different blob than the URL
-    /// names, silently and without an error at any layer.
+    /// Blob names are UTF-8. Decoding lossily would substitute U+FFFD and silently
+    /// address a different blob than the URL names.
     #[error(
         "Azure blob channel URL segment `{segment}` percent-decodes to bytes that are not UTF-8, \
          so it cannot name a blob"
     )]
     NonUtf8Path {
-        /// The segment as written.
         segment: String,
-        /// Where the decoded bytes stop being UTF-8.
         #[source]
         source: std::str::Utf8Error,
     },
@@ -178,16 +120,14 @@ pub enum AzureUrlError {
     /// A path segment contains `%2F`, an encoded slash.
     ///
     /// One segment holding a slash and two segments are different blob paths, and
-    /// the URL Standard does not resolve `%2F`, so whichever reading we picked would
-    /// be a place the URL text does not say. Refusing keeps the written path and the
-    /// blob path the same shape.
+    /// the URL Standard does not resolve `%2F`, so either reading would address a
+    /// place the URL text does not say.
     #[error(
         "Azure blob channel URL segment `{0}` contains an encoded slash (`%2F`); write the path \
          separator as `/` if you mean a new segment"
     )]
     EncodedSlashInPath(String),
 
-    /// The channel URL does not use the `az://` scheme.
     #[error(
         "Azure blob channel URL must use the `az://` scheme, e.g. \
          `az://<account>.blob.core.windows.net/<container>/...`: got `{0}`"
@@ -198,16 +138,13 @@ pub enum AzureUrlError {
 /// A storage account name that has passed Azure's naming rules: 3-24 characters
 /// of lowercase letters and digits.
 ///
-/// Those rules are the only thing that keeps option-shaped text (`--as-user`,
-/// `-o`) out of the `az` argv in [`mint_user_delegation_sas`], so the mint takes
-/// this type: the guarantee is then carried by what the function accepts rather
-/// than by every call site remembering to derive its name through a validating
-/// path. The inner `String` is private and [`Self::new`] is the only way to one.
+/// Those rules are the only thing keeping option-shaped text (`--as-user`, `-o`)
+/// out of the `az` argv in [`mint_user_delegation_sas`], which is why the mint
+/// takes this type rather than a `&str`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountName(String);
 
 impl AccountName {
-    /// Check a name against Azure's storage account naming rules.
     pub fn new(name: &str) -> Result<Self, AzureUrlError> {
         let valid = (3..=24).contains(&name.len())
             && name
@@ -218,7 +155,6 @@ impl AccountName {
             .ok_or_else(|| AzureUrlError::InvalidAccountName(name.to_string()))
     }
 
-    /// The validated name.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -234,15 +170,11 @@ impl std::fmt::Display for AccountName {
 /// lowercase letters, digits and hyphens, with no leading or trailing hyphen and
 /// no consecutive hyphens.
 ///
-/// Exists for the same reason as [`AccountName`], and is what the container half
-/// of the `az` argv is spelled as.
+/// Exists for the same reason as [`AccountName`].
 ///
-/// It is also the key of an `auth` table in `azure-options`, which is why it is
-/// hashable and has the same string serde bridge [`AzureHost`] has: a grant is
-/// written per container, and the name a grant is stored under must be the name a
-/// lookup arrives with. Azure's rules do the normalizing for free — a container
-/// name is lowercase by construction, so unlike a host there is only ever one
-/// spelling of one container.
+/// It is also the key of an `auth` table in `azure-options`, hence the hash and
+/// string serde bridge. Azure's rules make a container name lowercase by
+/// construction, so unlike a host there is only one spelling of one container.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "serde",
@@ -252,7 +184,6 @@ impl std::fmt::Display for AccountName {
 pub struct ContainerName(String);
 
 impl ContainerName {
-    /// Check a name against Azure's blob container naming rules.
     pub fn new(name: &str) -> Result<Self, AzureUrlError> {
         let valid = (3..=63).contains(&name.len())
             && name
@@ -266,7 +197,6 @@ impl ContainerName {
             .ok_or_else(|| AzureUrlError::InvalidContainerName(name.to_string()))
     }
 
-    /// The validated name.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -286,10 +216,8 @@ impl std::str::FromStr for ContainerName {
     }
 }
 
-/// The serde bridge for using a `ContainerName` as a map key: serde hands map keys
-/// over as owned strings, so `serde(try_from = "String")` is what routes a written
-/// `auth` key through [`ContainerName::new`] instead of storing it raw. A key Azure
-/// would refuse is then a config error at load, not a grant that can never match.
+/// Routes a written `auth` key through [`ContainerName::new`], so a key Azure
+/// would refuse is a config error at load rather than a grant that never matches.
 impl TryFrom<String> for ContainerName {
     type Error = AzureUrlError;
 
@@ -304,51 +232,27 @@ impl From<ContainerName> for String {
     }
 }
 
-/// The storage account and container an Azure Blob channel URL resolves to.
-///
-/// The fields are public because their *types* are the invariant: a
-/// `AzureCoordinates` cannot be assembled from unvalidated text, whoever builds
-/// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AzureCoordinates {
-    /// The storage account name — the first host label under
-    /// [`Addressing::HostStyle`], the first path segment under
-    /// [`Addressing::PathStyle`].
     pub account: AccountName,
-
-    /// The blob container name — the first path segment under
-    /// [`Addressing::HostStyle`], the second under [`Addressing::PathStyle`].
     pub container: ContainerName,
 }
 
 /// Derive the storage account name and container from an Azure Blob channel URL.
 ///
-/// Where the account name lives is decided by `addressing`, which comes from the
-/// host's `azure-options` entry — it is not guessable from the URL, because
-/// `https://host/a/b` is a valid reading under both styles:
+/// Which part of the URL holds the account is not guessable, since `host/a/b` is
+/// a valid reading under both styles. `addressing` decides:
 ///
-/// - [`Addressing::HostStyle`] (real Azure, the default): account = first label
-///   of the host, container = first path segment. The host must be a domain with
-///   at least two labels, so IP literals and single-label hosts fail with
-///   [`AzureUrlError::InvalidHost`], whose message names the config line that
-///   switches to path-style.
-/// - [`Addressing::PathStyle`] (Azurite and other emulators): account = first
-///   path segment, container = second. On a host under a known Azure Blob suffix
-///   this is almost certainly a config mistake — the two styles then disagree
-///   about which name is the account while producing identical request URLs, so
-///   nothing fails until a mint asks for a delegation SAS on whatever the path
-///   spelled. It is only a warning: the list is advisory, cannot cover a
-///   proxy or a private endpoint, and choosing the addressing for a host remains
-///   the user's call.
+/// - [`Addressing::HostStyle`]: account is the first host label, container the
+///   first path segment. The host must be a domain with at least two labels, so
+///   IP literals and single-label hosts fail with
+///   [`AzureUrlError::InvalidHost`].
+/// - [`Addressing::PathStyle`]: account is the first path segment, container the
+///   second. On a host under a known Azure Blob suffix this only warns, since the
+///   suffix list cannot cover a proxy or a private endpoint.
 ///
-/// The host is otherwise trusted verbatim (see the [crate-level docs] for the
-/// host model): an honest, arbitrary host is the caller's responsibility. The
-/// derived account and container are additionally held to Azure's own naming
-/// rules — under *both* addressing styles, since path-style takes the account
-/// from user-controlled path text. Those rules reject an empty name, any
-/// character outside `[a-z0-9-]`, and a leading `-`.
-///
-/// [crate-level docs]: crate
+/// Both derived names are held to Azure's naming rules under both styles, since
+/// path-style takes the account from user-controlled path text.
 pub fn account_and_container(
     channel: &AzureChannelUrl,
     addressing: Addressing,
@@ -391,21 +295,13 @@ pub fn account_and_container(
 
 /// The container an Azure Blob URL names, when it names one.
 ///
-/// This is the fetch path's half of [`account_and_container`]: a grant is written
-/// per container, so the middleware needs the container and nothing else — no
-/// account, which is what keeps a URL on a host that cannot carry an account label
-/// (an IP literal read host-style) from failing here where it fetches happily
-/// today.
+/// The fetch path's half of [`account_and_container`]. It derives no account, so
+/// a host that cannot carry an account label (an IP literal read host-style) still
+/// fetches.
 ///
-/// The two answers it can give are deliberately different:
-///
-/// - `Ok(None)`: the URL has no container segment — the host root, or a path too
-///   short to have one under this addressing. There is nothing to attribute a
-///   grant to, so the caller sends nothing.
-/// - `Err`: the segment is there but is not a name Azure allows for a container.
-///   No legitimate blob request can land here, so this is a malformed endpoint
-///   rather than an ungranted one, and saying so beats going quietly anonymous and
-///   surfacing later as an unexplained 401.
+/// `Ok(None)` means the URL has no container segment, so there is nothing to
+/// attribute a grant to. `Err` means the segment is there but is not a name Azure
+/// allows, which is a malformed endpoint rather than an ungranted one.
 pub fn container(
     channel: &AzureChannelUrl,
     addressing: Addressing,
@@ -415,10 +311,6 @@ pub fn container(
         .transpose()
 }
 
-/// The `index`-th path segment, or `None` when it is missing or empty.
-///
-/// An empty segment is a missing one: no Azure name may be empty, so `//general`
-/// has no first segment rather than an unnamed one.
 fn segment(channel: &AzureChannelUrl, index: usize) -> Option<&str> {
     channel
         .path_segments()
@@ -426,8 +318,6 @@ fn segment(channel: &AzureChannelUrl, index: usize) -> Option<&str> {
         .filter(|segment| !segment.is_empty())
 }
 
-/// A normalized Azure Blob endpoint authority: a host, and its port when one is
-/// written.
 #[derive(Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "serde",
@@ -440,7 +330,6 @@ pub struct AzureHost {
 }
 
 impl AzureHost {
-    /// Parse and normalize a bare `host[:port]` authority.
     pub fn parse(authority: &str) -> Result<Self, AzureUrlError> {
         if authority.contains('@') {
             return Err(AzureUrlError::UserInfoNotAllowed);
@@ -484,15 +373,12 @@ impl AzureHost {
 
     /// The port exactly as the authority spells it, when it spells one.
     ///
-    /// An IPv6 literal is bracketed, so a colon inside it is never a port
-    /// delimiter — only a `]:port` suffix is.
+    /// An IPv6 literal is bracketed, so only a `]:port` suffix is a port.
     fn written_port(authority: &str) -> Option<&str> {
         let (_, port) = authority.rsplit_once(':')?;
         (!port.ends_with(']')).then_some(port)
     }
 
-    /// Parse `<scheme>://<authority>`, reporting a failure against the authority
-    /// text the caller actually wrote.
     fn parse_as(authority: &str, scheme: &str) -> Result<Url, AzureUrlError> {
         Url::parse(&format!("{scheme}://{authority}")).map_err(|err| {
             AzureUrlError::InvalidHostAuthority {
@@ -502,12 +388,6 @@ impl AzureHost {
         })
     }
 
-    /// Apply the rules the URL host parser does not: strip the DNS root label,
-    /// reject empty labels, and hold the name to the 253-character limit DNS puts
-    /// on one.
-    ///
-    /// Private, so every route in goes through [`parse`](Self::parse) and no rule
-    /// can be skipped.
     fn normalized(
         host: url::Host,
         port: Option<u16>,
@@ -516,7 +396,6 @@ impl AzureHost {
         const DNS_NAME_LIMIT: usize = 253;
 
         let url::Host::Domain(domain) = &host else {
-            // An IP literal is already fully canonical, and has no labels.
             return Ok(Self { host, port });
         };
 
@@ -554,29 +433,23 @@ impl AzureHost {
         Ok(Self { host, port })
     }
 
-    /// The parsed host, without the port.
     pub fn host(&self) -> &url::Host {
         &self.host
     }
 
-    /// The port, when the authority names one.
     pub fn port(&self) -> Option<u16> {
         self.port
     }
 
     /// The storage account label under host-style addressing.
     ///
-    /// `None` whenever the host cannot carry an account name, which the stored
-    /// [`url::Host`] answers by construction rather than by inspecting text:
+    /// `None` whenever the host cannot carry an account name. The stored
+    /// [`url::Host`] answers that by construction: an IP literal is never a
+    /// domain, so `127.0.0.1` cannot yield an account named `127`, and a domain
+    /// needs at least two labels, so `localhost` is rejected.
     ///
-    /// - an IP literal is an [`url::Host::Ipv4`] or [`url::Host::Ipv6`], so it can
-    ///   never be read as a label — including `127.0.0.1`, which a "does it
-    ///   contain a dot" test would happily split into an account named `127`;
-    /// - a domain must have at least two labels, so `localhost` is rejected.
-    ///
-    /// [`parse`](Self::parse) has already guaranteed no label is empty and there
-    /// is no trailing dot, so "at least two labels" here means "at least two
-    /// non-empty labels".
+    /// [`parse`](Self::parse) has already rejected empty labels and a trailing
+    /// dot, so those two labels are non-empty.
     fn account_label(&self) -> Option<&str> {
         match &self.host {
             url::Host::Domain(domain) => {
@@ -591,16 +464,15 @@ impl AzureHost {
     /// Whether this host sits under a suffix Microsoft operates, where the account
     /// is by definition the first label.
     ///
-    /// Advisory only, and deliberately not a security boundary: a grant is written
-    /// per host, so no behaviour hangs off this answer. It exists to warn about a
+    /// Advisory only, never a security boundary: it exists to warn about a
     /// `path-style = true` that cannot be what the user meant. A proxy or private
-    /// endpoint in front of real Azure answers `false`, which is why a `false` here
-    /// is never treated as evidence of anything.
+    /// endpoint in front of real Azure answers `false`, so a `false` proves
+    /// nothing.
     pub fn is_known_azure_blob_endpoint(&self) -> bool {
         const SUFFIXES: &[&str] = &[
-            "blob.core.windows.net",       // global
-            "blob.core.usgovcloudapi.net", // US Government
-            "blob.core.chinacloudapi.cn",  // China, operated by 21Vianet
+            "blob.core.windows.net",
+            "blob.core.usgovcloudapi.net",
+            "blob.core.chinacloudapi.cn",
         ];
 
         let url::Host::Domain(domain) = &self.host else {
@@ -630,9 +502,6 @@ impl std::fmt::Display for AzureHost {
 
 impl std::fmt::Debug for AzureHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The canonical text *is* the identity; the host/port split is an
-        // implementation detail, and printing it would only make a config dump
-        // harder to read.
         write!(f, "AzureHost({:?})", self.to_string())
     }
 }
@@ -645,9 +514,6 @@ impl std::str::FromStr for AzureHost {
     }
 }
 
-/// The serde bridge for using an `AzureHost` as a map key: serde hands map keys
-/// over as owned strings, so `serde(try_from = "String")` is what routes a written
-/// `azure-options` key through [`AzureHost::parse`] instead of storing it raw.
 impl TryFrom<String> for AzureHost {
     type Error = AzureUrlError;
 
@@ -665,38 +531,20 @@ impl From<AzureHost> for String {
 /// A validated Azure Blob **channel** URL, which has two spellings: `az://…` as
 /// the user writes it and in configuration, and `http(s)://…` on the wire.
 ///
-/// # Why the parts are stored, and not a URL
+/// The parts are stored rather than a `Url`, because a `Url`'s port is
+/// scheme-relative: storing `az://host:443/…` as `https` drops the port, and
+/// [`wire`](Self::wire) would then hand out `http://host/…`, a different endpoint.
+/// [`AzureHost`] holds host and port explicitly and normalizes both without a
+/// scheme. Every spelling is built from those same parts, so no two spellings can
+/// disagree.
 ///
-/// The obvious shape is a struct holding both spellings, which can hold a pair
-/// that disagrees — a canonical URL for one host and a wire URL for another — and
-/// nothing but discipline stops it. The next-obvious shape is one `Url` in the
-/// wire form with a fixed scheme, deriving the other spelling from it. That is
-/// worse than it looks: a `Url`'s port is scheme-relative, so storing
-/// `az://host:443/…` as `https` drops the port on the way in, and
-/// [`wire`](Self::wire) then hands out `http://host/…` — port 80, a different
-/// endpoint.
-///
-/// So the authority is stored as an [`AzureHost`], which holds host and port
-/// explicitly and normalizes both without reference to any scheme, next to the
-/// already-normalized path, query and fragment. Every spelling is built from those
-/// same parts by one private helper, so no two spellings can disagree about host,
-/// port, path or query.
-///
-/// # Why the scheme is a `wire()` argument and not a field
-///
-/// Which scheme a host is reached over comes from its `azure-options` entry, and
-/// [`parse`](Self::parse) runs as a clap `value_parser` — before any config file
-/// is read. A stored scheme would therefore have to be a guess made at parse time
-/// and corrected later, which is exactly the drift this type exists to prevent.
-/// Passing it in at call time keeps the choice at the site that makes it.
-///
-/// Nothing in the type ties the argument to an options entry. `rattler-index`
-/// takes it from the channel host's entry; `rattler_upload` passes the default,
-/// because it reads no config file at all (see the note in
-/// `rattler_upload::upload_from_args`).
+/// The wire scheme is an argument to [`wire`](Self::wire) rather than a field
+/// because it comes from the host's `azure-options` entry, while
+/// [`parse`](Self::parse) runs as a clap `value_parser`, before any config file is
+/// read. `rattler-index` takes it from that entry; `rattler_upload` passes the
+/// default, because it reads no config file at all.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AzureChannelUrl {
-    /// The authority, normalized independently of any scheme.
     host: AzureHost,
 
     /// The path as the URL Standard normalizes it: always a leading `/`, still
@@ -709,11 +557,8 @@ pub struct AzureChannelUrl {
     /// The fragment, when there is one.
     ///
     /// Kept so [`canonical`](Self::canonical) spells the channel back the way the
-    /// user wrote it, which is also the spelling config keys are matched against.
-    /// It reaches no server: an HTTP request carries only the path and query, and
-    /// on a signed request it is gone from the URL as well, because
-    /// `AzureMiddleware::sign` round-trips through `http::Uri`, which has no
-    /// fragment.
+    /// user wrote it. It reaches no server: an HTTP request carries only the path
+    /// and query.
     fragment: Option<String>,
 }
 
@@ -721,16 +566,11 @@ impl AzureChannelUrl {
     /// Parse and validate an `az://` channel URL.
     ///
     /// The only accepted spelling is `az://<host>/<…>`. A bare `http(s)://` URL is
-    /// deliberately *not* accepted: `az://` is the single canonical spelling for an
-    /// Azure channel, and accepting the wire URL as a second input spelling would
-    /// only invite confusion about which one is authoritative.
+    /// not accepted, so there is one canonical spelling for an Azure channel.
     ///
-    /// Account and container derivation is *not* performed here: it depends on the
-    /// host's addressing style, which is config that does not exist yet at clap
-    /// parse time. It happens in [`account_and_container`], which today runs only
-    /// where an account name is genuinely needed — minting a SAS from an
-    /// `az login` session, and building the opendal config for a write. The fetch
-    /// path never calls it.
+    /// Account and container derivation happens in [`account_and_container`], not
+    /// here: it depends on the host's addressing style, which is config that does
+    /// not exist yet at clap parse time.
     pub fn parse(value: &str) -> Result<Self, AzureUrlError> {
         // URL schemes are case-insensitive and `Url` lowercases them, so `AZ://…`
         // reaches every downstream `scheme() == "az"` comparison as `az`. Matching
@@ -796,30 +636,14 @@ impl AzureChannelUrl {
         })
     }
 
-    /// The `az://host/path` spelling: the channel's identity.
-    ///
-    /// This is what users write, what is shown back to them, and what config keys
-    /// are matched against: `rattler-index` resolves `[index-config."az://…"]`
-    /// through this spelling, and `[azure-options."…"]` through [`Self::host`].
-    /// Matching the wire string instead was reviewer issue 5 — the two spellings
-    /// exist so a config key never has to guess which one a channel was stored as.
-    /// A SAS written inline is masked: this spelling is the one that reaches logs
-    /// and error messages, and [`Self::wire`] is the only way to the signature.
     pub fn canonical(&self) -> Url {
         self.spelled("az", Sas::Masked)
     }
 
-    /// The `http(s)://host/path` spelling used for actual requests, over the
-    /// scheme the host's options entry asks for.
     pub fn wire(&self, scheme: AzureScheme) -> Url {
         self.spelled(scheme.as_str(), Sas::Exposed)
     }
 
-    /// Build one spelling of this URL.
-    ///
-    /// Both public spellings go through here, so they cannot differ in anything
-    /// but the scheme and whether the signature is masked: the host, port, path,
-    /// query and fragment they are built from are literally the same values.
     fn spelled(&self, scheme: &str, sas: Sas) -> Url {
         let mut text = format!("{scheme}://{}{}", self.host, self.path);
         if let Some(query) = &self.query {
@@ -843,9 +667,7 @@ impl AzureChannelUrl {
 
     /// The host, with its port when the URL carries one.
     ///
-    /// This is the `azure-options` key for the channel, so options can be looked
-    /// up without a caller re-deriving it from a URL and getting the port handling
-    /// subtly wrong.
+    /// This is also the `azure-options` key for the channel.
     pub fn host(&self) -> &AzureHost {
         &self.host
     }
@@ -859,8 +681,6 @@ impl AzureChannelUrl {
 
 impl std::fmt::Display for AzureChannelUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The canonical spelling is the one users recognize and the one config is
-        // keyed by, so it is the only sensible thing to print.
         write!(f, "{}", self.canonical())
     }
 }
@@ -875,19 +695,16 @@ impl std::fmt::Debug for AzureChannelUrl {
     }
 }
 
-/// Whether a spelling of a channel URL may carry the SAS signature.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sas {
-    /// For the wire: the signature is what makes the request authentic.
     Exposed,
-    /// For anything a human or a log sees.
     Masked,
 }
 
 /// Replace the value of a query's `sig` parameter, leaving the rest intact.
 ///
-/// The other SAS parameters (`sv`, `se`, `sp`, …) describe the grant and are worth
-/// showing; `sig` is the secret that makes it usable.
+/// The other SAS parameters (`sv`, `se`, `sp`, …) only describe the grant; `sig`
+/// is the secret that makes it usable.
 fn mask_sas_signature(query: &str) -> String {
     query
         .split('&')
@@ -907,11 +724,8 @@ impl std::str::FromStr for AzureChannelUrl {
     }
 }
 
-/// Strip a case-insensitive `az://` prefix, or return `None` when it is absent.
 fn strip_az_scheme(value: &str) -> Option<&str> {
     const PREFIX: &str = "az://";
-    // `get` rather than slicing: a multi-byte leading character would panic on a
-    // non-char-boundary index.
     value
         .get(..PREFIX.len())
         .filter(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
@@ -921,37 +735,29 @@ fn strip_az_scheme(value: &str) -> Option<&str> {
 /// Build an opendal [`AzblobConfig`](opendal::services::AzblobConfig) from a
 /// channel URL, the endpoint options of its host, and credentials.
 ///
-/// The account name, endpoint, container and root prefix are all derived from the
-/// channel URL, read the way `options.addressing` says to read it and reached over
-/// `options.scheme`; the credentials supply only the account key or SAS token.
-/// The per-container grants are not part of [`AzureEndpoint`] at all — this is the
-/// write path, where the credential has already been chosen by the caller.
-///
-/// Taking the [`AzureChannelUrl`] rather than a wire `Url` is what keeps the
-/// scheme in the config from disagreeing with the scheme in the endpoint: both
-/// come from the same `options`.
+/// Account name, endpoint, container and root prefix all come from the channel
+/// URL, read the way `endpoint_options` says to read it. The credentials supply
+/// only the account key or SAS token.
 ///
 /// # The two addressing shapes
 ///
 /// opendal's azblob core builds every request URI as `{endpoint}/{container}/{path}`
-/// and its core struct carries no account field at all, so under path-style the
-/// account can only reach the URL through `endpoint`:
+/// and carries no account field, so under path-style the account can only reach
+/// the URL through `endpoint`:
 ///
-/// - [`Addressing::HostStyle`]: `endpoint` is `{scheme}://{host}[:{port}]`, the
-///   account is the first host label, and `root` is the path after the container.
+/// - [`Addressing::HostStyle`]: `endpoint` is `{scheme}://{host}[:{port}]` and
+///   `root` is the path after the container.
 /// - [`Addressing::PathStyle`]: `endpoint` is
-///   `{scheme}://{host}[:{port}]/{account}`, the account is the first path
-///   segment, and `root` is the path after *both* the account and the container.
+///   `{scheme}://{host}[:{port}]/{account}` and `root` is the path after *both*
+///   the account and the container.
 ///
-/// `account_name` is set under both styles, and is mandatory under both: opendal
-/// infers it only from three known Azure suffixes and returns `None` — not an
-/// error — for anything else, so omitting it from a path-style config makes
-/// shared-key signing quietly never engage, and the failure surfaces as a 403
-/// rather than as a config error.
+/// `account_name` is mandatory under both styles: opendal infers it only from
+/// three known Azure suffixes and returns `None` rather than an error otherwise,
+/// so omitting it makes shared-key signing quietly never engage and surfaces as a
+/// 403.
 ///
 /// Neither endpoint ends in a slash. `AzblobBuilder::endpoint` trims one, but this
-/// builds the config struct literally, where nothing does, and a stray slash would
-/// yield `//{container}/…`.
+/// builds the config struct literally, where nothing does.
 #[cfg(feature = "opendal")]
 pub fn azblob_config(
     credentials: &AzureCredentials,
@@ -961,9 +767,6 @@ pub fn azblob_config(
     let AzureCoordinates { account, container } =
         account_and_container(channel, endpoint_options.addressing)?;
 
-    // The authority comes from `AzureHost`, not from a wire URL: a `Url` has
-    // already dropped a port equal to its scheme's default, so reading it back
-    // would turn a written `:443` into no port at all.
     let authority = channel.host();
     let endpoint = match endpoint_options.addressing {
         Addressing::HostStyle => format!("{}://{authority}", endpoint_options.scheme),
@@ -1023,27 +826,21 @@ pub fn azblob_config(
     })
 }
 
-/// Errors that can occur while minting a user-delegation SAS via the Azure CLI.
 #[cfg(feature = "clap")]
 #[derive(Debug, thiserror::Error)]
 pub enum AzureCliSasError {
-    /// The SAS expiry timestamp could not be computed.
     #[error("failed to compute the SAS expiry timestamp: {0}")]
     Expiry(String),
 
-    /// The `az` executable could not be resolved on `PATH`.
     #[error("could not resolve the Azure CLI (`az`) on PATH; install it and run `az login`")]
     AzResolve(#[source] which::Error),
 
-    /// The `az` process could not be spawned.
     #[error("failed to run the Azure CLI (`az`)")]
     Spawn(#[source] std::io::Error),
 
-    /// `az` exited with a non-zero status.
     #[error("the Azure CLI failed to generate a user-delegation SAS (is `az login` current?): {0}")]
     CommandFailed(String),
 
-    /// `az` succeeded but produced no SAS token.
     #[error("the Azure CLI returned an empty SAS token")]
     EmptyOutput,
 }
@@ -1051,10 +848,8 @@ pub enum AzureCliSasError {
 /// Mint a short-lived user-delegation SAS for a container by shelling out to the
 /// Azure CLI.
 ///
-/// opendal's azblob backend (used by the index and upload write paths) only
-/// accepts a shared account key or a SAS token, not an AAD bearer token. To let
-/// users authenticate writes with their `az login` session, this converts that
-/// session into a SAS via:
+/// opendal's azblob backend accepts a shared account key or a SAS token, not an
+/// AAD bearer token, so an `az login` session has to be converted into a SAS:
 ///
 /// ```text
 /// az storage container generate-sas --account-name <account> --name <container>
@@ -1064,22 +859,14 @@ pub enum AzureCliSasError {
 ///
 /// `permissions` is the Azure SAS permission string (e.g. `"cw"`). The returned
 /// token has no leading `?`. Requires `az` on `PATH` and a prior `az login`.
-///
-/// `scheme` is the wire scheme the host's options entry asks for: `--https-only`
-/// restricts the SAS to TLS, which would make it unusable against a host reached
-/// over http.
-///
-/// Runs the `az` process on the tokio runtime; it is meant to be called once at
-/// setup time.
+/// `--https-only` is passed only when `scheme` is https, since it would otherwise
+/// make the SAS unusable against the host.
 ///
 /// # Container-scope limitation
 ///
-/// A user-delegation SAS minted against a flat container is *container-scoped*,
-/// not prefix-scoped: it grants its permissions over the whole container, so a
-/// SAS for one channel also grants rights over any sibling channels that share
-/// the same container. The short TTL requested here bounds the blast radius, but
-/// prefix-scoping a flat container is not possible without a stored access
-/// policy, which this path deliberately does not create.
+/// The minted SAS is container-scoped, not prefix-scoped, so a SAS for one channel
+/// also grants rights over sibling channels in the same container. Prefix-scoping
+/// would need a stored access policy, which this path does not create.
 #[cfg(feature = "clap")]
 pub async fn mint_user_delegation_sas(
     account: &AccountName,
@@ -1127,11 +914,6 @@ pub async fn mint_user_delegation_sas(
     Ok(token.into())
 }
 
-/// The argv for the `az storage container generate-sas` call.
-///
-/// Split out from the spawn so the argument list is testable without an `az` on
-/// `PATH`. It stays a list of separate arguments — never a command line — so no
-/// value can be read as anything but one argument.
 #[cfg(feature = "clap")]
 fn generate_sas_args<'a>(
     account: &'a AccountName,
@@ -1165,12 +947,10 @@ fn generate_sas_args<'a>(
 
 /// Build the [`tokio::process::Command`] used to invoke the Azure CLI.
 ///
-/// `which` resolves `az` up front so a missing CLI surfaces as [`AzureCliSasError::AzResolve`]
-/// rather than an opaque spawn failure. It also matters on Windows, where the CLI
-/// is an `az.cmd` batch shim: the process spawner does not honor `PATHEXT`, so a
-/// bare `az` fails to resolve, but `which` applies `PATHEXT` to find the real path.
-/// The resolved path is invoked directly; routing through the command interpreter
-/// (`cmd /C az ...`) is deliberately avoided as an argument-injection vector.
+/// `which` resolves `az` up front, which matters on Windows: the CLI is an
+/// `az.cmd` batch shim and the process spawner does not honor `PATHEXT`. The
+/// resolved path is invoked directly rather than through `cmd /C`, which would be
+/// an argument-injection vector.
 #[cfg(feature = "clap")]
 fn az_command() -> Result<tokio::process::Command, AzureCliSasError> {
     let path = which::which("az").map_err(AzureCliSasError::AzResolve)?;
@@ -1181,7 +961,6 @@ fn az_command() -> Result<tokio::process::Command, AzureCliSasError> {
 mod tests {
     use super::*;
 
-    /// Every derivation runs off an [`AzureChannelUrl`], so the tests build one.
     fn channel(url: &str) -> AzureChannelUrl {
         AzureChannelUrl::parse(url).unwrap_or_else(|err| panic!("{url} should parse: {err}"))
     }
@@ -1205,11 +984,9 @@ mod tests {
         );
     }
 
-    /// The fetch path's derivation: it must find the same container
-    /// `account_and_container` does, under both addressing styles, and it must not
-    /// inherit that function's account rules — a host-style IP literal has no
-    /// account label, but it still has a container, and a fetch for it is a request
-    /// that works today.
+    /// The fetch path must find the same container `account_and_container` does
+    /// under both styles, without inheriting its account rules: a host-style IP
+    /// literal has no account label but still has a container.
     #[test]
     fn container_is_derived_from_the_addressing() {
         for (url, addressing, expected) in [
@@ -1260,9 +1037,6 @@ mod tests {
         }
     }
 
-    /// A URL with no container segment is not an error: there is nothing to
-    /// attribute a grant to, so the fetch path sends nothing and stays total for
-    /// URLs that are not channel-scoped.
     #[test]
     fn a_url_without_a_container_names_none() {
         for (url, addressing) in [
@@ -1278,10 +1052,6 @@ mod tests {
         }
     }
 
-    /// A segment that cannot be a container name is a malformed endpoint, not an
-    /// ungranted one — Azure forbids uppercase, so no legitimate request lands
-    /// here. Going quietly anonymous would surface as an unexplained 401 instead of
-    /// naming the fault.
     #[test]
     fn a_url_with_an_unusable_container_is_an_error() {
         for url in [
@@ -1310,9 +1080,9 @@ mod tests {
         ));
     }
 
-    /// Azure's naming rules are what keep injection-shaped values out of the `az`
-    /// subprocess, so they have to hold under path-style too — where the account
-    /// comes from user-controlled path text rather than a host label.
+    /// Azure's naming rules keep injection-shaped values out of the `az`
+    /// subprocess, so they must hold under path-style too, where the account comes
+    /// from user-controlled path text.
     #[test]
     fn invalid_component_names_are_rejected_under_both_styles() {
         assert!(matches!(
@@ -1348,9 +1118,8 @@ mod tests {
         }
     }
 
-    /// The docstring on [`account_and_container`] promises option-shaped values can
-    /// never reach the `az` argv. A charset of `[a-z0-9-]` alone does not deliver
-    /// that, because a leading `-` is inside it.
+    /// A charset of `[a-z0-9-]` alone does not keep option-shaped values out of
+    /// the `az` argv, because a leading `-` is inside it.
     #[test]
     fn option_shaped_components_are_rejected() {
         for (url, account_at_fault) in [
@@ -1371,8 +1140,6 @@ mod tests {
         }
     }
 
-    /// An empty name reaching a constructor must be rejected there, not only by a
-    /// caller remembering to filter it out first.
     #[test]
     fn empty_components_are_rejected() {
         assert!(AccountName::new("").is_err());
@@ -1386,7 +1153,6 @@ mod tests {
             "[::1]:10000",
             "azurite:10000",
             "localhost:10000",
-            // A bare docker service name, which is the shape a compose file gives.
             "azurite",
             "localhost",
         ] {
@@ -1420,11 +1186,6 @@ mod tests {
         }
     }
 
-    /// A `path-style = true` entry on a real Azure host is a config mistake with no
-    /// visible symptom — request URLs come out identical under both styles — right
-    /// up to a mint asking for a delegation SAS on the account name the *path*
-    /// happened to spell. Which addressing a host uses is still the user's call, so
-    /// this warns and proceeds.
     #[test]
     #[tracing_test::traced_test]
     fn path_style_on_a_real_azure_host_warns_and_proceeds() {
@@ -1438,8 +1199,6 @@ mod tests {
         assert!(logs_contain("path-style = true"));
         assert!(logs_contain("acct.blob.core.windows.net"));
 
-        // A host that is not a known Azure endpoint gets no warning, however much
-        // its first label looks like an account name.
         let coords = account_and_container(
             &channel("az://acct.blob.example.com/devstoreaccount1/general"),
             Addressing::PathStyle,
@@ -1449,8 +1208,8 @@ mod tests {
         assert!(!logs_contain("acct.blob.example.com"));
     }
 
-    /// The suffix list is advisory, but a sloppy match on it would warn about
-    /// hosts Microsoft does not operate — and stay silent on ones it does.
+    /// A sloppy suffix match would warn about hosts Microsoft does not operate and
+    /// stay silent on ones it does.
     #[test]
     fn known_azure_endpoints_are_matched_on_a_label_boundary() {
         for host in [
@@ -1482,10 +1241,9 @@ mod tests {
         }
     }
 
-    /// Host-style must keep rejecting hosts it cannot derive an account from — and
-    /// the rejection must hand the user a config key that would actually match,
-    /// which means the port has to be in it and the host has to be spelled the way
-    /// [`AzureHost`] spells it.
+    /// Host-style must reject hosts it cannot derive an account from, and the
+    /// rejection must name a config key that would actually match: port included,
+    /// host spelled the way [`AzureHost`] spells it.
     #[test]
     fn host_style_rejects_undottable_hosts_with_a_guided_error() {
         for (host, expected_key) in [
@@ -1511,14 +1269,10 @@ mod tests {
             assert!(message.contains("path-style = true"), "{message}");
             let key = format!("[azure-options.\"{expected_key}\"]");
             assert!(message.contains(&key), "{message}");
-            // The key named must be the one an `azure-options` lookup is made
-            // with, or the entry the user writes cannot ever apply.
             assert_eq!(expected_key, channel.host().to_string(), "{host}");
         }
     }
 
-    /// An empty host label is never legal, and used to yield an empty first
-    /// "label" as the account name.
     #[test]
     fn empty_host_labels_are_rejected() {
         for host in [
@@ -1561,9 +1315,6 @@ mod tests {
         }
     }
 
-    /// URL schemes are case-insensitive, and the middleware's `scheme() == "az"`
-    /// test sees an already-lowercased scheme, so it accepts `AZ://`. This parser
-    /// must not disagree with it.
     #[test]
     fn parse_accepts_a_scheme_in_any_case() {
         for input in [
@@ -1598,8 +1349,6 @@ mod tests {
             "http://acct.blob.core.windows.net/general/noarch"
         );
         assert_eq!(channel.to_string(), channel.canonical().to_string());
-        // `FromStr` is the same parser, so the canonical spelling parses back to
-        // the same value — which is what lets a config key round-trip.
         assert_eq!(
             channel,
             channel
@@ -1610,8 +1359,6 @@ mod tests {
         );
     }
 
-    /// The point of storing the parts: no scheme choice can make the two spellings
-    /// describe different locations.
     #[test]
     fn spellings_cannot_disagree() {
         for input in [
@@ -1703,10 +1450,8 @@ mod tests {
         assert_eq!(azure.host().port(), None);
     }
 
-    /// Every normalization the URL host parser performs is a way for a written
-    /// config key and a looked-up host to disagree, unless both go through the same
-    /// parser. They do: this is that parser, and these are the classes it has to
-    /// collapse.
+    /// A written config key and a looked-up host disagree unless both go through
+    /// this parser. These are the classes it has to collapse.
     #[test]
     fn host_normalization_collapses_equivalent_spellings() {
         for (written, canonical) in [
@@ -1740,8 +1485,6 @@ mod tests {
         }
     }
 
-    /// A written port is part of the endpoint's identity: nothing here knows the
-    /// scheme, so nothing here can call 443 or 80 redundant.
     #[test]
     fn host_equality_is_not_scheme_relative() {
         let with_port = AzureHost::parse("azurite.local:443").unwrap();
@@ -1751,8 +1494,6 @@ mod tests {
         assert_eq!(with_port.to_string(), "azurite.local:443");
     }
 
-    /// A config key is a bare authority; anything else is a mistake worth naming
-    /// rather than silently reinterpreting.
     #[test]
     fn host_rejects_anything_that_is_not_a_bare_authority() {
         // A name DNS cannot resolve and a port nothing can connect to: `wire()`
@@ -1798,11 +1539,10 @@ mod tests {
         hasher.finish()
     }
 
-    /// The path-style recipe, asserted string by string, because every field but
-    /// `container` differs from host-style and each one fails silently when it is
-    /// wrong: a missing `account_name` becomes a 403, a trailing slash becomes
-    /// `//container/…`, and a `root` that skips one segment too few writes the
-    /// whole channel one directory too deep.
+    /// Asserted string by string, because every field but `container` differs from
+    /// host-style and each fails silently when wrong: a missing `account_name` is a
+    /// 403, a stray slash gives `//container/…`, a short `root` writes the channel
+    /// one directory too deep.
     #[cfg(feature = "opendal")]
     #[test]
     fn azblob_config_under_path_style() {
@@ -1841,9 +1581,8 @@ mod tests {
         );
     }
 
-    /// A channel that is a bare `account/container` leaves nothing for the root,
-    /// which must still be `/` and not the empty string opendal would treat as a
-    /// relative path.
+    /// A bare `account/container` leaves nothing for the root, which must still be
+    /// `/`, not the empty string opendal treats as a relative path.
     #[cfg(feature = "opendal")]
     #[test]
     fn azblob_config_path_style_without_a_prefix() {
@@ -1861,12 +1600,9 @@ mod tests {
 
         assert_eq!(config.root.as_deref(), Some("/"));
         assert_eq!(config.container, "general");
-        // The leading `?` is stripped exactly once, wherever the token came from.
         assert_eq!(config.sas_token.as_deref(), Some("sv=token"));
     }
 
-    /// Host-style is the shape every existing caller uses, so honouring
-    /// path-style must not have moved it.
     #[cfg(feature = "opendal")]
     #[test]
     fn azblob_config_under_host_style_is_unchanged() {
@@ -1891,8 +1627,6 @@ mod tests {
         assert_eq!(config.account_key, None);
     }
 
-    /// A prefix with a space arrives here percent-encoded and opendal encodes
-    /// `root + path` again, so the root has to be handed over decoded.
     #[cfg(feature = "opendal")]
     #[test]
     fn azblob_config_decodes_the_root() {
@@ -1908,10 +1642,6 @@ mod tests {
         assert_eq!(config.root.as_deref(), Some("/with space"));
     }
 
-    /// Account and container derivation is deliberately *not* part of parsing: the
-    /// addressing style is config that does not exist yet when clap parses the
-    /// argument, so an emulator URL must survive parsing and be rejected (or not)
-    /// later, once its options entry is known.
     #[test]
     fn parse_defers_account_derivation() {
         let channel = channel("az://127.0.0.1:10000/devstoreaccount1/general");
@@ -1920,9 +1650,9 @@ mod tests {
         assert!(account_and_container(&channel, Addressing::PathStyle).is_ok());
     }
 
-    /// The rewrite is invisible in the URL a user reads back: under path-style it
-    /// moves the *account* too, so a channel URL that says `devstoreaccount1` mints
-    /// a SAS for whatever account the escaped `..` climbs out to.
+    /// Under path-style the rewrite moves the *account* too, so a channel URL that
+    /// says `devstoreaccount1` mints a SAS for whatever the escaped `..` climbs
+    /// out to.
     #[test]
     fn a_rewritten_path_is_rejected() {
         for (input, resolved) in [
@@ -1950,16 +1680,13 @@ mod tests {
                 matches!(&err, AzureUrlError::NonCanonicalPath { resolved: got, .. } if got == resolved),
                 "unexpected error for {input}: {err}"
             );
-            // Both spellings are in the message, so the user can see where the URL
-            // they wrote would have gone.
             let message = err.to_string();
             assert!(message.contains(resolved), "{message}");
             assert!(message.contains("/general/"), "{message}");
         }
     }
 
-    /// The paths that must keep parsing: nothing about rejecting rewrites may
-    /// narrow what an ordinary channel URL can say.
+    /// Rejecting rewrites must not narrow what an ordinary channel URL can say.
     #[test]
     fn unrewritten_paths_still_parse() {
         for (input, path) in [
@@ -1988,8 +1715,6 @@ mod tests {
         }
     }
 
-    /// A segment that cannot become a blob name is refused, rather than becoming a
-    /// different blob name than the URL says.
     #[test]
     fn segments_that_cannot_name_a_blob_are_rejected() {
         assert!(matches!(
@@ -2011,7 +1736,6 @@ mod tests {
             );
         }
 
-        // A percent escape that is valid UTF-8 is still a legitimate segment.
         assert_eq!(
             channel("az://acct.blob.core.windows.net/general/caf%C3%A9")
                 .canonical()
@@ -2020,8 +1744,6 @@ mod tests {
         );
     }
 
-    /// `--https-only` restricts the SAS to TLS, so a host configured for http would
-    /// get a token it cannot use. Nothing else about the grant may move with it.
     #[cfg(feature = "clap")]
     #[test]
     fn https_only_follows_the_configured_scheme() {
@@ -2069,8 +1791,8 @@ mod debug_redaction_tests {
         }
     }
 
-    /// An inline SAS reaches the wire and nothing else. Every other spelling of the
-    /// channel is a log line or an error message waiting to happen.
+    /// An inline SAS reaches the wire and nothing else. Every other spelling ends
+    /// up in a log line or an error message.
     #[test]
     fn only_the_wire_spelling_carries_the_signature() {
         let channel = AzureChannelUrl::parse(
@@ -2084,7 +1806,6 @@ mod debug_redaction_tests {
             format!("{channel:?}"),
         ] {
             assert!(!shown.contains("SECRETSIG"), "signature leaked: {shown}");
-            // The rest of the grant is not secret and is worth showing.
             assert!(shown.contains("sv=2024-11-04"), "over-redacted: {shown}");
             assert!(shown.contains("se=z"), "over-redacted: {shown}");
         }

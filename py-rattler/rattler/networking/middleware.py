@@ -161,12 +161,10 @@ class AzureMiddleware:
     """
     Middleware to work with az:// URLs.
 
-    Fetches are anonymous. The per-host `azure-options` table (credential grants,
-    `scheme`, `path-style`) is not exposed to Python yet — unlike `S3Config`, which
-    does expose per-bucket configuration — so a private container cannot be read
-    from Python, and an emulator or custom endpoint cannot be reached at all. Azure
+    Every fetch is anonymous: the per-host `azure-options` table is not exposed to
+    Python yet, so private containers and custom endpoints are out of reach. Azure
     answers an unauthorized read of a private container with a 404, so that is what
-    surfaces. Follow-up work.
+    surfaces.
 
     Examples
     --------

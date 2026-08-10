@@ -1,17 +1,8 @@
 //! Live fetch-path integration tests against a local Azurite emulator.
 //!
-//! Everything is driven through a single `azure-options` entry, which is the
-//! point of the exercise — there is no out-of-band account or endpoint
-//! configuration on the fetch path:
-//!
-//! ```toml
-//! [azure-options."127.0.0.1:10000"]
-//! scheme = "http"
-//! path-style = true
-//!
-//! [azure-options."127.0.0.1:10000".auth]
-//! cli-channel = true
-//! ```
+//! Everything is driven through the single `azure-options` entry built by
+//! `azurite_entry` below; there is no out-of-band account or endpoint
+//! configuration on the fetch path.
 //!
 //! Run with:
 //!
@@ -42,23 +33,20 @@ use reqwest_middleware::{
 use url::Url;
 
 /// Azurite's development account and its fixed key. Not a secret: both are
-/// published constants of the emulator, hardcoded in opendal's own source, and
-/// they only ever address a loopback port.
+/// published constants of the emulator and only ever address a loopback port.
 const ACCOUNT: &str = "devstoreaccount1";
 const ACCOUNT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
-/// The authority, which is also the exact `azure-options` table key. An IP with a
-/// port is precisely the host shape that host-style addressing cannot read an
-/// account out of, so it only works through a `path-style = true` entry.
+/// The authority, which is also the exact `azure-options` table key. Host-style
+/// addressing cannot read an account out of an IP literal, so this needs
+/// path-style.
 const AUTHORITY: &str = "127.0.0.1:10000";
 
-/// Container name from the test this one restores. Azurite creates containers as
-/// private, which is what makes the ungranted case below meaningful.
+/// Azurite creates containers as private, which is what makes the ungranted case
+/// below meaningful.
 const CONTAINER: &str = "cli-channel";
 
-/// Minimal but structurally real repodata, so the assertions can be about
-/// content rather than just a status code.
 const REPODATA: &str = r#"{
   "info": { "subdir": "noarch" },
   "packages": {},
@@ -77,20 +65,14 @@ const REPODATA: &str = r#"{
   }
 }"#;
 
-/// The channel as a user would write it: the account is the first path segment,
-/// which is what `path-style = true` means.
 fn channel_url() -> String {
     format!("az://{AUTHORITY}/{ACCOUNT}/{CONTAINER}")
 }
 
-/// The one `azure-options` entry these tests run on, with the container's grant as
-/// the only variable. `scheme` and `path-style` stay set even in the ungranted case:
-/// the entry is what makes the emulator reachable at all, and keeping it identical
-/// means the two tests differ in the grant and nothing else.
-///
-/// The grant is written for `CONTAINER` specifically, which is also what makes the
-/// ungranted case below a real test of the per-container lookup rather than of an
-/// empty table: `Auth::Anonymous` here is the container named and *refused*.
+/// The one `azure-options` entry these tests run on, with the grant as the only
+/// variable. It names `CONTAINER` specifically, so the ungranted case tests the
+/// per-container lookup rather than an empty table: `Auth::Anonymous` is the
+/// container named and *refused*.
 fn azurite_entry(auth: Auth) -> HashMap<AzureHost, AzureEndpointOptions> {
     HashMap::from([(
         AzureHost::parse(AUTHORITY).expect("azurite authority is a valid host:port"),
@@ -109,10 +91,9 @@ fn azurite_entry(auth: Auth) -> HashMap<AzureHost, AzureEndpointOptions> {
 
 /// The last request to leave the stack, captured *after* `AzureMiddleware` ran.
 ///
-/// Azurite answers 403 to any request it cannot authenticate, so a response status
-/// cannot tell an unsigned request from a signed one whose signature was rejected —
-/// a leak with a bad signature reads exactly like a refusal. The claim being tested
-/// is about what goes on the wire, so that is what gets asserted.
+/// Azurite answers 403 to any request it cannot authenticate, so a status cannot
+/// tell an unsigned request from a signed one whose signature was rejected. The
+/// claim under test is about what goes on the wire, so that is what is asserted.
 #[derive(Clone, Default)]
 struct SentRequest(Arc<Mutex<Option<(Url, HeaderMap)>>>);
 
@@ -158,10 +139,8 @@ fn client(auth: Auth) -> ClientWithMiddleware {
 /// Create the container and put a `noarch/repodata.json` in it.
 ///
 /// Seeding runs through the granted middleware rather than a separate SDK, which
-/// keeps the test dependency-free and doubles as proof that the signature works
-/// for writes and for a request carrying a query string (`?restype=container`
-/// participates in the canonicalized signing resource, so a wrong signature
-/// fails here first).
+/// also proves the signature works for a request carrying a query string:
+/// `?restype=container` participates in the canonicalized signing resource.
 async fn seed(client: &ClientWithMiddleware) {
     let created = client
         .put(format!("{}?restype=container", channel_url()))
@@ -195,9 +174,6 @@ async fn seed(client: &ClientWithMiddleware) {
     );
 }
 
-/// A granted, `http`, path-style entry fetches a blob out of a private Azurite
-/// container — the whole fetch path end to end, with the entry as the only
-/// configuration.
 #[tokio::test]
 #[ignore = "requires a running Azurite emulator; see the module docs"]
 async fn azurite_granted_entry_fetches_repodata() {
@@ -237,15 +213,6 @@ async fn azurite_granted_entry_fetches_repodata() {
     .await;
 }
 
-/// Without a grant for this container the request goes out unsigned, and a private
-/// container
-/// refuses it. This is the core claim of the anonymous-by-default model.
-///
-/// The primary assertion is on the outgoing request, not the status: no
-/// `Authorization` header and no SAS `sig` reaches the wire. The status is a
-/// secondary check that the container really is private, but on its own it would
-/// also pass while the account key was being sent with a signature Azurite
-/// rejected.
 #[tokio::test]
 #[ignore = "requires a running Azurite emulator; see the module docs"]
 async fn azurite_ungranted_entry_is_refused_by_a_private_container() {

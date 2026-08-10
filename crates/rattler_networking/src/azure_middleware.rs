@@ -14,37 +14,23 @@ use reqwest::{Client, Request, Response};
 use reqwest_middleware::{Middleware, Next, Result as MiddlewareResult};
 use url::Url;
 
-/// The Azure Storage REST API version sent on every signed request. A URL that
-/// already carries a SAS returns before this is attached, and the write path pins
-/// its own version inside opendal.
+/// The Azure Storage REST API version sent on every signed request.
 const X_MS_VERSION: &str = "2021-12-02";
 
-/// Middleware that rewrites `az://` URLs to their wire form and, where a host is
-/// granted credentials, signs them.
+/// Middleware that rewrites `az://` URLs to their wire form and signs the ones
+/// whose container is granted credentials.
 ///
-/// The `az://` URL carries the full blob endpoint in its host, so rewriting is a
-/// plain scheme swap: `az://{host}/{path}` → `https://{host}/{path}`. A conda
-/// channel is therefore addressed the same way it is on the wire, e.g.
-/// `az://myaccount.blob.core.windows.net/mycontainer` — no separate account or
-/// endpoint configuration is needed. Sovereign clouds work with no configuration
-/// at all; an emulator needs only the `scheme = "http"` line below.
+/// The `az://` host is the full blob endpoint, so rewriting is a plain scheme
+/// swap: `az://{host}/{path}` → `https://{host}/{path}`.
 ///
-/// # Trust model
-///
-/// **Anonymous by default.** With no entry for a host, its requests are sent
-/// unsigned and *no credential is resolved at all* — so no ambient Azure
-/// credential can leak to a host the user never named, and an anonymous read of a
-/// public container does not block on the managed-identity / IMDS probe.
-///
-/// A credential attaches to a request only because the user's `azure-options`
-/// table grants it to the *container* the request addresses:
+/// Requests are anonymous by default: with no `azure-options` entry for the host,
+/// nothing is signed and no credential is resolved. A credential attaches only
+/// because the user's config grants it to the *container* the request addresses:
 ///
 /// ```toml
 /// [azure-options."mycompany.blob.core.windows.net".auth]
 /// releases = true
-/// # a container not listed is fetched anonymously, so one account can hold
-/// # private and anonymous-read containers side by side — which is what Azure's
-/// # per-container RBAC actually enforces.
+/// # an unlisted container is fetched anonymously
 ///
 /// [azure-options."127.0.0.1:10000"]   # Azurite
 /// scheme = "http"
@@ -54,97 +40,47 @@ const X_MS_VERSION: &str = "2021-12-02";
 /// general = true
 /// ```
 ///
-/// There is no host-level grant, by design: a single field meaning "every
-/// container on this account, including the ones created later" is exactly the
-/// mistake worth making unrepresentable.
+/// Entries must stay user-scoped: a project-level manifest that could write one
+/// would let a checked-out repository claim the user's credentials.
 ///
-/// Three consequences of the grant being explicit:
+/// `az://user:pass@host/...` is refused. The host becomes the request target
+/// verbatim, so userinfo is a host-spoofing vector.
 ///
-/// - **Nothing is inferred from the host name.** There is no allow-list of
-///   "official" Azure suffixes, and none is needed: a host nobody granted gets
-///   nothing regardless of what it is called, and an entry for a custom host *is*
-///   the declaration that the user trusts that endpoint.
-/// - **A broken credential is a hard error.** Because the user asked for signing,
-///   an unusable credential must be reported, not silently downgraded to an
-///   anonymous request that Azure will answer with a confusing 404.
-/// - **A new private container fails closed** until someone adds a line for it.
-///   That is the deliberate cost of a per-container grant, and it is why the 404
-///   hint below prints the exact line to write: unhelped, the failure reads as "the
-///   channel is broken".
-///
-/// Entries are user-scoped by contract: a project- or workspace-level manifest
-/// must never be allowed to write one, since that would let a checked-out
-/// repository name a host and receive the user's credentials.
-///
-/// `az://user:pass@host/...` is refused outright. The host becomes the request
-/// target verbatim, so userinfo is a host-spoofing vector — the real authority can
-/// hide behind it — and userinfo is invalid in a blob URL anyway.
-///
-/// Granted credentials are resolved by reqsign's [`DefaultCredentialProvider`]
-/// chain, in its order: environment variables, the Azure CLI (`az login`),
-/// client certificate, client secret, pipelines, workload identity, IMDS.
-/// rattler's [`crate::AuthenticationStorage`] is not consulted — it has no Azure
-/// variant, and [`crate::AuthenticationMiddleware`] handles only `http`/`https`,
-/// so its host-keyed entries cannot reach an `az://` request either.
+/// Granted credentials come from reqsign's [`DefaultCredentialProvider`] chain;
+/// rattler's [`crate::AuthenticationStorage`] has no Azure variant.
 #[derive(Clone)]
 pub struct AzureMiddleware {
     /// reqsign signer; caches the resolved credential internally.
     signer: Signer<Credential>,
 
     /// Whole `azure-options` entries, keyed by the same normalized authority the
-    /// config table is keyed by. An absent host is *defined* to behave as a
-    /// defaulted entry (no grants, https), so a miss is never a separate code path.
+    /// config table is keyed by. An absent host behaves as a defaulted entry, so a
+    /// miss is never a separate code path.
     ///
-    /// Entries and not the narrower [`AzureFetchOptions`], because resolving a
-    /// grant is two steps and they are ordered: the host's addressing decides which
-    /// path segment is the container, and only then can the container's grant be
-    /// read. The narrowing therefore happens per request, in [`Self::resolve`].
+    /// Entries and not the narrower [`AzureFetchOptions`]: the host's addressing
+    /// decides which path segment is the container, so the narrowing can only
+    /// happen per request, in [`Self::resolve`].
     ///
-    /// A plain `HashMap` rather than `rattler_config::AzureOptionsMap`, mirroring
-    /// [`crate::S3Middleware`]: taking the config type would put a mandatory
-    /// `rattler_config` edge on the `azure` feature. The constructors take any
-    /// iterator of host/entry pairs instead, which `AzureOptionsMap` yields
-    /// directly from its own `endpoint_options`.
+    /// A plain `HashMap` rather than `rattler_config::AzureOptionsMap`, as in
+    /// [`crate::S3Middleware`]: the config type would force a `rattler_config` edge
+    /// on the `azure` feature.
     options: HashMap<AzureHost, AzureEndpointOptions>,
 }
 
-/// One `az://` request, resolved against the options table.
-///
-/// The container is kept next to the grant it produced, because the message the
-/// user needs when a request comes back 404 is the TOML line naming *that*
-/// container — a hint naming only the host would be a line that grants the wrong
-/// thing.
 #[derive(Debug)]
 struct Resolved {
-    /// The channel URL the request names.
     channel: AzureChannelUrl,
-
-    /// The container it addresses, when it addresses one. `None` for a URL with no
-    /// container segment — the host root, or a path too short for the host's
-    /// addressing — which has nothing to attribute a grant to.
     container: Option<ContainerName>,
-
-    /// The grant for that container, and the wire scheme for the host.
     options: AzureFetchOptions,
 }
 
-/// What a resolved request asks of the signer.
-///
-/// [`Signing::Granted`] carries the container whose entry granted it, so "sign
-/// this, but for no container" is unrepresentable and the failure message can
-/// always quote the line that asked for signing. A grant is only ever read out of a
-/// container's entry in an `auth` table, so there is no other way for one to exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Signing<'a> {
-    /// No grant: send unsigned, and resolve no credential.
     Anonymous,
-
-    /// `container` is granted, so sign — and fail loudly if that is impossible.
     Granted(&'a ContainerName),
 }
 
 impl<'a> Signing<'a> {
-    /// The signing decision for a resolved request.
     fn new(auth: Auth, container: Option<&'a ContainerName>) -> Self {
         match (auth, container) {
             (Auth::DefaultChain, Some(container)) => Self::Granted(container),
@@ -159,15 +95,13 @@ impl<'a> Signing<'a> {
 impl AzureMiddleware {
     /// Create a new Azure middleware.
     ///
-    /// `client` is used for reqsign's credential resolution (IMDS / managed
-    /// identity / AAD token fetches), so it must be the caller's configured
-    /// client — proxy, CA bundle, and TLS settings carry through to those
-    /// requests.
+    /// `client` also carries reqsign's credential resolution (IMDS, managed
+    /// identity, AAD token fetches), so its proxy, CA bundle and TLS settings apply
+    /// there too.
     ///
-    /// `options` is the `azure-options` table: the per-host entries carrying the
-    /// per-container grants, in any shape that iterates them —
-    /// `rattler_config::AzureOptionsMap::endpoint_options` yields exactly this. An
-    /// empty iterator means every `az://` request is anonymous.
+    /// `options` is the `azure-options` table, as
+    /// `rattler_config::AzureOptionsMap::endpoint_options` yields it. Empty means
+    /// every `az://` request is anonymous.
     pub fn new(
         client: Client,
         options: impl IntoIterator<Item = (AzureHost, AzureEndpointOptions)>,
@@ -175,12 +109,6 @@ impl AzureMiddleware {
         Self::with_credential_provider(client, DefaultCredentialProvider::new(), options)
     }
 
-    /// Build the middleware around an explicit credential provider.
-    ///
-    /// [`AzureMiddleware::new`] wires up the [`DefaultCredentialProvider`] chain;
-    /// tests use this seam to inject a deterministic provider (an empty chain
-    /// standing in for a broken credential, or a static key) without touching the
-    /// ambient environment.
     fn with_credential_provider(
         client: Client,
         provider: impl ProvideCredential<Credential = Credential> + 'static,
@@ -201,18 +129,12 @@ impl AzureMiddleware {
     /// Resolve an `az://` request URL to the channel URL it names, the container it
     /// addresses, and the options that apply to it.
     ///
-    /// Going through [`AzureChannelUrl`] is what keeps this middleware from owning
-    /// a second copy of rules that live in `rattler_azure`: that parser is what
-    /// rejects userinfo, and it normalizes the authority into the exact spelling
-    /// the options table is keyed by, so a grant cannot miss over case, a trailing
-    /// dot, an IDNA name or an IP literal written oddly. The container comes from
-    /// [`rattler_azure::container`] for the same reason — it is the same derivation
-    /// the write path's coordinates use, and two derivations that disagreed would
-    /// look a grant up for one container and send it to another.
-    ///
-    /// The order is forced: the host's entry carries the addressing, the addressing
-    /// says which path segment is the container, and the container selects the
-    /// grant. Nothing earlier can know the container.
+    /// [`AzureChannelUrl`] rejects userinfo and normalizes the authority to the
+    /// spelling the options table is keyed by, so a grant cannot miss over case, a
+    /// trailing dot or an IDNA name. The container comes from
+    /// [`rattler_azure::container`], the derivation the write path also uses; two
+    /// that disagreed would look a grant up for one container and send it to
+    /// another.
     fn resolve(&self, url: &Url) -> MiddlewareResult<Resolved> {
         let channel = AzureChannelUrl::parse(url.as_str()).map_err(|e| {
             // The URL is not echoed back: the one rejection a user hits here is
@@ -220,8 +142,6 @@ impl AzureMiddleware {
             reqwest_middleware::Error::Middleware(anyhow::Error::from(e))
         })?;
 
-        // An absent host is defined to behave as a defaulted entry, so the fallback
-        // is a value and not a branch.
         let unconfigured = AzureEndpointOptions::default();
         let entry = self.options.get(channel.host()).unwrap_or(&unconfigured);
 
@@ -244,25 +164,10 @@ impl AzureMiddleware {
         url.query_pairs().any(|(key, _)| key == "sig")
     }
 
-    /// Sign a reqwest `Request` in place using reqsign, when `signing` grants it.
-    ///
-    /// Two cases return without invoking reqsign at all:
-    /// - The URL already carries an explicit SAS (`?...&sig=...`). Signing would
-    ///   add an `Authorization` header that Azure prefers over the SAS, silently
-    ///   overriding the caller's explicit token.
-    /// - [`Signing::Anonymous`] — no grant. Crucially the credential is not *resolved*
-    ///   either: reqsign would otherwise probe the managed-identity / IMDS endpoint
-    ///   and block until it times out (~30s on a machine with no metadata service)
-    ///   before we could decide not to use the result, making every anonymous
-    ///   public-channel read pay that timeout — and it would pull an ambient
-    ///   credential into memory for a host the user never granted.
-    ///
-    /// Under [`Signing::Granted`] any signing failure is propagated, carrying the
-    /// host, the container whose grant required signing and the remedies. reqsign
-    /// collapses "no
-    /// credential" and "broken credential" into the same
-    /// [`reqsign_core::ErrorKind::CredentialInvalid`], and since the user asked for
-    /// signing there is no case left where going anonymous is the right answer.
+    /// Under [`Signing::Anonymous`] the credential is not *resolved* either.
+    /// reqsign would otherwise probe the managed-identity / IMDS endpoint and block
+    /// until it times out (~30s where there is no metadata service), and would pull
+    /// an ambient credential into memory for a host the user never granted.
     async fn sign(&self, req: &mut Request, signing: Signing<'_>) -> MiddlewareResult<()> {
         if Self::has_sas_token(req.url()) {
             return Ok(());
@@ -342,7 +247,6 @@ impl Middleware for AzureMiddleware {
         extensions: &mut http::Extensions,
         next: Next<'_>,
     ) -> MiddlewareResult<Response> {
-        // Only intercept `az://` requests.
         if req.url().scheme() != "az" {
             return next.run(req, extensions).await;
         }
@@ -358,16 +262,6 @@ impl Middleware for AzureMiddleware {
 
         let response = next.run(req, extensions).await?;
 
-        // Azure answers an unauthorized read of a private container with 404, not
-        // 403, so "no grant" and "no such blob" are the same status on the wire.
-        // Under a per-container grant a newly-created private container fails closed
-        // until someone writes a line for it, so this hint is what stands between
-        // that and a user reading "404" as "the channel is broken". Say it once per
-        // container, naming the config to write — spelled through `AzureHost` and
-        // `ContainerName` so the key printed is the key a lookup arrives with.
-        //
-        // A URL naming no container gets no hint: there is no line that would grant
-        // it anything.
         if let Some(container) = container.filter(|_| {
             response.status() == http::StatusCode::NOT_FOUND && !options.auth.is_granted()
         }) && first_404_for_container(channel.host(), &container)
@@ -393,13 +287,9 @@ impl Middleware for AzureMiddleware {
 /// Whether this container still owes the 404 hint, claiming it if so.
 ///
 /// A 404 is the *normal* answer to plenty of requests a healthy public channel
-/// makes — the repodata gateway probes for a shard index under every subdir it
-/// fetches, and a non-sharded channel misses every time — so a hint emitted per
-/// response is a security warning printed repeatedly at users whose channel is
-/// fine. Once per container per process is enough for the one case it is about: a
-/// private container the user forgot to grant. Per container and not per host,
-/// because the line to add differs per container: silencing a host after its first
-/// ungranted container would leave the second one unexplained.
+/// makes: the repodata gateway probes for a shard index under every subdir, and a
+/// non-sharded channel misses every time. Per container and not per host, because
+/// the line to add differs per container.
 fn first_404_for_container(host: &AzureHost, container: &ContainerName) -> bool {
     static HINTED: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashSet<(AzureHost, ContainerName)>>,
@@ -420,7 +310,6 @@ mod tests {
         ContainerName::new(name).expect("test container name")
     }
 
-    /// The `azure-options` table for one host, as a caller would build it.
     fn options(
         authority: &str,
         options: AzureEndpointOptions,
@@ -428,8 +317,6 @@ mod tests {
         HashMap::from([(AzureHost::parse(authority).expect("test host"), options)])
     }
 
-    /// An entry granting one container, with everything else defaulted: which
-    /// container is granted is the only interesting axis in most of these tests.
     fn granting(container_name: &str) -> AzureEndpointOptions {
         AzureEndpointOptions::new(
             [(container(container_name), Auth::DefaultChain)],
@@ -441,7 +328,6 @@ mod tests {
         AzureMiddleware::new(Client::new(), options)
     }
 
-    /// Resolve a URL and hand back the wire spelling its options ask for.
     fn wire_of(middleware: &AzureMiddleware, url: &str) -> String {
         let resolved = middleware
             .resolve(&Url::parse(url).expect("test url"))
@@ -449,15 +335,12 @@ mod tests {
         resolved.channel.wire(resolved.options.scheme).to_string()
     }
 
-    /// Resolve a URL, or panic with the middleware's rejection.
     fn resolve(middleware: &AzureMiddleware, url: &str) -> Resolved {
         middleware
             .resolve(&Url::parse(url).expect("test url"))
             .unwrap_or_else(|err| panic!("{url} should resolve: {err}"))
     }
 
-    /// With no entry the scheme defaults to https, and path, query and fragment
-    /// survive the rewrite untouched.
     #[test]
     fn rewrites_to_https_without_an_entry() {
         let middleware = middleware(HashMap::new());
@@ -478,8 +361,7 @@ mod tests {
     }
 
     /// An emulator entry is the only thing that can send an `az://` URL in
-    /// cleartext, and the port has to survive — `:10000` is not any scheme's
-    /// default, but `:443` would be under https and must not be dropped either.
+    /// cleartext, and the port has to survive the rewrite under either scheme.
     #[test]
     fn rewrites_to_http_for_an_emulator_entry() {
         let emulator = middleware(options("127.0.0.1:10000", emulator_entry(["general"])));
@@ -491,8 +373,6 @@ mod tests {
             "http://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json"
         );
 
-        // The same host with no entry stays on https: an emulator grant must not
-        // generalize to a scheme downgrade for anyone else.
         assert_eq!(
             wire_of(
                 &middleware(HashMap::new()),
@@ -502,9 +382,6 @@ mod tests {
         );
     }
 
-    /// A grant written in any spelling of a host must apply to a request for that
-    /// host: a silent miss reads as a 404, i.e. "not found" for what is really
-    /// "not authorized". Delegating to `AzureHost` on both sides is what buys this.
     #[test]
     fn a_grant_applies_regardless_of_how_the_host_is_spelled() {
         let middleware = middleware(options(
@@ -522,10 +399,6 @@ mod tests {
         );
     }
 
-    /// The point of the per-container table: one account holding a private and an
-    /// anonymous-read container is configurable, because the grant stops at the
-    /// container it names. Under a host-level grant the second URL here would be
-    /// signed too, and 403 for any identity holding no role on it.
     #[test]
     fn a_grant_stops_at_the_container_it_names() {
         let middleware = middleware(options(
@@ -554,9 +427,6 @@ mod tests {
         }
     }
 
-    /// A container is found where the host's addressing says it is, so a grant on a
-    /// path-style host applies to the second segment and not the account in the
-    /// first.
     #[test]
     fn a_container_is_read_through_the_hosts_addressing() {
         let path_style = middleware(options("127.0.0.1:10000", emulator_entry(["general"])));
@@ -588,9 +458,6 @@ mod tests {
         assert!(!resolved.options.auth.is_granted());
     }
 
-    /// A URL naming no container has nothing to attribute a grant to, so it is
-    /// anonymous rather than an error: the fetch path stays total for URLs that are
-    /// not channel-scoped, which is what it is today.
     #[test]
     fn a_url_without_a_container_is_anonymous() {
         let middleware = middleware(options(
@@ -609,9 +476,6 @@ mod tests {
         }
     }
 
-    /// A container segment Azure could never accept is a malformed endpoint, not an
-    /// ungranted one: no legitimate request can land here, and going quietly
-    /// anonymous would surface as an unexplained 401 rather than naming the fault.
     #[test]
     fn a_url_with_an_unusable_container_is_refused() {
         let middleware = middleware(options(
@@ -630,9 +494,6 @@ mod tests {
         }
     }
 
-    /// Userinfo is refused before any rewrite or signing: the host is the request
-    /// target verbatim, so `user:pass@real.host` can hide the real authority.
-    /// (Rejection lives in `AzureHost::parse`, so there is one copy of the rule.)
     #[test]
     fn rejects_userinfo() {
         let middleware = middleware(HashMap::new());
@@ -667,10 +528,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// A container with no grant is sent unsigned, and its credential is never even
-    /// resolved — so nothing blocks on the IMDS probe and no ambient credential is
-    /// pulled into memory for a host the user never named. The provider flips a
-    /// flag if it is ever asked.
     #[tokio::test]
     async fn an_ungranted_container_sends_unsigned_without_resolving_a_credential() {
         use std::sync::{
@@ -721,8 +578,6 @@ mod tests {
         );
     }
 
-    /// A granted container is actually signed: the credential resolves and the
-    /// request comes back carrying Shared Key authorization.
     #[tokio::test]
     async fn a_granted_container_is_signed() {
         use reqsign_azure_storage::StaticCredentialProvider;
@@ -754,11 +609,6 @@ mod tests {
         );
     }
 
-    /// The inversion this design turns on: with a grant, an unusable credential is
-    /// a hard error. It must never degrade to an anonymous request, which Azure
-    /// would answer with a 404 the user has no way to read as "auth failed". An
-    /// empty provider chain resolves nothing, which reqsign reports the same way it
-    /// reports a broken credential.
     #[tokio::test]
     async fn a_granted_container_with_broken_credentials_is_a_hard_error() {
         use reqsign_core::ProvideCredentialChain;
@@ -786,10 +636,6 @@ mod tests {
             "a failed signing attempt must not leave a partial Authorization header"
         );
 
-        // reqsign's own message names neither the host nor a remedy, and the chain
-        // hides which provider failed. Everything actionable has to come from here —
-        // including which container's grant asked for the signing, since the entry
-        // may hold several and only one line is at fault.
         let message = result.unwrap_err().to_string();
         for expected in [
             "acct.blob.core.windows.net",
@@ -804,9 +650,6 @@ mod tests {
         }
     }
 
-    /// A URL that already carries a SAS token must not be re-signed even where the
-    /// container is granted: Azure prefers an `Authorization` header over the SAS,
-    /// so signing would silently override the caller's explicit token.
     #[tokio::test]
     async fn a_sas_in_the_url_passes_through() {
         use reqsign_azure_storage::StaticCredentialProvider;
@@ -840,8 +683,6 @@ mod tests {
         );
     }
 
-    /// Serve 404 for everything, over http on localhost, standing in for a private
-    /// container answering an anonymous read.
     async fn spawn_404_server() -> AzureHost {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -850,8 +691,6 @@ mod tests {
         AzureHost::parse(&addr.to_string()).unwrap()
     }
 
-    /// An emulator-shaped entry (http, path-style) granting whichever containers the
-    /// caller names, so one server can exercise both sides of the hint.
     fn emulator_entry<'a>(granted: impl IntoIterator<Item = &'a str>) -> AzureEndpointOptions {
         AzureEndpointOptions::new(
             granted
@@ -881,10 +720,6 @@ mod tests {
             .status()
     }
 
-    /// The 404 hint must name the config block to add, keyed exactly as the table
-    /// is keyed — including the port, which an earlier version of this hint
-    /// dropped, printing a key that could never match — and the container, since
-    /// that is the line the user has to write.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn the_404_hint_names_the_config_block_for_an_ungranted_container() {
@@ -897,10 +732,6 @@ mod tests {
         assert!(logs_contain("general = true"));
     }
 
-    /// A public non-sharded channel 404s on every shard-index probe the repodata
-    /// gateway makes, so a hint per response is a security warning repeated at a
-    /// user whose channel is healthy. It is silenced per container, though: a second
-    /// ungranted container needs a different line, so it gets its own hint.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn the_404_hint_is_emitted_once_per_container() {
@@ -937,7 +768,6 @@ mod tests {
         }
     }
 
-    /// With a grant in place a 404 means what it says, so the hint would be noise.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn the_404_hint_is_silent_for_a_granted_container() {

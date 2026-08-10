@@ -297,7 +297,6 @@ pub async fn fetch_index(
                                 return Ok(shard_index);
                             }
                             Err(e) => {
-                                // Fall through to the unconditional fetch below.
                                 tracing::warn!("the cached shard index has been corrupted: {e}");
                                 if let Some((reporter, index)) = download_reporter {
                                     reporter.on_download_complete(response.url(), index);

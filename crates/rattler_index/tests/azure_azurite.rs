@@ -1,23 +1,9 @@
 //! Live write-path integration tests against a local Azurite emulator.
 //!
-//! `index_azure` builds its opendal config from a channel URL plus one
-//! `azure-options` entry, and under `path-style = true` the account moves from the
-//! host into the endpoint path. Unit tests can only assert the strings that
-//! construction produces; whether a real Azure Blob implementation accepts them is
-//! a different question, and this is where it gets answered:
-//!
-//! ```toml
-//! [azure-options."127.0.0.1:10000"]
-//! scheme = "http"
-//! path-style = true
-//! ```
-//!
-//! The rest of the file covers two opendal behaviours that the production code
-//! deliberately works around, and that only a real server can demonstrate: the
-//! multi-block write path silently ignores `if_not_exists`, and it does carry
-//! `Cache-Control` through its commit.
-//!
-//! Run with:
+//! Checks that a real server accepts what `azblob_config` derives under
+//! `path-style = true`, plus two opendal behaviours only a real server can show:
+//! the multi-block write path ignores `if_not_exists`, and it does carry
+//! `Cache-Control` through its commit. Run with:
 //!
 //! ```text
 //! docker run --rm -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
@@ -25,11 +11,9 @@
 //! cargo nextest run -p rattler_index --test azure_azurite --run-ignored all
 //! ```
 //!
-//! No `--skipApiVersionCheck` needed: the `x-ms-version` opendal pins is older
-//! than what current Azurite accepts. Verified on 3.36.0, which answers that
-//! version with `AuthorizationFailure` rather than `InvalidHeaderValue`, i.e. it
-//! validates the signature instead of rejecting the version. Add the flag only if
-//! an older emulator rejects the version outright.
+//! No `--skipApiVersionCheck` needed. Azurite 3.36.0 answers the `x-ms-version`
+//! opendal pins with `AuthorizationFailure`, not `InvalidHeaderValue`, so it
+//! accepts the version. Add the flag only if an older emulator rejects it.
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -41,27 +25,25 @@ use rattler_azure::{
 use rattler_index::{IndexAzureConfig, PackageRevisionAssignment, index_azure};
 
 /// Azurite's development account and its fixed key. Not a secret: both are
-/// published constants of the emulator, hardcoded in opendal's own source, and
-/// they only ever address a loopback port.
+/// published constants of the emulator and only ever address a loopback port.
 const ACCOUNT: &str = "devstoreaccount1";
 const ACCOUNT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
-/// The authority, which is also the exact `azure-options` table key. An IP with a
-/// port is precisely the host shape host-style addressing cannot read an account
-/// out of, so it only works through a `path-style = true` entry.
+/// The authority, which is also the exact `azure-options` table key. Host-style
+/// addressing cannot read an account out of an IP literal, so this needs
+/// path-style.
 const AUTHORITY: &str = "127.0.0.1:10000";
 
 const CONTAINER: &str = "test-channel";
 
-/// The `Cache-Control` `rattler_index` writes on repodata (`lib.rs`'s
-/// `CACHE_CONTROL_REPODATA`), duplicated because the constant is private.
+/// `rattler_index`'s private `CACHE_CONTROL_REPODATA`, duplicated here.
 const CACHE_CONTROL_REPODATA: &str = "public, max-age=300";
 
 const MIB: usize = 1024 * 1024;
 
-/// `rattler_upload`'s `DESIRED_CHUNK_SIZE`, which is what decides whether a
-/// package upload takes opendal's single-shot or multi-block path.
+/// `rattler_upload`'s `DESIRED_CHUNK_SIZE`, which decides whether an upload takes
+/// opendal's single-shot or multi-block path.
 const UPLOAD_CHUNK_SIZE: usize = 10 * MIB;
 
 const PACKAGE: &str = "empty-0.1.0-h4616a5c_0.conda";
@@ -72,20 +54,16 @@ fn package_path() -> PathBuf {
         .join(PACKAGE)
 }
 
-/// The channel as a user would write it: the account is the first path segment,
-/// which is what `path-style = true` means. `prefix` keeps each test in its own
-/// subtree so they can run in parallel.
+/// The channel as a user would write it, with the account as the first path
+/// segment. `prefix` keeps each test in its own subtree so they can run in parallel.
 fn channel(prefix: &str) -> AzureChannelUrl {
     AzureChannelUrl::parse(&format!("az://{AUTHORITY}/{ACCOUNT}/{CONTAINER}/{prefix}"))
         .expect("azurite channel url")
 }
 
-/// The `azure-options` entry for the emulator: the only configuration these tests
-/// hand to the indexer.
-///
-/// The grant on `CONTAINER` is for the fetch-side fixture below — `index_azure`
-/// signs with the credential it is handed and never reads a grant — and it is
-/// written per container because that is the only scope a grant has.
+/// The `azure-options` entry for the emulator. Its grant on `CONTAINER` is only
+/// for the signing client below: `index_azure` signs with the credential it is
+/// handed and never reads a grant.
 fn azurite_options() -> AzureEndpointOptions {
     AzureEndpointOptions::new(
         [(
@@ -99,9 +77,6 @@ fn azurite_options() -> AzureEndpointOptions {
     )
 }
 
-/// An operator built exactly the way `index_azure` builds one, so the opendal-level
-/// tests below run against the config the production path derives rather than a
-/// hand-written stand-in.
 fn production_operator(channel: &AzureChannelUrl) -> Operator {
     let config = rattler_azure::azblob_config(
         &AzureCredentials::AccountKey(ACCOUNT_KEY.into()),
@@ -114,13 +89,10 @@ fn production_operator(channel: &AzureChannelUrl) -> Operator {
         .finish()
 }
 
-/// An operator written out by hand, *not* derived from the code under test.
-///
-/// This is what makes the round-trip assertion mean something: if
-/// `azblob_config`'s path-style derivation put the blobs somewhere else, this
-/// operator would not find them. It is the verbatim shape the emulator wants — the
-/// account appears both inside `endpoint` and in `account_name`, `container` is
-/// separate, and `root` is the channel prefix without repeating the container.
+/// An operator written out by hand, *not* derived from the code under test, so a
+/// wrong path-style derivation fails to find its own blobs. This is the verbatim
+/// shape the emulator wants: the account appears both inside `endpoint` and in
+/// `account_name`, and `root` omits the container.
 fn verify_operator(prefix: &str) -> Operator {
     let config = AzblobConfig {
         endpoint: Some(format!("http://{AUTHORITY}/{ACCOUNT}")),
@@ -135,13 +107,10 @@ fn verify_operator(prefix: &str) -> Operator {
         .finish()
 }
 
-/// Create the channel's container and clear this test's prefix inside it.
-///
-/// The clearing is what makes the assertions below mean anything: the emulator is
-/// long-lived, and a blob left by an earlier run answers the same read a correct
-/// run would produce — so a derivation that writes to the wrong prefix passes by
-/// finding the *previous* run's output. Removal goes through the hand-written
-/// operator, not the one under test, for the same reason.
+/// Create the channel's container and clear this test's prefix inside it. The
+/// emulator is long-lived, so without the clearing a derivation that writes to the
+/// wrong prefix passes by reading the previous run's output. Removal goes through
+/// the hand-written operator for the same reason.
 async fn ensure_empty_prefix(prefix: &str) {
     ensure_container().await;
     verify_operator(prefix)
@@ -151,12 +120,8 @@ async fn ensure_empty_prefix(prefix: &str) {
         .expect("clearing the test prefix failed");
 }
 
-/// A signing client for the requests opendal cannot make.
-///
-/// `AzureMiddleware` is the one signer already reachable from here, and there is no
-/// opendal operation for creating a container or reading a block list — hand-rolling
-/// shared-key signing in a test fixture would be more code than the tests it
-/// supports.
+/// A signing client for the requests opendal cannot make: it has no operation for
+/// creating a container or reading a block list.
 fn azure_client() -> reqwest_middleware::ClientWithMiddleware {
     let options = HashMap::from([(
         AzureHost::parse(AUTHORITY).expect("azurite authority is a valid host:port"),
@@ -170,11 +135,8 @@ fn azure_client() -> reqwest_middleware::ClientWithMiddleware {
         .build()
 }
 
-/// How many blocks a blob was committed from.
-///
-/// The one witness that a write took Put Block List and not the single-shot Put
-/// Blob path — a single-shot blob has no committed blocks at all, whatever its
-/// size.
+/// How many blocks a blob was committed from. A single-shot Put Blob leaves none
+/// at all, whatever its size, so this is the one witness for Put Block List.
 async fn committed_block_count(prefix: &str, blob: &str) -> usize {
     let body = azure_client()
         .get(format!(
@@ -209,11 +171,9 @@ async fn ensure_container() {
     );
 }
 
-/// Run `body` with the emulator credentials in the environment.
-///
-/// reqsign's env provider sits first in its default chain, so a shared key is how
-/// a container's grant resolves against Azurite — it rejects the AAD bearer
-/// tokens the rest of the chain produces. The chain itself is left alone.
+/// Run `body` with the emulator credentials in the environment. Azurite rejects
+/// the AAD bearer tokens the rest of reqsign's default chain produces, and its env
+/// provider sits first, so a shared key is the only shape that works here.
 async fn with_azurite_credentials<F: Future<Output = ()>>(body: F) {
     temp_env::async_with_vars(
         [
@@ -242,11 +202,6 @@ fn index_config(channel: AzureChannelUrl) -> IndexAzureConfig {
     }
 }
 
-/// The round trip: seed a package into a path-style Azurite channel, index it
-/// through an `azure-options` entry, and read the written `repodata.json` back.
-///
-/// The read side uses the hand-written operator, so this checks that the indexer
-/// wrote to the blob the URL names — not merely that it reported success.
 #[tokio::test]
 #[ignore = "requires a running Azurite emulator; see the module docs"]
 async fn azurite_index_round_trip_through_a_path_style_entry() {
@@ -284,8 +239,6 @@ async fn azurite_index_round_trip_through_a_path_style_entry() {
             "repodata should describe the subdir it was written for: {json}"
         );
 
-        // The same write path that ros-recipes' cache-header sweep exists to
-        // override. Live evidence that opendal's azblob backend honours it at all.
         let metadata = seeded
             .stat("noarch/repodata.json")
             .await
@@ -295,15 +248,10 @@ async fn azurite_index_round_trip_through_a_path_style_entry() {
     .await;
 }
 
-/// A write larger than the chunk size commits through Put Block List, and
-/// `Cache-Control` survives that commit.
-///
-/// Nothing in production reaches this yet. opendal's azblob backend declares no
-/// `write_multi_min_size`, so `Operator::write_with` hands the whole buffer over in
-/// a single `write` call and always takes the single-shot Put Blob path, however
-/// large the repodata gets; only an explicit `chunk` splits it. So this locks the
-/// header down for the commit path a chunked repodata write would take, which is
-/// the gap that made the live `Cache-Control` evidence incomplete.
+/// `Cache-Control` survives a Put Block List commit. Nothing in production reaches
+/// this yet: opendal's azblob backend declares no `write_multi_min_size`, so
+/// `Operator::write_with` always takes the single-shot path however large the
+/// repodata gets, and only an explicit `chunk` splits it.
 #[tokio::test]
 #[ignore = "requires a running Azurite emulator; see the module docs"]
 async fn azurite_multi_block_write_keeps_cache_control() {
@@ -354,24 +302,18 @@ async fn azurite_multi_block_write_keeps_cache_control() {
     .await;
 }
 
-/// A canary for an opendal bug, so it asserts the *broken* behaviour and fails when
-/// upstream fixes it. Read the failure message before touching the assertions.
+/// A canary that asserts the *broken* behaviour and fails when upstream fixes it.
+/// Read the failure message before touching the assertions.
 ///
-/// The bug: `azblob_complete_put_block_list_request` never sets `IF_NONE_MATCH`, so
-/// `if_not_exists` is silently dropped above the 10 MiB chunk size, while the
-/// sibling copy-block-list function does set it. That is the gap
-/// `upload_package_to_azure`'s pre-write `stat` exists to close.
+/// `azblob_complete_put_block_list_request` never sets `IF_NONE_MATCH`, so
+/// `if_not_exists` is silently dropped above the 10 MiB chunk size. That is the
+/// gap `upload_package_to_azure`'s pre-write `stat` exists to close.
 ///
-/// TODO: revisit once <https://github.com/apache/opendal/pull/7990> merges — it
-/// carries changes in this area.
+/// TODO: revisit once <https://github.com/apache/opendal/pull/7990> merges.
 ///
-/// A package over `rattler_upload`'s 10 MiB chunk size is the only way to reach the
-/// multi-block path, and this is as close as a test can currently get to that
-/// upload: `rattler_upload` reads no config file, so it always builds a host-style
-/// endpoint and cannot be pointed at an emulator at all. What it can share is the
-/// operator, built here through the same `azblob_config`, and the uploader's chunk
-/// size and overwrite guard — so the behaviour being reproduced is the uploader's,
-/// even though the entry point is not.
+/// It drives the operator rather than `rattler_upload`, which reads no config file
+/// and so cannot be pointed at an emulator, but reuses that crate's chunk size and
+/// overwrite guard.
 #[tokio::test]
 #[ignore = "requires a running Azurite emulator; see the module docs"]
 async fn azurite_if_not_exists_is_dropped_on_the_multi_block_path() {
@@ -380,8 +322,6 @@ async fn azurite_if_not_exists_is_dropped_on_the_multi_block_path() {
         ensure_empty_prefix(PREFIX).await;
         let op = production_operator(&channel(PREFIX));
 
-        // Baseline: below the chunk size, the guard works and opendal reports the
-        // conflict the uploader turns into "already exists, use --force".
         let small = "noarch/small.conda";
         op.write(small, b"first".to_vec())
             .await
@@ -393,8 +333,6 @@ async fn azurite_if_not_exists_is_dropped_on_the_multi_block_path() {
             .expect_err("if_not_exists should refuse to overwrite a small blob");
         assert_eq!(refused.kind(), ErrorKind::ConditionNotMatch);
 
-        // Over the chunk size, the same option is accepted and then ignored: the
-        // guarded second write goes through and replaces the first payload.
         let large = "noarch/large.conda";
         let first = vec![0u8; UPLOAD_CHUNK_SIZE + 2 * MIB];
         let second = vec![1u8; first.len()];
@@ -431,11 +369,9 @@ async fn azurite_if_not_exists_is_dropped_on_the_multi_block_path() {
     .await;
 }
 
-/// Write `payload` the way `upload_single_package` does.
-///
-/// `guard` is that function's `if_not_exists(!force)`. The commit result is handed
-/// back rather than unwrapped: whether a guarded commit over an existing blob
-/// succeeds is the thing under test, so the caller owns that message.
+/// Write `payload` the way `upload_single_package` does, where `guard` is that
+/// function's `if_not_exists(!force)`. The commit result is handed back because
+/// whether a guarded commit over an existing blob succeeds is the thing under test.
 async fn write_chunked(
     op: &Operator,
     path: &str,

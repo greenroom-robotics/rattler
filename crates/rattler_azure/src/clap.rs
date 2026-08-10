@@ -11,67 +11,47 @@ use crate::{
 
 /// Default lifetime, in minutes, of a SAS minted from an `az login` session.
 ///
-/// SAS tokens are deliberately short-lived: a SAS cannot be individually revoked,
-/// so a short lifetime keeps the blast radius small if one leaks. Thirty minutes
-/// comfortably covers a typical index or upload run.
+/// A SAS cannot be individually revoked, so a short lifetime bounds the damage if
+/// one leaks. Thirty minutes covers a typical index or upload run.
 const DEFAULT_AZURE_CLI_SAS_TTL_MINUTES: u64 = 30;
 
 /// Upper bound, in minutes, accepted for `--azure-cli-sas-ttl-minutes`.
-///
-/// A SAS is meant to be short-lived; one week is already generous. Capping the
-/// value at the clap layer also keeps `minutes * 60` well clear of overflowing
-/// the [`Duration`] arithmetic in [`AzureCredentialsOpts::source`].
 const MAX_AZURE_CLI_SAS_TTL_MINUTES: u64 = 7 * 24 * 60;
 
-/// Errors that can occur while resolving [`AzureCredentialsOpts`] into
-/// [`AzureCredentials`].
 #[derive(Debug, thiserror::Error)]
 pub enum AzureCredentialsError {
-    /// No credential source was supplied.
     #[error("no Azure credentials supplied: pass --account-key, --sas-token, or --azure-cli")]
     Missing,
 
-    /// The channel URL required to mint a SAS could not be parsed.
     #[error(transparent)]
     Url(#[from] AzureUrlError),
 
-    /// Minting a SAS via the Azure CLI failed.
     #[error("failed to mint a user-delegation SAS from the Azure CLI")]
     Cli(#[from] AzureCliSasError),
 }
 
 /// A resolved, unambiguous choice of authentication source.
 ///
-/// [`AzureCredentialsOpts`] can express several inputs at once (an exported
-/// `AZURE_STORAGE_KEY` and an explicit `--azure-cli`, say); this enum is the
-/// single winner after precedence is applied, so downstream code never has to
-/// reason about combinations. Only [`AzureAuthSource::AzureCli`] carries state
-/// (the minting TTL), which is why account/container derivation is needed for
-/// that arm alone.
+/// [`AzureCredentialsOpts`] can express several inputs at once. This enum is the
+/// single winner after precedence is applied, so downstream code never reasons
+/// about combinations.
 #[derive(Clone, Debug)]
 pub enum AzureAuthSource {
-    /// Use a shared storage account key verbatim.
     AccountKey(SecretString),
 
-    /// Use a supplied SAS token verbatim.
     SasToken(SecretString),
 
-    /// Mint a short-lived user-delegation SAS from the current `az login`
-    /// session, valid for `ttl`.
-    AzureCli {
-        /// How long the minted SAS should remain valid.
-        ttl: Duration,
-    },
+    AzureCli { ttl: Duration },
 }
 
 impl AzureAuthSource {
     /// Resolve this source into concrete [`AzureCredentials`].
     ///
-    /// `permissions`, `channel` and `endpoint` are consulted **only** for the
-    /// [`AzureAuthSource::AzureCli`] arm, which mints a SAS scoped to the channel's
-    /// container with those permissions. Taking the channel and its endpoint rather
-    /// than pre-derived coordinates is what keeps the account the SAS is minted for
-    /// and the scheme it is restricted to from coming from two different places.
+    /// `permissions`, `channel` and `endpoint` are consulted only for the
+    /// [`AzureAuthSource::AzureCli`] arm, which mints a SAS scoped to the
+    /// channel's container. Taking the channel and its endpoint rather than
+    /// pre-derived coordinates keeps the account the SAS is minted for and the
+    /// scheme it is restricted to from coming from two different places.
     pub async fn resolve(
         self,
         permissions: &str,
@@ -98,20 +78,12 @@ impl AzureAuthSource {
     }
 }
 
-/// Manually specified Azure Blob credentials.
-///
-/// See [`super::AzureCredentials`] for details on how these credentials are used.
-/// Several inputs may be present at once (for example when `AZURE_STORAGE_KEY` is
-/// exported *and* `--azure-cli` is passed), so [`AzureCredentialsOpts::source`]
-/// applies an explicit precedence rather than treating the combination as an
-/// error — see that method for the exact ordering.
 #[derive(Clone, Debug, Parser)]
 pub struct AzureCredentialsOpts {
     /// The Azure Storage account key.
     ///
-    /// Mutually exclusive with `--sas-token`: supplying both is a usage error
-    /// rather than silently discarding one. `--azure-cli` layers on top of both
-    /// (see [`AzureCredentialsOpts::source`]).
+    /// Mutually exclusive with `--sas-token`. `--azure-cli` takes precedence over
+    /// both.
     #[arg(
         long,
         env = "AZURE_STORAGE_KEY",
@@ -133,18 +105,17 @@ pub struct AzureCredentialsOpts {
     /// Mint a short-lived user-delegation SAS from the current `az login`
     /// session (requires the Azure CLI).
     ///
-    /// Takes precedence over AZURE_STORAGE_KEY / AZURE_STORAGE_SAS_TOKEN, so it
-    /// can be used to override ambient credentials picked up from the
-    /// environment.
+    /// Takes precedence over AZURE_STORAGE_KEY and AZURE_STORAGE_SAS_TOKEN, so it
+    /// can override credentials picked up from the environment.
     #[allow(clippy::doc_markdown)]
     #[arg(long, help_heading = "Azure Credentials")]
     pub azure_cli: bool,
 
     /// Lifetime, in minutes, of the SAS minted for `--azure-cli`.
     ///
-    /// The default keeps the token short-lived. Raise it for very large index or
-    /// upload runs: if the SAS expires mid-run, subsequent requests fail with a
-    /// 403 and the run aborts, potentially leaving a partial index behind.
+    /// Raise it for very large index or upload runs. If the SAS expires mid-run,
+    /// later requests fail with a 403 and the run aborts, possibly leaving a
+    /// partial index behind.
     #[arg(
         long,
         default_value_t = DEFAULT_AZURE_CLI_SAS_TTL_MINUTES,
@@ -155,13 +126,13 @@ pub struct AzureCredentialsOpts {
 }
 
 /// Take a command-line or environment value straight into a [`SecretString`], so
-/// it is never held as a plain `String` that a `{:?}` could reach.
+/// it is never a plain `String` a `{:?}` could reach.
 fn secret(value: &str) -> Result<SecretString, std::convert::Infallible> {
     Ok(value.into())
 }
 
 impl PartialEq for AzureCredentialsOpts {
-    /// Hand-written because [`SecretString`] withholds `PartialEq` — comparing
+    /// Hand-written because [`SecretString`] withholds `PartialEq`: comparing
     /// secrets is not constant-time. The containing `UploadOpts` tree derives
     /// `PartialEq`, and comparing parsed command lines is not a secrets check.
     fn eq(&self, other: &Self) -> bool {
@@ -181,18 +152,6 @@ impl PartialEq for AzureCredentialsOpts {
 }
 
 impl AzureCredentialsOpts {
-    /// Collapse the supplied options into a single, unambiguous
-    /// [`AzureAuthSource`].
-    ///
-    /// When more than one input is present the following precedence applies,
-    /// highest first:
-    ///
-    /// 1. `--azure-cli` — an explicit opt-in, so it wins over anything picked up
-    ///    from the environment.
-    /// 2. `--sas-token` / `AZURE_STORAGE_SAS_TOKEN`.
-    /// 3. `--account-key` / `AZURE_STORAGE_KEY`.
-    ///
-    /// If none are set, returns [`AzureCredentialsError::Missing`].
     pub fn source(&self) -> Result<AzureAuthSource, AzureCredentialsError> {
         if self.azure_cli {
             Ok(AzureAuthSource::AzureCli {
@@ -207,11 +166,6 @@ impl AzureCredentialsOpts {
         }
     }
 
-    /// Resolve the supplied options into concrete [`AzureCredentials`].
-    ///
-    /// Precedence is applied by [`AzureCredentialsOpts::source`]. `permissions`,
-    /// `channel` and `endpoint` are consulted only when the winning source is
-    /// `--azure-cli`; see [`AzureAuthSource::resolve`].
     pub async fn resolve(
         self,
         permissions: &str,
@@ -239,8 +193,8 @@ mod tests {
         }
     }
 
-    /// A channel whose coordinates cannot be derived under `endpoint`: resolving a
-    /// verbatim credential must not need them, and this is what proves it.
+    /// A channel whose coordinates cannot be derived under `endpoint`, proving
+    /// that resolving a verbatim credential does not need them.
     fn underivable() -> (AzureChannelUrl, AzureEndpoint) {
         let channel =
             AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general").unwrap();
@@ -280,17 +234,14 @@ mod tests {
 
     #[test]
     fn azure_cli_beats_sas_beats_account_key() {
-        // All three present: `--azure-cli` wins.
         assert!(matches!(
             opts(Some("key"), Some("sv=..."), true).source(),
             Ok(AzureAuthSource::AzureCli { .. })
         ));
-        // SAS token beats an account key when `--azure-cli` is absent.
         assert!(matches!(
             opts(Some("key"), Some("sv=..."), false).source(),
             Ok(AzureAuthSource::SasToken(t)) if t.expose_secret() == "sv=..."
         ));
-        // Account key is the last resort.
         assert!(matches!(
             opts(Some("key"), None, false).source(),
             Ok(AzureAuthSource::AccountKey(k)) if k.expose_secret() == "key"
@@ -333,8 +284,6 @@ mod tests {
         );
     }
 
-    /// `--account-key` and `--sas-token` are mutually exclusive: passing both is
-    /// a clap error rather than silently discarding one.
     #[test]
     fn account_key_and_sas_token_conflict() {
         use clap::Parser;
@@ -351,7 +300,6 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
-    /// Neither the resolved source nor the raw options may print a secret.
     #[test]
     fn debug_never_prints_secrets() {
         let sources = [
@@ -365,7 +313,6 @@ mod tests {
             assert!(!out.contains("deadbeef"), "leaked token: {out}");
         }
 
-        // The TTL arm carries no secret, so it stays fully printable.
         let cli = AzureAuthSource::AzureCli {
             ttl: Duration::from_secs(60),
         };
@@ -386,8 +333,6 @@ mod tests {
         assert!(out.contains("sas_token: None"), "unexpected: {out}");
     }
 
-    /// A zero TTL is rejected, and the maximum is capped so `minutes * 60`
-    /// cannot overflow.
     #[test]
     fn ttl_range_is_enforced() {
         use clap::Parser;

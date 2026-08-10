@@ -421,17 +421,13 @@ pub struct S3Opts {
 
 /// Options for uploading to Azure Blob Storage.
 ///
-/// Authentication is supplied with either an account key or a shared access
-/// signature (SAS) token; the two are mutually exclusive.
+/// Authenticate with either an account key or a shared access signature (SAS)
+/// token. The two are mutually exclusive.
 #[cfg(feature = "azure")]
 #[derive(Clone, Debug, PartialEq, Parser)]
 pub struct AzureOpts {
     /// The channel URL in the Azure Blob container to upload the package to,
     /// e.g., `az://myaccount.blob.core.windows.net/my-container/my-channel`
-    ///
-    /// Kept as an [`AzureChannelUrl`](rattler_azure::AzureChannelUrl) rather than
-    /// a wire `Url`, so the scheme the request goes out over is chosen where the
-    /// endpoint options are known instead of being fixed at parse time.
     #[arg(short, long, env = "AZURE_CHANNEL")]
     pub channel: rattler_azure::AzureChannelUrl,
 
@@ -640,7 +636,6 @@ mod test {
     use super::{AzureOpts, ForceOverwrite};
     use clap::Parser;
 
-    /// `--force` stays a flag even though it parses into a newtype.
     #[test]
     fn test_azure_force_parses_as_a_flag() {
         let args = ["az", "--channel", "az://account.blob.core.windows.net/c"];

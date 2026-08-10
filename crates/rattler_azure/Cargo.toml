@@ -15,7 +15,6 @@ default = []
 # SAS by shelling out to the Azure CLI (which needs `jiff` for the expiry and
 # `tokio` to run `az` without blocking the async runtime).
 clap = ["dep:clap", "dep:jiff", "dep:which", "dep:tokio"]
-# `azblob_config`: build an opendal `AzblobConfig` from a channel URL.
 opendal = ["dep:opendal"]
 # Serde derives for the `azure-options` config table: the per-host endpoint
 # options, the `AzureHost` used as their map key and the `ContainerName` keying

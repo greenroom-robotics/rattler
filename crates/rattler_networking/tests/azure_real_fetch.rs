@@ -1,8 +1,7 @@
 //! Live read-path test against a *real* Azure Blob Storage account.
 //!
-//! Exercises the AAD / token path of reqsign's `DefaultCredentialProvider` —
-//! i.e. the credential `az login` provides — against a real
-//! `*.blob.core.windows.net` endpoint. It is purely a read; it never writes.
+//! Exercises the AAD token path of reqsign's `DefaultCredentialProvider`, i.e.
+//! the credential `az login` provides. It never writes.
 //!
 //! Configure via env and run (requires `az login` with at least
 //! `Storage Blob Data Reader` on the container):
@@ -54,8 +53,6 @@ async fn azure_middleware_fetches_real_repodata() {
         .with(AzureMiddleware::new(reqwest::Client::new(), options))
         .build();
 
-    // The `az://` host carries the full blob endpoint — same form used in a
-    // channel URL, e.g. `az://stcondachannel.blob.core.windows.net/general`.
     let url = format!("az://{host}/{container}/{path}");
     println!("fetching {url}");
     let resp = client

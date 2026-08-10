@@ -14,7 +14,6 @@ from rattler.networking.middleware import (
 
 
 def test_default_client_stack_includes_azure(monkeypatch) -> None:
-    """The default client's middleware stack must include every cloud backend."""
     constructed: list[type] = []
 
     for name in (
