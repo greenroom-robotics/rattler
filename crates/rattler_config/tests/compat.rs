@@ -322,7 +322,7 @@ fn merge_semantics() {
     let mycompany = merged
         .azure_options
         .get(&rattler_azure::AzureEndpointKey::parse("mycompany.blob.core.windows.net").unwrap());
-    // The override layer states the host's whole grant table, so `releases` —
+    // The override layer states the key's whole grant table, so `releases` —
     // which only the lower layer names — is gone.
     for (container, granted) in [("releases", false), ("staging", true), ("public", false)] {
         let container = rattler_azure::ContainerName::new(container).unwrap();

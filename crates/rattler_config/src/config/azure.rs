@@ -107,9 +107,9 @@ impl Config for AzureOptionsMap {
     }
 
     fn keys(&self) -> Vec<String> {
-        // Quoted, because every Azure endpoint key contains dots and a path-style
-        // one a slash, and an unquoted key is not the TOML path the user must pass
-        // to `config set`/`unset`.
+        // Quoted, because a key can carry dots, a colon and a slash, none of which
+        // a bare TOML key holds — and the path is what the user passes to `config
+        // set`/`unset`.
         //
         // The per-container grants are listed as their own keys so each is
         // separately unsettable. There is deliberately no `."<key>".auth` key: the
@@ -332,8 +332,8 @@ general = true
         assert!(ensure_no_colliding_keys(&document.parse().unwrap()).is_ok());
     }
 
-    /// A key runs up to the container and no further, so one naming a container
-    /// cannot be written.
+    /// A key carries at most one path segment, read as the account, so anything
+    /// past that is refused whatever the writer meant it to be.
     #[test]
     fn a_key_past_the_account_is_rejected() {
         let err = toml::from_str::<AzureOptionsMap>(
