@@ -16,7 +16,7 @@ use crate::config::Config;
 /// The key is an [`AzureHost`] rather than a `String` because a missed grant
 /// fails silently: Azure answers an unauthorized request for a private container
 /// with a 404, so the user is told "not found". Every host normalization would be
-/// such a miss (`MyCompany.blob…`, `host:443`, `[0:0:0:0:0:0:0:1]:10000`).
+/// such a miss (`MyCompany.blob…`, `[0:0:0:0:0:0:0:1]:10000`).
 /// Deserializing the key through the parser that also produces the lookup value
 /// removes the class. The inner map is private for the same reason.
 ///
@@ -27,54 +27,8 @@ pub struct AzureOptionsMap(IndexMap<AzureHost, AzureEndpointOptions>);
 
 impl AzureOptionsMap {
     pub fn get(&self, host: &AzureHost) -> AzureEndpointOptions {
-        if let Some(options) = self.0.get(host) {
-            return options.clone();
-        }
-
-        // `host` and `host:443` are the same https endpoint, and a user may write
-        // either in the config and the other in a channel URL. `AzureHost` keeps
-        // the written port because it has no scheme to judge it against; the entry
-        // does, so the collapse happens here. Both directions, since either side
-        // may be the one carrying the port.
-        self.0
-            .iter()
-            .find(|(key, options)| {
-                let scheme = options.endpoint().scheme;
-                key.without_default_port(scheme).as_ref() == Some(host)
-                    || host.without_default_port(scheme).as_ref() == Some(*key)
-            })
-            .map(|(_, options)| options.clone())
-            .unwrap_or_default()
+        self.0.get(host).cloned().unwrap_or_default()
     }
-}
-
-/// Reject a document that spells one host two ways.
-///
-/// Both spellings reach serde, which silently keeps whichever the table iterated
-/// last. TOML's own duplicate-key check runs on the raw text, so it cannot see
-/// the collision.
-pub(crate) fn ensure_no_colliding_hosts(document: &toml::Table) -> Result<(), String> {
-    let Some(table) = document
-        .get("azure-options")
-        .and_then(toml::Value::as_table)
-    else {
-        return Ok(());
-    };
-
-    let mut seen: IndexMap<AzureHost, &String> = IndexMap::new();
-    for written in table.keys() {
-        // An unparseable key is serde's error to report, not ours.
-        let Ok(host) = AzureHost::parse(written) else {
-            continue;
-        };
-        if let Some(first) = seen.insert(host.clone(), written) {
-            return Err(format!(
-                "`azure-options` names one host twice: \"{first}\" and \"{written}\" are both \
-                 `{host}`"
-            ));
-        }
-    }
-    Ok(())
 }
 
 impl Config for AzureOptionsMap {
@@ -190,20 +144,6 @@ mod tests {
                 .is_granted()
         );
         assert_eq!(unlisted, AzureEndpointOptions::default());
-    }
-
-    #[test]
-    fn a_document_naming_one_host_twice_is_refused() {
-        let document = r#"
-[azure-options."acct.blob.example".auth]
-releases = false
-
-[azure-options."ACCT.blob.example.".auth]
-releases = true
-"#;
-        let error = ensure_no_colliding_hosts(&document.parse().unwrap())
-            .expect_err("a collision must be reported");
-        assert!(error.contains("acct.blob.example"), "{error}");
     }
 
     #[test]
