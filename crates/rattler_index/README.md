@@ -84,24 +84,29 @@ runtime from `--account-key` / `--sas-token`, an `az login` session
 (`--azure-cli`), or the `DefaultCredentialProvider` chain.
 
 A host whose first label is not the storage account, or that is not reached over
-https, needs an entry under `[azure-options."<host>"]`. The key is the host with
-its port when the URL has one:
+https, needs an entry under `[azure-options."<key>"]`. The key is the channel URL
+prefix up to the container, with the port when the URL has one — so
+`acct.blob.core.windows.net` where the host's first label is the account, and
+`127.0.0.1:10000/devstoreaccount1` where the account is the first path segment
+instead. The next segment after the key is always the container:
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `scheme` | string | The scheme `az://` is rewritten to: `"https"` (default) or `"http"`. Use `http` for local emulators only. |
-| `path-style` | boolean | Where the storage account is found. `false` (default) reads it from the first host label. `true` reads it from the first path segment instead, which is the only form that works for an IP-literal or single-label host. |
-| `auth` | table | Which containers on the host may be sent credentials **when fetching**: one `<container> = true` line each. A container not listed is fetched anonymously, so one account can hold private and anonymous-read containers side by side — which is what Azure's per-container RBAC enforces. There is no host-wide switch, because a grant covering every container on an account, including ones created later, is not something to be able to write by accident. This is the only way a credential attaches on the fetch path, so keep these entries in your user-level config file, never in a checked-in project file. It has no effect on `rattler-index` or `rattler upload`, which take their credentials from the command line. |
+| `auth` | table | Which containers under this key may be sent credentials **when fetching**: one `<container> = true` line each. A container not listed is fetched anonymously, so one account can hold private and anonymous-read containers side by side — which is what Azure's per-container RBAC enforces. There is no key-wide switch, because a grant covering every container on an account, including ones created later, is not something to be able to write by accident. This is the only way a credential attaches on the fetch path, so keep these entries in your user-level config file, never in a checked-in project file. It has no effect on `rattler-index` or `rattler upload`, which take their credentials from the command line. |
 
-Indexing a channel in the Azurite emulator needs the two wire settings (add an
-`auth` line per container if the same host is also fetched from):
+Two accounts behind one proxy get one entry each, and the longer key wins where
+both it and the bare host are configured.
+
+Indexing a channel in the Azurite emulator needs the account in the key and the
+`http` scheme (add an `auth` line per container if the same endpoint is also
+fetched from):
 
 ```toml
-[azure-options."127.0.0.1:10000"]
+[azure-options."127.0.0.1:10000/devstoreaccount1"]
 scheme = "http"
-path-style = true
 
-[azure-options."127.0.0.1:10000".auth]
+[azure-options."127.0.0.1:10000/devstoreaccount1".auth]
 general = true
 ```
 
@@ -111,8 +116,8 @@ rattler-index --config ./rattler-config.toml az \
     az://127.0.0.1:10000/devstoreaccount1/general/my-channel
 ```
 
-Without the entry, that URL fails: host-style addressing cannot read an account
-name out of `127.0.0.1`, and the error tells you which line to add.
+Without the entry, that URL fails: read as `<account>.<host>/<container>`,
+`127.0.0.1` carries no account name, and the error tells you which key to add.
 
 ## Per-channel index configuration
 

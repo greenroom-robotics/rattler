@@ -7,7 +7,7 @@ use futures::StreamExt;
 use miette::IntoDiagnostic;
 use opendal::{Configurator, ErrorKind};
 use rattler_azure::{
-    AzureChannelUrl, AzureCoordinates, AzureCredentials, AzureEndpoint, account_and_container,
+    AccountName, AzureChannelUrl, AzureCredentials, AzureEndpointKey, AzureScheme, ContainerName,
 };
 
 use crate::upload::{
@@ -27,22 +27,23 @@ pub(crate) const AZURE_UPLOAD_SAS_PERMISSIONS: &str = "rcw";
 /// Uploads packages to a channel in an Azure Blob Storage container.
 ///
 /// The account name, endpoint, container and root prefix come from the channel
-/// URL and `endpoint` (see `azblob_config`). A path-style entry is what makes an
-/// IP, single-label or Azurite endpoint uploadable.
+/// URL and `key` (see `azblob_config`). A path-style key is what makes an IP,
+/// single-label or Azurite endpoint uploadable.
 pub async fn upload_package_to_azure(
     channel: AzureChannelUrl,
     credentials: AzureCredentials,
-    endpoint: AzureEndpoint,
+    key: &AzureEndpointKey,
+    scheme: AzureScheme,
     package_files: &[PathBuf],
     force: ForceOverwrite,
 ) -> miette::Result<()> {
     let config =
-        rattler_azure::azblob_config(&credentials, &channel, endpoint).into_diagnostic()?;
+        rattler_azure::azblob_config(&credentials, &channel, key, scheme).into_diagnostic()?;
 
-    // The account and container the requests below are aimed at. `azblob_config`
-    // has already derived them, but it keeps them to itself, and an opendal error
-    // names neither.
-    let coordinates = account_and_container(&channel, endpoint.addressing).into_diagnostic()?;
+    // The container the requests below are aimed at. `azblob_config` has already
+    // derived it, but it keeps it to itself, and an opendal error names neither it
+    // nor the account.
+    let container = key.container_in(&channel).into_diagnostic()?;
 
     let builder = config.into_builder();
     let op = BlobStore::new(builder).into_diagnostic()?;
@@ -56,10 +57,17 @@ pub async fn upload_package_to_azure(
         .map(|package_file| {
             let op = op.clone();
             let channel = &channel;
-            let coordinates = &coordinates;
+            let container = &container;
             async move {
-                let result =
-                    upload_single_package(&op, channel, coordinates, package_file, force).await;
+                let result = upload_single_package(
+                    &op,
+                    channel,
+                    key.account(),
+                    container,
+                    package_file,
+                    force,
+                )
+                .await;
                 (package_file.clone(), result)
             }
         })
@@ -106,10 +114,10 @@ fn summarize(outcomes: &[(PathBuf, miette::Result<()>)]) -> String {
 /// aimed at, neither of which opendal's own error mentions.
 fn explain(
     error: BlobStoreError,
-    coordinates: &AzureCoordinates,
+    account: &AccountName,
+    container: &ContainerName,
     blob_url: &str,
 ) -> miette::Report {
-    let AzureCoordinates { account, container } = coordinates;
     let context = match error.kind() {
         // A container that is not there answers a blob request with the same
         // `NotFound` a missing blob does, so a wrong container — or a wrong
@@ -135,7 +143,8 @@ fn explain(
 async fn upload_single_package(
     op: &BlobStore,
     channel: &AzureChannelUrl,
-    coordinates: &AzureCoordinates,
+    account: &AccountName,
+    container: &ContainerName,
     package_file: &Path,
     force: ForceOverwrite,
 ) -> miette::Result<()> {
@@ -170,7 +179,7 @@ async fn upload_single_package(
                 miette::bail!("Package {blob_url} already exists. Use --force to overwrite.");
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(explain(e, coordinates, &blob_url)),
+            Err(e) => return Err(explain(e, account, container, &blob_url)),
         }
     }
 
@@ -192,7 +201,7 @@ async fn upload_single_package(
     stream_package_to_object_store(op, &target, package_file, &blob_url, force)
         .await
         .map_err(|failure| match failure {
-            UploadFailure::Store(e) => explain(e, coordinates, &blob_url),
+            UploadFailure::Store(e) => explain(e, account, container, &blob_url),
             failure => failure.into_report(&blob_url),
         })
 }
@@ -204,7 +213,7 @@ mod test {
     use opendal::services::Memory;
     use rattler_azure::AzureChannelUrl;
 
-    use super::{AzureCoordinates, BlobStore, summarize, upload_single_package};
+    use super::{BlobStore, summarize, upload_single_package};
     use crate::upload::opt::ForceOverwrite;
     use crate::upload::package::ExtractedPackage;
     use crate::upload::test_utils::test_package_path;
@@ -217,9 +226,10 @@ mod test {
         AzureChannelUrl::parse("az://account.blob.core.windows.net/container/prefix").unwrap()
     }
 
-    fn test_coordinates() -> AzureCoordinates {
-        rattler_azure::account_and_container(&test_channel(), rattler_azure::Addressing::HostStyle)
-            .unwrap()
+    /// The key `test_channel` falls under, which carries the account the channel's
+    /// host names.
+    fn test_key() -> rattler_azure::AzureEndpointKey {
+        rattler_azure::AzureEndpointKey::host_style(test_channel().host()).unwrap()
     }
 
     fn package_key() -> String {
@@ -244,7 +254,8 @@ mod test {
         upload_single_package(
             &op,
             &channel,
-            &test_coordinates(),
+            test_key().account(),
+            &test_key().container_in(&test_channel()).unwrap(),
             &package,
             ForceOverwrite(true),
         )
@@ -254,7 +265,8 @@ mod test {
         let err = upload_single_package(
             &op,
             &channel,
-            &test_coordinates(),
+            test_key().account(),
+            &test_key().container_in(&test_channel()).unwrap(),
             &package,
             ForceOverwrite(false),
         )
@@ -272,7 +284,8 @@ mod test {
         upload_single_package(
             &op,
             &test_channel(),
-            &test_coordinates(),
+            test_key().account(),
+            &test_key().container_in(&test_channel()).unwrap(),
             &test_package_path(),
             ForceOverwrite(false),
         )
@@ -292,7 +305,8 @@ mod test {
         upload_single_package(
             &op,
             &test_channel(),
-            &test_coordinates(),
+            test_key().account(),
+            &test_key().container_in(&test_channel()).unwrap(),
             &test_package_path(),
             ForceOverwrite(false),
         )

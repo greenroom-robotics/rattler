@@ -29,7 +29,7 @@ use opendal::layers::RetryLayer;
 use opendal::services::S3Config;
 use opendal::{Configurator, Operator, services::FsConfig};
 #[cfg(feature = "azure")]
-use rattler_azure::{AzureChannelUrl, AzureCredentials, AzureEndpoint};
+use rattler_azure::{AzureChannelUrl, AzureCredentials, AzureEndpointKey, AzureScheme};
 use rattler_conda_types::{
     ChannelInfo, ChannelNotice, ChannelNotices, ChannelRelations, PackageRecord, PatchInstructions,
     Platform, RepoData, Shard, ShardedRepodata, ShardedSubdirInfo, UrlOrPath, V3Packages,
@@ -1530,8 +1530,11 @@ pub struct IndexAzureConfig {
     pub channel: AzureChannelUrl,
     /// The credentials to use for Azure Blob access.
     pub credentials: AzureCredentials,
-    /// How to address the channel's host. See [`AzureEndpoint`].
-    pub endpoint: AzureEndpoint,
+    /// The `azure-options` key the channel was matched under, which says where
+    /// its storage account and container are.
+    pub key: AzureEndpointKey,
+    /// The wire scheme requests are sent over.
+    pub scheme: AzureScheme,
     /// The target platform to index.
     pub target_platform: Option<Platform>,
     /// The path to a repodata patch to apply to the index.
@@ -1571,7 +1574,8 @@ pub async fn index_azure_with_channel_metadata(
     IndexAzureConfig {
         channel,
         credentials,
-        endpoint,
+        key,
+        scheme,
         target_platform,
         repodata_patch,
         write_zst,
@@ -1584,11 +1588,11 @@ pub async fn index_azure_with_channel_metadata(
     }: IndexAzureConfig,
     channel_metadata: ChannelMetadata,
 ) -> anyhow::Result<()> {
-    let azblob_config = rattler_azure::azblob_config(&credentials, &channel, endpoint)?;
-    // The account and container every request below is aimed at. `azblob_config`
-    // has already derived them, but it keeps them to itself and an opendal error
-    // names neither.
-    let coordinates = rattler_azure::account_and_container(&channel, endpoint.addressing)?;
+    let azblob_config = rattler_azure::azblob_config(&credentials, &channel, &key, scheme)?;
+    // The container every request below is aimed at. `azblob_config` has already
+    // derived it, but it keeps it to itself and an opendal error names neither it
+    // nor the account.
+    let container = key.container_in(&channel)?;
     let builder = azblob_config.into_builder();
     // opendal's default retry interceptor logs the error with its `url` context,
     // and for a SAS the credential is *in* that URL — once per retry, at warn
@@ -1616,7 +1620,7 @@ pub async fn index_azure_with_channel_metadata(
     // blob. Ask once here, where the answer can still be attributed to the
     // container and account the run was pointed at.
     if let Err(e) = op.list_with("").await {
-        return Err(explain_azure_error(e, &coordinates));
+        return Err(explain_azure_error(e, &key, &container));
     }
 
     index_with_channel_metadata(
@@ -1635,7 +1639,7 @@ pub async fn index_azure_with_channel_metadata(
     )
     .await
     .map(|_| ())
-    .map_err(|e| annotate_azure_failure(e, &coordinates))
+    .map_err(|e| annotate_azure_failure(e, &key, &container))
 }
 
 /// Explains an opendal error in terms of the account and container the request
@@ -1643,16 +1647,17 @@ pub async fn index_azure_with_channel_metadata(
 #[cfg(feature = "azure")]
 fn explain_azure_error(
     error: opendal::Error,
-    coordinates: &rattler_azure::AzureCoordinates,
+    key: &AzureEndpointKey,
+    container: &rattler_azure::ContainerName,
 ) -> anyhow::Error {
-    let rattler_azure::AzureCoordinates { account, container } = coordinates;
+    let account = key.account();
     match error.kind() {
         opendal::ErrorKind::NotFound => anyhow::Error::new(error).context(format!(
             "could not list container `{container}` in account `{account}`: the container may not \
              exist, or the account name may not be the one you meant"
         )),
         opendal::ErrorKind::PermissionDenied => {
-            anyhow::Error::new(error).context(azure_permission_denied_hint(coordinates))
+            anyhow::Error::new(error).context(azure_permission_denied_hint(key, container))
         }
         _ => anyhow::Error::new(error).context(format!(
             "failed to reach container `{container}` in account `{account}`"
@@ -1663,8 +1668,11 @@ fn explain_azure_error(
 /// A 403 part-way through a run is usually a SAS that expired under the index,
 /// since nothing renews one mid-run.
 #[cfg(feature = "azure")]
-fn azure_permission_denied_hint(coordinates: &rattler_azure::AzureCoordinates) -> String {
-    let rattler_azure::AzureCoordinates { account, container } = coordinates;
+fn azure_permission_denied_hint(
+    key: &AzureEndpointKey,
+    container: &rattler_azure::ContainerName,
+) -> String {
+    let account = key.account();
     format!(
         "access to container `{container}` in account `{account}` was denied; a SAS minted by \
          `--azure-cli` expires after `--azure-cli-sas-ttl-minutes` (30 by default) and is not \
@@ -1678,7 +1686,8 @@ fn azure_permission_denied_hint(coordinates: &rattler_azure::AzureCoordinates) -
 #[cfg(feature = "azure")]
 fn annotate_azure_failure(
     error: anyhow::Error,
-    coordinates: &rattler_azure::AzureCoordinates,
+    key: &AzureEndpointKey,
+    container: &rattler_azure::ContainerName,
 ) -> anyhow::Error {
     let denied = error
         .chain()
@@ -1686,7 +1695,7 @@ fn annotate_azure_failure(
         .any(|cause| cause.kind() == opendal::ErrorKind::PermissionDenied);
 
     if denied {
-        error.context(azure_permission_denied_hint(coordinates))
+        error.context(azure_permission_denied_hint(key, container))
     } else {
         error
     }
@@ -2047,10 +2056,8 @@ mod tests {
         let config = rattler_azure::azblob_config(
             &credentials,
             &channel,
-            AzureEndpoint {
-                scheme: rattler_azure::AzureScheme::Http,
-                ..Default::default()
-            },
+            &AzureEndpointKey::parse("devstoreaccount1.blob.localhost:10000").unwrap(),
+            AzureScheme::Http,
         )
         .unwrap();
 

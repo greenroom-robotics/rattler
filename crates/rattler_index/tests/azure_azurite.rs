@@ -1,7 +1,7 @@
 //! Live write-path integration tests against a local Azurite emulator.
 //!
-//! Checks that a real server accepts what `azblob_config` derives under
-//! `path-style = true`, plus two opendal behaviours only a real server can show:
+//! Checks that a real server accepts what `azblob_config` derives under a
+//! path-style key, plus two opendal behaviours only a real server can show:
 //! the multi-block write path ignores `if_not_exists`, and it does carry
 //! `Cache-Control` through its commit. Run with:
 //!
@@ -19,8 +19,8 @@ use std::{collections::HashMap, path::PathBuf};
 
 use opendal::{Configurator, ErrorKind, Operator, services::AzblobConfig};
 use rattler_azure::{
-    Addressing, Auth, AzureChannelUrl, AzureCoordinates, AzureCredentials, AzureEndpoint,
-    AzureEndpointOptions, AzureHost, AzureScheme,
+    Auth, AzureChannelUrl, AzureCredentials, AzureEndpointKey, AzureEndpointOptions, AzureScheme,
+    ContainerName,
 };
 use rattler_index::{IndexAzureConfig, PackageRevisionAssignment, index_azure};
 
@@ -30,9 +30,8 @@ const ACCOUNT: &str = "devstoreaccount1";
 const ACCOUNT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
-/// The authority, which is also the exact `azure-options` table key. Host-style
-/// addressing cannot read an account out of an IP literal, so this needs
-/// path-style.
+/// The authority. An IP literal carries no account label, so the table key below
+/// has to name the account as a path segment.
 const AUTHORITY: &str = "127.0.0.1:10000";
 
 const CONTAINER: &str = "test-channel";
@@ -61,20 +60,22 @@ fn channel(prefix: &str) -> AzureChannelUrl {
         .expect("azurite channel url")
 }
 
+/// The key the emulator's channels are matched under.
+fn azurite_key() -> AzureEndpointKey {
+    AzureEndpointKey::parse(&format!("{AUTHORITY}/{ACCOUNT}"))
+        .expect("azurite authority and account name")
+}
+
 /// The `azure-options` entry for the emulator. Its grant on `CONTAINER` is only
 /// for the signing client below: `index_azure` signs with the credential it is
 /// handed and never reads a grant.
 fn azurite_options() -> AzureEndpointOptions {
     AzureEndpointOptions::new(
         [(
-            AzureCoordinates::parse(&format!("{ACCOUNT}/{CONTAINER}"))
-                .expect("azurite account and container names"),
+            ContainerName::new(CONTAINER).expect("azurite container name"),
             Auth::DefaultChain,
         )],
-        AzureEndpoint {
-            scheme: AzureScheme::Http,
-            addressing: Addressing::PathStyle,
-        },
+        AzureScheme::Http,
     )
 }
 
@@ -82,7 +83,8 @@ fn production_operator(channel: &AzureChannelUrl) -> Operator {
     let config = rattler_azure::azblob_config(
         &AzureCredentials::AccountKey(ACCOUNT_KEY.into()),
         channel,
-        azurite_options().endpoint(),
+        &azurite_key(),
+        azurite_options().scheme(),
     )
     .expect("azblob config for an azurite path-style channel");
     Operator::new(config.into_builder())
@@ -124,10 +126,7 @@ async fn ensure_empty_prefix(prefix: &str) {
 /// A signing client for the requests opendal cannot make: it has no operation for
 /// creating a container or reading a block list.
 fn azure_client() -> reqwest_middleware::ClientWithMiddleware {
-    let options = HashMap::from([(
-        AzureHost::parse(AUTHORITY).expect("azurite authority is a valid host:port"),
-        azurite_options(),
-    )]);
+    let options = HashMap::from([(azurite_key(), azurite_options())]);
     reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
         .with(rattler_networking::AzureMiddleware::new(
             reqwest::Client::new(),
@@ -190,7 +189,8 @@ fn index_config(channel: AzureChannelUrl) -> IndexAzureConfig {
     IndexAzureConfig {
         channel,
         credentials: AzureCredentials::AccountKey(ACCOUNT_KEY.into()),
-        endpoint: azurite_options().endpoint(),
+        key: azurite_key(),
+        scheme: azurite_options().scheme(),
         target_platform: None,
         repodata_patch: None,
         write_zst: false,

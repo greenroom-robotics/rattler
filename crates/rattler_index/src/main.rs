@@ -5,7 +5,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::Verbosity;
 #[cfg(feature = "azure")]
-use rattler_azure::{AzureChannelUrl, AzureEndpoint, AzureHost};
+use rattler_azure::{AzureChannelUrl, AzureEndpointKey, AzureScheme};
 use rattler_conda_types::Platform;
 use rattler_config::config::{
     concurrency::default_max_concurrent_solves, index::IndexChannelConfig,
@@ -247,17 +247,18 @@ async fn main() -> anyhow::Result<()> {
                 effective_index_options(&resolved);
             let channel_metadata = ChannelMetadata::from_index_config(&resolved);
 
-            let endpoint = azure_endpoint(&config, channel.host());
+            let (key, scheme) = azure_endpoint(&config, &channel)?;
 
             let credentials = credentials
-                .resolve(AZURE_INDEX_SAS_PERMISSIONS, &channel, endpoint)
+                .resolve(AZURE_INDEX_SAS_PERMISSIONS, &channel, &key, scheme)
                 .await?;
 
             index_azure_with_channel_metadata(
                 IndexAzureConfig {
                     channel,
                     credentials,
-                    endpoint,
+                    key,
+                    scheme,
                     target_platform: cli.target_platform,
                     repodata_patch: cli.repodata_patch,
                     write_zst,
@@ -277,17 +278,33 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How to address a channel's host, from its `[azure-options."<host>"]` entry.
+/// The `azure-options` entry a channel falls under: the key that says where its
+/// account and container are, and the scheme to reach them over.
 ///
 /// A missing entry and an empty entry behave identically, so this never reports
 /// which it found. Grants are not part of the result: indexing signs with the
-/// credential its caller supplied, so there is no ambient chain to gate.
+/// credential its caller supplied, so there is no ambient chain to gate. A URL
+/// matching no entry is read host-style, which fails for a host that names no
+/// account — indexing has to know the account.
 #[cfg(feature = "azure")]
-fn azure_endpoint(config: &Option<Config>, host: &AzureHost) -> AzureEndpoint {
-    config
+fn azure_endpoint(
+    config: &Option<Config>,
+    channel: &AzureChannelUrl,
+) -> anyhow::Result<(AzureEndpointKey, AzureScheme)> {
+    let located = rattler_azure::locate(channel, |key| {
+        config
+            .as_ref()
+            .is_some_and(|config| config.azure_options.contains(key))
+    })?;
+    let key = located
+        .key()
+        .cloned()
+        .ok_or(rattler_azure::AzureUrlError::NoAccount)?;
+    let scheme = config
         .as_ref()
-        .map(|config| config.azure_options.get(host).endpoint())
-        .unwrap_or_default()
+        .map(|config| config.azure_options.get(&key).scheme())
+        .unwrap_or_default();
+    Ok((key, scheme))
 }
 
 /// The `[index-config."…"]` key a channel is looked up under.
@@ -349,8 +366,6 @@ fn effective_index_options(
 
 #[cfg(all(test, feature = "azure"))]
 mod tests {
-    use rattler_azure::{Addressing, AzureScheme};
-
     use super::*;
 
     /// Load a config from TOML through a real file, the way `--config` does.
@@ -380,26 +395,40 @@ mod tests {
         assert_ne!(key.0, channel.wire(AzureScheme::Https).to_string());
     }
 
-    /// All four fields are derived differently under path-style, and a wrong one
-    /// fails silently.
+    /// The key is what tells the index the account is a path segment, and a wrong
+    /// one fails silently.
     #[test]
     fn a_path_style_entry_drives_the_azurite_index_config() {
         let config = config_from(
             r#"
-            [azure-options."127.0.0.1:10000"]
+            [azure-options."127.0.0.1:10000/devstoreaccount1"]
             scheme = "http"
-            path-style = true
 
-            [azure-options."127.0.0.1:10000".auth]
-            "devstoreaccount1/general" = true
+            [azure-options."127.0.0.1:10000/devstoreaccount1".auth]
+            general = true
             "#,
         );
         let channel =
             AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general/mychannel")
                 .unwrap();
 
-        let endpoint = azure_endpoint(&config, channel.host());
-        assert_eq!(endpoint.scheme, AzureScheme::Http);
-        assert_eq!(endpoint.addressing, Addressing::PathStyle);
+        let (key, scheme) = azure_endpoint(&config, &channel).unwrap();
+        assert_eq!(scheme, AzureScheme::Http);
+        assert_eq!(
+            key,
+            AzureEndpointKey::parse("127.0.0.1:10000/devstoreaccount1").unwrap()
+        );
+        assert_eq!(key.container_in(&channel).unwrap().as_str(), "general");
+    }
+
+    /// Without an entry the same channel is read host-style, and an IP literal
+    /// names no account for the index to write to.
+    #[test]
+    fn an_unconfigured_ip_literal_channel_is_refused() {
+        let channel =
+            AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general/mychannel")
+                .unwrap();
+
+        assert!(azure_endpoint(&None, &channel).is_err());
     }
 }
