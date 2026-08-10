@@ -304,13 +304,9 @@ async fn azurite_multi_block_write_keeps_cache_control() {
 }
 
 /// A canary that asserts the *broken* behaviour and fails when upstream fixes it.
-/// Read the failure message before touching the assertions.
-///
-/// `azblob_complete_put_block_list_request` never sets `IF_NONE_MATCH`, so
-/// `if_not_exists` is silently dropped above the 10 MiB chunk size. That is the
-/// gap `upload_package_to_azure`'s pre-write `stat` exists to close.
-///
-/// TODO: revisit once <https://github.com/apache/opendal/pull/7990> merges.
+/// Read the failure message before touching the assertions; the guard this
+/// backstops, and what to delete when opendal#7990 releases, are documented on
+/// `upload_package_to_azure`'s pre-write `stat` in `rattler_upload`.
 ///
 /// It drives the operator rather than `rattler_upload`, which reads no config file
 /// and so cannot be pointed at an emulator, but reuses that crate's chunk size and

@@ -154,18 +154,16 @@ async fn upload_single_package(
     };
 
     // Guard against overwriting an existing blob when `--force` was not passed.
-    // opendal 0.57 only honours `if_not_exists` on the single-shot Put Blob path,
-    // never the multi-block Put Block List path used for packages larger than a
-    // single block, so the writer-level `if_not_exists` silently does nothing for
-    // large uploads. An explicit `stat` closes that gap for a blob that already
-    // exists, but not for two writers racing to create one: above the chunk size
-    // both stat as absent and the second commit wins silently. Concurrent uploads
-    // of the same package are unsafe until opendal carries `if_none_match` onto
-    // the Put Block List path.
     //
-    // TODO: delete this guard and its TOCTOU window once
-    // <https://github.com/apache/opendal/pull/7990> merges — it carries changes
-    // in this area.
+    // TODO(opendal#7990): the fix is merged upstream but unreleased. opendal 0.57
+    // honours `if_not_exists` only on the single-shot Put Blob path, so a package
+    // above `DESIRED_CHUNK_SIZE` commits through Put Block List unguarded. This
+    // `stat` closes that for a blob that already exists, but not for two writers
+    // racing to create one: both stat as absent and the second commit wins.
+    //
+    // On release, delete this guard and rattler_index's canary test
+    // `azurite_if_not_exists_is_dropped_on_the_multi_block_path`, which fails
+    // once it lands. Those two are the only places waiting on it.
     if !force.is_enabled() {
         match op.stat(target.key()).await {
             Ok(_) => {

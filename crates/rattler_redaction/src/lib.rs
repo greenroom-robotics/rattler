@@ -5,10 +5,9 @@ use url::Url;
 /// A default string to use for redaction.
 pub const DEFAULT_REDACTION_STR: &str = "********";
 
-/// Query parameters holding the signature of a pre-signed URL, which is the
-/// credential itself: `sig` for Azure SAS, `x-amz-signature` for S3/SigV4. The
-/// rest of such a URL is inert without them and stays readable.
-const SIGNATURE_PARAMS: &[&str] = &["sig", "x-amz-signature"];
+/// The query parameter holding an Azure SAS signature, which is the credential
+/// itself. The rest of such a URL is inert without it and stays readable.
+const SIGNATURE_PARAM: &str = "sig";
 
 /// Mask the signature of a pre-signed URL wherever one appears in `text`.
 ///
@@ -23,10 +22,7 @@ pub fn redact_signatures_in_text<'a>(text: &'a str, redaction: &str) -> Cow<'a, 
         let Some(equals) = pair.find('=') else {
             continue;
         };
-        if !SIGNATURE_PARAMS
-            .iter()
-            .any(|param| pair[..equals].eq_ignore_ascii_case(param))
-        {
+        if !pair[..equals].eq_ignore_ascii_case(SIGNATURE_PARAM) {
             continue;
         }
 
@@ -167,14 +163,6 @@ mod test {
             format!(
                 "unexpected status code 403, url=https://acct.blob.core.windows.net/c/p?sv=2025-01-05&se=2026-08-05T00%3A00Z&sig={DEFAULT_REDACTION_STR}, op=stat"
             )
-        );
-
-        assert_eq!(
-            redact_signatures_in_text(
-                "https://b.s3.amazonaws.com/k?X-Amz-Credential=AK&X-Amz-Signature=deadbeef",
-                "X"
-            ),
-            "https://b.s3.amazonaws.com/k?X-Amz-Credential=AK&X-Amz-Signature=X"
         );
 
         assert!(matches!(
