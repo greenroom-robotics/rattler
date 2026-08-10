@@ -4,11 +4,13 @@
 //! # Host model
 //!
 //! The host a channel URL names is taken to be the storage endpoint it claims to
-//! be. Credentials, wire scheme and addressing are declared in [`options`], never
-//! inferred from the host name. Scheme and addressing are per host; credentials
-//! are per *container*, the scope Azure's own RBAC has. The default grant is
-//! [`Auth::Anonymous`], so naming a host in a URL by itself sends nothing to it.
-//! Signing and sending live in `rattler_networking`, not here.
+//! be. Credentials and wire scheme are declared in [`options`], never inferred
+//! from the host name, and are keyed by an [`AzureEndpointKey`] — the URL prefix
+//! up to the container, whose shape says where the storage account is. The scheme
+//! is per endpoint; credentials are per *container*, the scope Azure's own RBAC
+//! has. The default grant is [`Auth::Anonymous`], so naming a host in a URL by
+//! itself sends nothing to it. Signing and sending live in `rattler_networking`,
+//! not here.
 //!
 //! Userinfo (`user:pass@host`) is rejected wherever a host is parsed:
 //! `az://real.host@evil.example/…` reads as the real host while addressing the
@@ -19,9 +21,7 @@ pub mod clap;
 
 pub mod options;
 
-pub use options::{
-    Addressing, Auth, AzureEndpoint, AzureEndpointOptions, AzureFetchOptions, AzureScheme,
-};
+pub use options::{Auth, AzureEndpointOptions, AzureFetchOptions, AzureScheme};
 
 pub use secrecy::{ExposeSecret, SecretString};
 use url::Url;
@@ -47,17 +47,24 @@ pub enum AzureUrlError {
     #[error("`{authority}` is not a valid Azure host: {reason}; expected `host` or `host:port`")]
     InvalidHostAuthority { authority: String, reason: String },
 
-    /// Host-style addressing was requested but the host has no account label: it
-    /// is an IP literal, or a domain with only one label.
+    /// The host's first label cannot be a storage account: it is an IP literal,
+    /// or a domain with only one label.
     #[error(
         "Azure blob URL host `{0}` is not a dotted domain of the form `<account>.blob.<suffix>`, \
-         so its first label cannot be a storage account; such a host needs path-style addressing, \
-         where the storage account is the first path segment instead"
+         so its first label cannot be a storage account; such a host needs an `azure-options` key \
+         spelled `{0}/<account>`, which reads the account from the first path segment instead"
     )]
     InvalidHost(String),
 
     #[error("could not derive account name from Azure blob URL")]
     NoAccount,
+
+    /// An `azure-options` key names more than an endpoint and an account.
+    #[error(
+        "`{0}` is not an `azure-options` key: a key is a channel URL prefix up to the container, \
+         so it is spelled `<host>` or `<host>/<account>` and nothing more"
+    )]
+    InvalidKey(String),
 
     #[error("no container in Azure blob URL")]
     NoContainer,
@@ -134,13 +141,6 @@ pub enum AzureUrlError {
          `az://<account>.blob.core.windows.net/<container>/...`: got `{0}`"
     )]
     InvalidScheme(String),
-
-    /// A grant key is not spelled `account/container`.
-    #[error(
-        "`{0}` is not an `<account>/<container>` pair; an `azure-options` grant names both, \
-         because a container name alone does not identify a container under path-style addressing"
-    )]
-    InvalidCoordinates(String),
 }
 
 /// A storage account name that has passed Azure's naming rules: 3-24 characters
@@ -240,47 +240,154 @@ impl From<ContainerName> for String {
     }
 }
 
-/// The account and container an Azure Blob URL addresses.
+/// A host whose first label is the storage account it serves, which is how real
+/// Azure addresses an account.
 ///
-/// This is also the key of an `auth` table in `azure-options`, spelled
-/// `account/container`. Keying on the container alone would be wrong under
-/// path-style addressing, where the account lives in the first path segment
-/// rather than the host: two accounts fronted by one proxy would share a key, and
-/// a grant for your own `accta/general` would credential a request to
-/// `acctb/general`. Azure scopes RBAC per `(account, container)`, so the key does
-/// too — under host-style the account is redundant with the host, but one spelling
-/// at one depth beats a shape that changes with `path-style`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Only [`new`](Self::new) builds one, so a host that carries no usable account
+/// label — an IP literal, a single-label name, a first label Azure would refuse —
+/// has no host-style spelling at all.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AccountHost {
+    host: AzureHost,
+    account: AccountName,
+}
+
+impl AccountHost {
+    pub fn new(host: AzureHost) -> Result<Self, AzureUrlError> {
+        let account = AccountName::new(
+            host.account_label()
+                .ok_or_else(|| AzureUrlError::InvalidHost(host.to_string()))?,
+        )?;
+        Ok(Self { host, account })
+    }
+
+    pub fn host(&self) -> &AzureHost {
+        &self.host
+    }
+
+    pub fn account(&self) -> &AccountName {
+        &self.account
+    }
+}
+
+impl std::fmt::Display for AccountHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.host)
+    }
+}
+
+/// The key of an `azure-options` entry: a channel URL prefix that runs up to, but
+/// not including, the container.
+///
+/// Its shape is what says where the storage account is, so nothing else has to.
+/// `acct.blob.core.windows.net` reads the account off the host;
+/// `proxy.internal/accta` reads it from the first path segment, which is the only
+/// spelling that works for an IP literal or a single-label host, and the only one
+/// that tells two accounts behind one proxy apart. Under both, the container is
+/// the segment right after the key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Deserialize, serde::Serialize),
     serde(try_from = "String", into = "String")
 )]
-pub struct AzureCoordinates {
-    pub account: AccountName,
-    pub container: ContainerName,
+pub enum AzureEndpointKey {
+    /// The account is the host's first label.
+    HostStyle(AccountHost),
+
+    /// The account is the first path segment.
+    PathStyle {
+        host: AzureHost,
+        account: AccountName,
+    },
 }
 
-impl AzureCoordinates {
-    /// Parse the `account/container` spelling used as a grant key.
-    pub fn parse(value: &str) -> Result<Self, AzureUrlError> {
-        let (account, container) = value
-            .split_once('/')
-            .ok_or_else(|| AzureUrlError::InvalidCoordinates(value.to_string()))?;
-        Ok(Self {
-            account: AccountName::new(account)?,
-            container: ContainerName::new(container)?,
-        })
+impl AzureEndpointKey {
+    /// Parse a written key.
+    ///
+    /// A key is a channel URL prefix, so it is parsed as one: `az://{key}` goes
+    /// through [`AzureChannelUrl::parse`], and the host and at most one path
+    /// segment are read back off it. Userinfo rejection, IDNA, ports, empty
+    /// labels, dot segments and percent-escape validation are therefore the same
+    /// here as in the URLs this key is matched against.
+    pub fn parse(key: &str) -> Result<Self, AzureUrlError> {
+        let channel = AzureChannelUrl::parse(&format!("az://{key}"))?;
+        if channel.query.is_some() || channel.fragment.is_some() {
+            return Err(AzureUrlError::InvalidKey(key.to_string()));
+        }
+
+        let segments = channel
+            .path_segments()
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        match segments.as_slice() {
+            [] => Self::host_style(channel.host()),
+            [account] => Ok(Self::PathStyle {
+                host: channel.host().clone(),
+                account: AccountName::new(account)?,
+            }),
+            _ => Err(AzureUrlError::InvalidKey(key.to_string())),
+        }
+    }
+
+    /// The key for a URL read host-style, which is how a URL matching no entry is
+    /// read.
+    pub fn host_style(host: &AzureHost) -> Result<Self, AzureUrlError> {
+        AccountHost::new(host.clone()).map(Self::HostStyle)
+    }
+
+    pub fn host(&self) -> &AzureHost {
+        match self {
+            Self::HostStyle(host) => host.host(),
+            Self::PathStyle { host, .. } => host,
+        }
+    }
+
+    pub fn account(&self) -> &AccountName {
+        match self {
+            Self::HostStyle(host) => host.account(),
+            Self::PathStyle { account, .. } => account,
+        }
+    }
+
+    /// The container `channel` addresses under this key.
+    pub fn container_in(&self, channel: &AzureChannelUrl) -> Result<ContainerName, AzureUrlError> {
+        container_after(channel, Some(self))?.ok_or(AzureUrlError::NoContainer)
+    }
+
+    fn container_segment(&self) -> usize {
+        match self {
+            Self::HostStyle(_) => 0,
+            Self::PathStyle { .. } => 1,
+        }
+    }
+
+    /// How many leading path segments the key and the container consume, and so
+    /// where a channel's root prefix starts.
+    #[cfg(feature = "opendal")]
+    fn segments_before_root(&self) -> usize {
+        self.container_segment() + 1
     }
 }
 
-impl std::fmt::Display for AzureCoordinates {
+impl std::fmt::Display for AzureEndpointKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.account, self.container)
+        match self {
+            Self::HostStyle(host) => write!(f, "{host}"),
+            Self::PathStyle { host, account } => write!(f, "{host}/{account}"),
+        }
     }
 }
 
-impl TryFrom<String> for AzureCoordinates {
+impl std::str::FromStr for AzureEndpointKey {
+    type Err = AzureUrlError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<String> for AzureEndpointKey {
     type Error = AzureUrlError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -288,69 +395,76 @@ impl TryFrom<String> for AzureCoordinates {
     }
 }
 
-impl From<AzureCoordinates> for String {
-    fn from(coordinates: AzureCoordinates) -> Self {
-        coordinates.to_string()
+impl From<AzureEndpointKey> for String {
+    fn from(key: AzureEndpointKey) -> Self {
+        key.to_string()
     }
 }
 
-/// Derive the storage account name and container from an Azure Blob channel URL.
+/// The `azure-options` entry a channel URL falls under, and the container it
+/// addresses under that entry.
 ///
-/// Which part of the URL holds the account is not guessable, since `host/a/b` is
-/// a valid reading under both styles. `addressing` decides:
-///
-/// - [`Addressing::HostStyle`]: account is the first host label, container the
-///   first path segment. The host must be a domain with at least two labels, so
-///   IP literals and single-label hosts fail with
-///   [`AzureUrlError::InvalidHost`].
-/// - [`Addressing::PathStyle`]: account is the first path segment, container the
-///   second.
-///
-/// Both derived names are held to Azure's naming rules under both styles, since
-/// path-style takes the account from user-controlled path text.
-pub fn account_and_container(
-    channel: &AzureChannelUrl,
-    addressing: Addressing,
-) -> Result<AzureCoordinates, AzureUrlError> {
-    let host = channel.host();
-    let container_segment =
-        || segment(channel, addressing.container_segment()).ok_or(AzureUrlError::NoContainer);
-
-    let (account, container) = match addressing {
-        Addressing::HostStyle => {
-            let account = host
-                .account_label()
-                .ok_or_else(|| AzureUrlError::InvalidHost(host.to_string()))?;
-            (account, container_segment()?)
-        }
-        Addressing::PathStyle => (
-            segment(channel, 0).ok_or(AzureUrlError::NoAccount)?,
-            container_segment()?,
-        ),
-    };
-
-    Ok(AzureCoordinates {
-        account: AccountName::new(account)?,
-        container: ContainerName::new(container)?,
-    })
+/// Both come out of one matched key, so they cannot disagree: the container is by
+/// definition the segment right after the key's prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AzureLocation {
+    key: Option<AzureEndpointKey>,
+    container: Option<ContainerName>,
 }
 
-/// The container an Azure Blob URL names, when it names one.
+impl AzureLocation {
+    /// The key the URL matched, or the host-style key it falls back to.
+    ///
+    /// `None` when neither exists: an unconfigured IP literal names no account, so
+    /// there is nothing for a grant to hang off.
+    pub fn key(&self) -> Option<&AzureEndpointKey> {
+        self.key.as_ref()
+    }
+
+    /// `None` when the URL carries no container segment.
+    pub fn container(&self) -> Option<&ContainerName> {
+        self.container.as_ref()
+    }
+}
+
+/// Match a channel URL against the configured entry keys.
 ///
-/// The fetch path's half of [`account_and_container`]. It derives no account, so
-/// a host that cannot carry an account label (an IP literal read host-style) still
-/// fetches.
+/// Both candidates are tried, longest first, so `proxy.internal/accta` wins over
+/// `proxy.internal` where both are configured. A URL matching neither is read
+/// host-style, the shape of the default entry.
+pub fn locate(
+    channel: &AzureChannelUrl,
+    configured: impl Fn(&AzureEndpointKey) -> bool,
+) -> Result<AzureLocation, AzureUrlError> {
+    let host_style = AzureEndpointKey::host_style(channel.host()).ok();
+    let path_style = segment(channel, 0)
+        .and_then(|segment| AccountName::new(segment).ok())
+        .map(|account| AzureEndpointKey::PathStyle {
+            host: channel.host().clone(),
+            account,
+        });
+
+    let key = [path_style, host_style.clone()]
+        .into_iter()
+        .flatten()
+        .find(|key| configured(key))
+        .or(host_style);
+    let container = container_after(channel, key.as_ref())?;
+
+    Ok(AzureLocation { key, container })
+}
+
+/// The container a URL addresses under `key`, the one derivation there is.
 ///
 /// `Ok(None)` means the URL has no container segment, so there is nothing to
 /// attribute a grant to. `Err` means the segment is there but is not a name Azure
 /// allows, which is a malformed endpoint rather than an ungranted one.
-pub fn container(
+fn container_after(
     channel: &AzureChannelUrl,
-    addressing: Addressing,
+    key: Option<&AzureEndpointKey>,
 ) -> Result<Option<ContainerName>, AzureUrlError> {
-    segment(channel, addressing.container_segment())
-        .map(ContainerName::new)
-        .transpose()
+    let index = key.map_or(0, AzureEndpointKey::container_segment);
+    segment(channel, index).map(ContainerName::new).transpose()
 }
 
 fn segment(channel: &AzureChannelUrl, index: usize) -> Option<&str> {
@@ -631,9 +745,9 @@ impl AzureChannelUrl {
     /// The only accepted spelling is `az://<host>/<…>`. A bare `http(s)://` URL is
     /// not accepted, so there is one canonical spelling for an Azure channel.
     ///
-    /// Account and container derivation happens in [`account_and_container`], not
-    /// here: it depends on the host's addressing style, which is config that does
-    /// not exist yet at clap parse time.
+    /// Account and container derivation happens in [`locate`], not here: it
+    /// depends on which [`AzureEndpointKey`] the URL matches, which is config that
+    /// does not exist yet at clap parse time.
     pub fn parse(value: &str) -> Result<Self, AzureUrlError> {
         // URL schemes are case-insensitive and `Url` lowercases them, so `AZ://…`
         // reaches every downstream `scheme() == "az"` comparison as `az`. Matching
@@ -772,8 +886,6 @@ impl AzureChannelUrl {
     }
 
     /// The host, with its port when the URL carries one.
-    ///
-    /// This is also the `azure-options` key for the channel.
     pub fn host(&self) -> &AzureHost {
         &self.host
     }
@@ -839,55 +951,39 @@ fn strip_az_scheme(value: &str) -> Option<&str> {
 }
 
 /// Build an opendal [`AzblobConfig`](opendal::services::AzblobConfig) from a
-/// channel URL, the endpoint options of its host, and credentials.
-///
-/// Account name, endpoint, container and root prefix all come from the channel
-/// URL, read the way `endpoint_options` says to read it. The credentials supply
-/// only the account key or SAS token.
-///
-/// # The two addressing shapes
+/// channel URL, the key it was matched under, its wire scheme and credentials.
 ///
 /// opendal's azblob core builds every request URI as `{endpoint}/{container}/{path}`
-/// and carries no account field, so under path-style the account can only reach
-/// the URL through `endpoint`:
+/// and carries no account field, so under a path-style key the account can only
+/// reach the URL through `endpoint` — which is exactly what the key spells, under
+/// both shapes. `root` is the channel path past the key and the container.
 ///
-/// - [`Addressing::HostStyle`]: `endpoint` is `{scheme}://{host}[:{port}]` and
-///   `root` is the path after the container.
-/// - [`Addressing::PathStyle`]: `endpoint` is
-///   `{scheme}://{host}[:{port}]/{account}` and `root` is the path after *both*
-///   the account and the container.
-///
-/// `account_name` is mandatory under both styles: opendal infers it only from
+/// `account_name` is mandatory under both shapes: opendal infers it only from
 /// three known Azure suffixes and returns `None` rather than an error otherwise,
 /// so omitting it makes shared-key signing quietly never engage and surfaces as a
 /// 403.
 ///
-/// Neither endpoint ends in a slash. `AzblobBuilder::endpoint` trims one, but this
-/// builds the config struct literally, where nothing does.
+/// The endpoint never ends in a slash. `AzblobBuilder::endpoint` trims one, but
+/// this builds the config struct literally, where nothing does.
 #[cfg(feature = "opendal")]
 pub fn azblob_config(
     credentials: &AzureCredentials,
     channel: &AzureChannelUrl,
-    endpoint_options: AzureEndpoint,
+    key: &AzureEndpointKey,
+    scheme: AzureScheme,
 ) -> Result<opendal::services::AzblobConfig, AzureUrlError> {
-    let AzureCoordinates { account, container } =
-        account_and_container(channel, endpoint_options.addressing)?;
-
-    let authority = channel.host();
-    let endpoint = match endpoint_options.addressing {
-        Addressing::HostStyle => format!("{}://{authority}", endpoint_options.scheme),
-        Addressing::PathStyle => format!("{}://{authority}/{account}", endpoint_options.scheme),
-    };
+    let container = key.container_in(channel)?;
+    let endpoint = format!("{scheme}://{key}");
 
     // Percent-decode each segment: `path_segments()` yields still-encoded segments
     // and opendal percent-encodes `root + path` again, so passing them through
     // verbatim would double-encode a prefix containing a space or a `+`.
-    // `account_and_container` has already confirmed the consumed segments exist.
+    // `container_in` has already confirmed the consumed segments exist.
     let root = format!(
         "/{}",
         channel
             .path_segments()
-            .skip(endpoint_options.addressing.segments_before_root())
+            .skip(key.segments_before_root())
             // Infallible in practice: `AzureChannelUrl::parse` rejects a segment that
             // does not decode to UTF-8. Erroring rather than substituting U+FFFD is
             // what keeps that a guarantee instead of an assumption.
@@ -916,7 +1012,7 @@ pub fn azblob_config(
 
     Ok(opendal::services::AzblobConfig {
         endpoint: Some(endpoint),
-        account_name: Some(account.as_str().to_string()),
+        account_name: Some(key.account().as_str().to_string()),
         container: container.as_str().to_string(),
         root: Some(root),
         account_key,
@@ -1064,90 +1160,197 @@ mod tests {
         AzureChannelUrl::parse(url).unwrap_or_else(|err| panic!("{url} should parse: {err}"))
     }
 
-    fn coordinates(account: &str, container: &str) -> AzureCoordinates {
-        AzureCoordinates {
-            account: AccountName::new(account).expect("test account name"),
-            container: ContainerName::new(container).expect("test container name"),
-        }
+    fn key(written: &str) -> AzureEndpointKey {
+        AzureEndpointKey::parse(written)
+            .unwrap_or_else(|err| panic!("{written} should parse as a key: {err}"))
+    }
+
+    /// Locate `url` against a table holding exactly `configured`.
+    fn located(url: &str, configured: &[&str]) -> AzureLocation {
+        let configured = configured.iter().copied().map(key).collect::<Vec<_>>();
+        locate(&channel(url), |candidate| configured.contains(candidate))
+            .unwrap_or_else(|err| panic!("{url} should locate: {err}"))
+    }
+
+    fn container(name: &str) -> ContainerName {
+        ContainerName::new(name).expect("test container name")
     }
 
     #[test]
-    fn normal_url_resolves() {
-        assert_eq!(
-            account_and_container(
-                &channel("az://acct.blob.core.windows.net/general/noarch"),
-                Addressing::HostStyle
-            )
-            .unwrap(),
-            coordinates("acct", "general")
-        );
-    }
-
-    /// The fetch path must find the same container `account_and_container` does
-    /// under both styles, without inheriting its account rules: a host-style IP
-    /// literal has no account label but still has a container.
-    #[test]
-    fn container_is_derived_from_the_addressing() {
-        for (url, addressing, expected) in [
+    fn a_written_key_round_trips() {
+        for (written, canonical) in [
             (
-                "az://acct.blob.core.windows.net/general/noarch",
-                Addressing::HostStyle,
-                "general",
+                "acct.blob.core.windows.net",
+                "acct.blob.core.windows.net",
             ),
             (
-                "az://127.0.0.1:10000/devstoreaccount1/general/noarch",
-                Addressing::PathStyle,
-                "general",
+                "MyCompany.blob.core.windows.net",
+                "mycompany.blob.core.windows.net",
             ),
             (
-                "az://127.0.0.1:10000/general/noarch",
-                Addressing::HostStyle,
-                "general",
+                "acct.blob.core.windows.net.",
+                "acct.blob.core.windows.net",
+            ),
+            (
+                "acct.blob.core.windows.net:443",
+                "acct.blob.core.windows.net:443",
+            ),
+            ("proxy.internal/accta", "proxy.internal/accta"),
+            ("Proxy.Internal./accta", "proxy.internal/accta"),
+            ("ünï.blob.example/accta", "xn--n-nga1b.blob.example/accta"),
+            (
+                "[0:0:0:0:0:0:0:1]:10000/devstoreaccount1",
+                "[::1]:10000/devstoreaccount1",
+            ),
+            (
+                "127.0.0.1:10000/devstoreaccount1",
+                "127.0.0.1:10000/devstoreaccount1",
             ),
         ] {
-            assert_eq!(
-                container(&channel(url), addressing).unwrap(),
-                Some(ContainerName::new(expected).unwrap()),
-                "{url}"
+            let parsed = key(written);
+            assert_eq!(parsed.to_string(), canonical, "{written}");
+            assert_eq!(key(canonical), parsed, "{written}");
+            assert_eq!(hash_of(&key(canonical)), hash_of(&parsed), "{written}");
+        }
+    }
+
+    #[test]
+    fn a_key_past_the_container_is_rejected() {
+        for written in [
+            "proxy.internal/accta/general",
+            "acct.blob.core.windows.net/general/noarch",
+        ] {
+            assert!(
+                matches!(
+                    AzureEndpointKey::parse(written),
+                    Err(AzureUrlError::InvalidKey(_))
+                ),
+                "{written} names past the container"
             );
         }
+    }
 
-        // Where both derivations answer, they must answer the same thing: a grant
-        // looked up for one container and applied to another is a security bug.
-        for (url, addressing) in [
+    /// A key is parsed as the channel URL prefix it is, so the URL parser's
+    /// rejections are the key's too.
+    #[test]
+    fn a_key_inherits_the_channel_url_rejections() {
+        for written in [
+            "acct.blob.core.windows.net@evil.example",
+            "acct.blob.core.windows.net/../accta",
+            "acct.blob.example//accta",
+            "acct.blob.example/acc%zz",
+            "proxy.internal/accta?sv=token",
+            "proxy.internal/accta#frag",
+            "acct.blob.core.windows.net:",
+            "acct..blob.core.windows.net",
+        ] {
+            assert!(
+                AzureEndpointKey::parse(written).is_err(),
+                "expected a rejection for {written}"
+            );
+        }
+    }
+
+    /// A key that names no account could not say which account a grant is for, so
+    /// there is no such key to write.
+    #[test]
+    fn a_key_must_name_an_account() {
+        for written in [
+            "127.0.0.1:10000",
+            "[::1]:10000",
+            "localhost",
+            "localhost.",
+            "azurite:10000",
+            // Azure allows no hyphen in an account name, and a leading `-` would be
+            // option-shaped in the `az` argv.
+            "--as-user.blob.core.windows.net",
+            "acct-1.blob.example",
+        ] {
+            assert!(
+                AzureEndpointKey::parse(written).is_err(),
+                "expected a rejection for {written}"
+            );
+        }
+    }
+
+    /// The container is by construction the segment right after the matched key's
+    /// prefix; a pair that disagreed would look a grant up for one container and
+    /// spend it on another.
+    #[test]
+    fn the_container_follows_the_matched_key() {
+        for (url, configured) in [
+            ("az://acct.blob.core.windows.net/general/noarch", &[][..]),
             (
                 "az://acct.blob.core.windows.net/general/noarch",
-                Addressing::HostStyle,
+                &["acct.blob.core.windows.net"],
             ),
+            (
+                "az://proxy.internal/accta/general/noarch",
+                &["proxy.internal/accta"],
+            ),
+            ("az://proxy.internal/accta/general", &["proxy.internal"]),
+            ("az://127.0.0.1:10000/devstoreaccount1/general", &[]),
             (
                 "az://127.0.0.1:10000/devstoreaccount1/general",
-                Addressing::PathStyle,
+                &["127.0.0.1:10000/devstoreaccount1"],
             ),
         ] {
-            assert_eq!(
-                container(&channel(url), addressing).unwrap(),
-                Some(
-                    account_and_container(&channel(url), addressing)
-                        .unwrap()
-                        .container
-                ),
-                "{url}"
+            let located = located(url, configured);
+            let Some(container) = located.container() else {
+                panic!("{url} names a container");
+            };
+            let prefix = match located.key() {
+                Some(AzureEndpointKey::PathStyle { account, .. }) => format!("/{account}"),
+                Some(AzureEndpointKey::HostStyle(_)) | None => String::new(),
+            };
+            assert!(
+                channel(url)
+                    .canonical()
+                    .path()
+                    .starts_with(&format!("{prefix}/{container}")),
+                "{url}: `{container}` does not follow `{prefix}`"
             );
         }
+    }
+
+    #[test]
+    fn the_longest_configured_key_wins() {
+        let url = "az://proxy.internal/accta/general/noarch";
+
+        let both = located(url, &["proxy.internal", "proxy.internal/accta"]);
+        assert_eq!(both.key(), Some(&key("proxy.internal/accta")));
+        assert_eq!(both.container(), Some(&container("general")));
+
+        let host_only = located(url, &["proxy.internal"]);
+        assert_eq!(host_only.key(), Some(&key("proxy.internal")));
+        assert_eq!(host_only.container(), Some(&container("accta")));
+    }
+
+    /// An unconfigured IP literal is read host-style, which names no account — so
+    /// it has no key, and nothing a grant could hang off.
+    #[test]
+    fn an_unmatched_url_falls_back_to_host_style() {
+        let anonymous = located("az://127.0.0.1:10000/devstoreaccount1/general", &[]);
+        assert_eq!(anonymous.key(), None);
+        assert_eq!(anonymous.container(), Some(&container("devstoreaccount1")));
+
+        let azure = located("az://acct.blob.core.windows.net/general/noarch", &[]);
+        assert_eq!(azure.key(), Some(&key("acct.blob.core.windows.net")));
+        assert_eq!(azure.container(), Some(&container("general")));
     }
 
     #[test]
     fn a_url_without_a_container_names_none() {
-        for (url, addressing) in [
-            ("az://acct.blob.core.windows.net", Addressing::HostStyle),
-            ("az://acct.blob.core.windows.net/", Addressing::HostStyle),
+        for (url, configured) in [
+            ("az://acct.blob.core.windows.net", &[][..]),
+            ("az://acct.blob.core.windows.net/", &[]),
             (
                 "az://127.0.0.1:10000/devstoreaccount1",
-                Addressing::PathStyle,
+                &["127.0.0.1:10000/devstoreaccount1"],
             ),
-            ("az://127.0.0.1:10000/", Addressing::PathStyle),
+            ("az://127.0.0.1:10000/", &[]),
         ] {
-            assert_eq!(container(&channel(url), addressing).unwrap(), None, "{url}");
+            assert_eq!(located(url, configured).container(), None, "{url}");
         }
     }
 
@@ -1157,8 +1360,10 @@ mod tests {
             "az://acct.blob.core.windows.net/General/noarch",
             "az://acct.blob.core.windows.net/ab/noarch",
             "az://acct.blob.core.windows.net/a--b/noarch",
+            "az://acct.blob.core.windows.net/general;evil/noarch",
+            "az://acct.blob.core.windows.net/-o/noarch",
         ] {
-            let err = container(&channel(url), Addressing::HostStyle)
+            let err = locate(&channel(url), |_| false)
                 .expect_err("an illegal container name must be reported");
             assert!(
                 matches!(err, AzureUrlError::InvalidContainerName(_)),
@@ -1180,62 +1385,29 @@ mod tests {
     }
 
     /// Azure's naming rules keep injection-shaped values out of the `az`
-    /// subprocess, so they must hold under path-style too, where the account comes
+    /// subprocess, so a path-style key is held to them too: it takes the account
     /// from user-controlled path text.
     #[test]
-    fn invalid_component_names_are_rejected_under_both_styles() {
-        assert!(matches!(
-            account_and_container(
-                &channel("az://acct.blob.core.windows.net/general;evil/noarch"),
-                Addressing::HostStyle
-            ),
-            Err(AzureUrlError::InvalidContainerName(_))
-        ));
-
-        for (path, account_at_fault) in [
-            ("az://127.0.0.1:10000/devstore;evil/general", true),
-            ("az://127.0.0.1:10000/DevStoreAccount1/general", true),
+    fn an_account_a_key_names_is_held_to_azures_rules() {
+        for written in [
+            "127.0.0.1:10000/devstore;evil",
+            "127.0.0.1:10000/DevStoreAccount1",
             // Azure allows no hyphen at all in an account name.
-            ("az://127.0.0.1:10000/dev-store/general", true),
+            "127.0.0.1:10000/dev-store",
             // Too short for Azure, whatever the charset says.
-            ("az://127.0.0.1:10000/ab/general", true),
-            ("az://127.0.0.1:10000/devstoreaccount1/general;evil", false),
-            ("az://127.0.0.1:10000/devstoreaccount1/ab", false),
-            ("az://127.0.0.1:10000/devstoreaccount1/a--b", false),
-            ("az://127.0.0.1:10000/devstoreaccount1/-general", false),
-            ("az://127.0.0.1:10000/devstoreaccount1/general-", false),
+            "127.0.0.1:10000/ab",
+            // A leading `-` is inside `[a-z0-9-]` and option-shaped in the `az`
+            // argv.
+            "127.0.0.1:10000/-o",
+            "127.0.0.1:10000/--as-user",
         ] {
-            let Err(err) = account_and_container(&channel(path), Addressing::PathStyle) else {
-                panic!("expected a rejection for {path}");
-            };
-            let matched = if account_at_fault {
-                matches!(err, AzureUrlError::InvalidAccountName(_))
-            } else {
-                matches!(err, AzureUrlError::InvalidContainerName(_))
-            };
-            assert!(matched, "unexpected error for {path}: {err}");
-        }
-    }
-
-    /// A charset of `[a-z0-9-]` alone does not keep option-shaped values out of
-    /// the `az` argv, because a leading `-` is inside it.
-    #[test]
-    fn option_shaped_components_are_rejected() {
-        for (url, account_at_fault) in [
-            ("az://--as-user.blob.core.windows.net/general", true),
-            ("az://-o.blob.core.windows.net/general", true),
-            ("az://acct.blob.core.windows.net/--https-only/noarch", false),
-            ("az://acct.blob.core.windows.net/-o/noarch", false),
-        ] {
-            let Err(err) = account_and_container(&channel(url), Addressing::HostStyle) else {
-                panic!("expected a rejection for {url}");
-            };
-            let matched = if account_at_fault {
-                matches!(err, AzureUrlError::InvalidAccountName(_))
-            } else {
-                matches!(err, AzureUrlError::InvalidContainerName(_))
-            };
-            assert!(matched, "unexpected error for {url}: {err}");
+            assert!(
+                matches!(
+                    AzureEndpointKey::parse(written),
+                    Err(AzureUrlError::InvalidAccountName(_))
+                ),
+                "expected a rejection for {written}"
+            );
         }
     }
 
@@ -1246,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    fn path_style_derives_account_from_first_segment() {
+    fn a_path_style_key_takes_the_account_off_any_host() {
         for host in [
             "127.0.0.1:10000",
             "[::1]:10000",
@@ -1255,32 +1427,35 @@ mod tests {
             "azurite",
             "localhost",
         ] {
+            let key = key(&format!("{host}/devstoreaccount1"));
+            assert_eq!(key.account().as_str(), "devstoreaccount1", "{host}");
             assert_eq!(
-                account_and_container(
-                    &channel(&format!("az://{host}/devstoreaccount1/general/noarch")),
-                    Addressing::PathStyle
-                )
+                key.container_in(&channel(&format!(
+                    "az://{host}/devstoreaccount1/general/noarch"
+                )))
                 .unwrap(),
-                coordinates("devstoreaccount1", "general"),
-                "path-style derivation failed for {host}"
+                container("general"),
+                "{host}"
             );
         }
     }
 
     #[test]
-    fn path_style_needs_two_segments() {
-        assert!(matches!(
-            account_and_container(
-                &channel("az://127.0.0.1:10000/devstoreaccount1"),
-                Addressing::PathStyle
+    fn a_url_short_of_the_container_has_none_to_address() {
+        for (written, url) in [
+            (
+                "127.0.0.1:10000/devstoreaccount1",
+                "az://127.0.0.1:10000/devstoreaccount1",
             ),
-            Err(AzureUrlError::NoContainer)
-        ));
-
-        for empty in ["az://127.0.0.1:10000/", "az://127.0.0.1:10000"] {
+            ("127.0.0.1:10000/devstoreaccount1", "az://127.0.0.1:10000/"),
+            (
+                "acct.blob.core.windows.net",
+                "az://acct.blob.core.windows.net",
+            ),
+        ] {
             assert!(matches!(
-                account_and_container(&channel(empty), Addressing::PathStyle),
-                Err(AzureUrlError::NoAccount)
+                key(written).container_in(&channel(url)),
+                Err(AzureUrlError::NoContainer)
             ));
         }
     }
@@ -1318,9 +1493,10 @@ mod tests {
         }
     }
 
-    /// Host-style must reject hosts it cannot derive an account from.
+    /// A host-style key must be refused for a host it cannot derive an account
+    /// from, and the message must say which key to write instead.
     #[test]
-    fn host_style_rejects_undottable_hosts() {
+    fn a_host_style_key_rejects_undottable_hosts() {
         for host in [
             "127.0.0.1:10000",
             "azurite:10000",
@@ -1333,11 +1509,10 @@ mod tests {
             "azurite:443",
             "azurite:80",
         ] {
-            let channel = channel(&format!("az://{host}/devstoreaccount1/general"));
-            let err = account_and_container(&channel, Addressing::HostStyle)
-                .expect_err("host-style must not accept an undottable host");
+            let err = AzureEndpointKey::host_style(&AzureHost::parse(host).unwrap())
+                .expect_err("a host-style key must not accept an undottable host");
             assert!(matches!(err, AzureUrlError::InvalidHost(_)), "{err}");
-            assert!(err.to_string().contains("path-style"), "{err}");
+            assert!(err.to_string().contains("/<account>"), "{err}");
         }
     }
 
@@ -1596,10 +1771,10 @@ mod tests {
         assert!(AzureHost::parse(&at_limit).is_ok());
     }
 
-    fn hash_of(host: &AzureHost) -> u64 {
-        use std::hash::{Hash, Hasher};
+    fn hash_of(value: &impl std::hash::Hash) -> u64 {
+        use std::hash::Hasher;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        host.hash(&mut hasher);
+        value.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -1616,10 +1791,8 @@ mod tests {
         let config = azblob_config(
             &AzureCredentials::AccountKey("key".into()),
             &channel,
-            AzureEndpoint {
-                scheme: AzureScheme::Http,
-                addressing: Addressing::PathStyle,
-            },
+            &key("127.0.0.1:10000/devstoreaccount1"),
+            AzureScheme::Http,
         )
         .unwrap();
 
@@ -1655,10 +1828,8 @@ mod tests {
         let config = azblob_config(
             &AzureCredentials::SasToken("?sv=token".into()),
             &channel,
-            AzureEndpoint {
-                scheme: AzureScheme::Http,
-                addressing: Addressing::PathStyle,
-            },
+            &key("127.0.0.1:10000/devstoreaccount1"),
+            AzureScheme::Http,
         )
         .unwrap();
 
@@ -1676,7 +1847,8 @@ mod tests {
         let config = azblob_config(
             &AzureCredentials::SasToken("sv=token".into()),
             &channel,
-            AzureEndpoint::default(),
+            &key("stcondachannel.blob.core.windows.net"),
+            AzureScheme::Https,
         )
         .unwrap();
 
@@ -1699,19 +1871,12 @@ mod tests {
         let config = azblob_config(
             &AzureCredentials::AccountKey("key".into()),
             &channel,
-            AzureEndpoint::default(),
+            &key("acct.blob.core.windows.net"),
+            AzureScheme::Https,
         )
         .unwrap();
 
         assert_eq!(config.root.as_deref(), Some("/with space"));
-    }
-
-    #[test]
-    fn parse_defers_account_derivation() {
-        let channel = channel("az://127.0.0.1:10000/devstoreaccount1/general");
-
-        assert!(account_and_container(&channel, Addressing::HostStyle).is_err());
-        assert!(account_and_container(&channel, Addressing::PathStyle).is_ok());
     }
 
     /// Under path-style the rewrite moves the *account* too, so a channel URL that
@@ -1822,7 +1987,7 @@ mod tests {
         ));
 
         // An encoded slash past the container is a blob name containing a slash,
-        // which Azure supports. It cannot move the container: `container()` reads a
+        // which Azure supports. It cannot move the container, which is read from a
         // separate raw segment, and `ContainerName`'s charset admits neither `/`
         // nor `%`, so the boundary is held by the type rather than by banning the
         // escape everywhere.
@@ -1830,10 +1995,9 @@ mod tests {
             "az://acct.blob.core.windows.net/general/a%2Fb",
             "az://acct.blob.core.windows.net/general/a%2fb",
         ] {
-            let parsed = channel(input);
             assert_eq!(
-                container(&parsed, Addressing::HostStyle).unwrap(),
-                Some(ContainerName::new("general").unwrap()),
+                located(input, &[]).container(),
+                Some(&container("general")),
                 "{input}"
             );
         }
@@ -1863,11 +2027,12 @@ mod tests {
     #[cfg(feature = "clap")]
     #[test]
     fn https_only_follows_the_configured_scheme() {
-        let coordinates = coordinates("acct", "general");
+        let key = key("acct.blob.core.windows.net");
+        let container = container("general");
         let args = |scheme| {
             generate_sas_args(
-                &coordinates.account,
-                &coordinates.container,
+                key.account(),
+                &container,
                 "cw",
                 "2030-01-01T00:00:00Z",
                 scheme,

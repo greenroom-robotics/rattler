@@ -5,8 +5,8 @@ use clap::Parser;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
-    AzureChannelUrl, AzureCliSasError, AzureCoordinates, AzureCredentials, AzureEndpoint,
-    AzureUrlError, account_and_container, mint_user_delegation_sas,
+    AzureChannelUrl, AzureCliSasError, AzureCredentials, AzureEndpointKey, AzureScheme,
+    AzureUrlError, mint_user_delegation_sas,
 };
 
 /// Default lifetime, in minutes, of a SAS minted from an `az login` session.
@@ -55,29 +55,31 @@ pub enum AzureAuthSource {
 impl AzureAuthSource {
     /// Resolve this source into concrete [`AzureCredentials`].
     ///
-    /// `permissions`, `channel` and `endpoint` are consulted only for the
+    /// `permissions`, `channel`, `key` and `scheme` are consulted only for the
     /// [`AzureAuthSource::AzureCli`] arm, which mints a SAS scoped to the
-    /// channel's container. Taking the channel and its endpoint rather than
-    /// pre-derived coordinates keeps the account the SAS is minted for and the
-    /// scheme it is restricted to from coming from two different places.
+    /// channel's container. Taking the channel and its key rather than a
+    /// pre-derived account and container keeps the account the SAS is minted for
+    /// and the container it is scoped to from coming from two different places.
     pub async fn resolve(
         self,
         permissions: &str,
         channel: &AzureChannelUrl,
-        endpoint: AzureEndpoint,
+        key: &AzureEndpointKey,
+        scheme: AzureScheme,
     ) -> Result<AzureCredentials, AzureCredentialsError> {
         match self {
-            AzureAuthSource::AccountKey(key) => Ok(AzureCredentials::AccountKey(key)),
+            AzureAuthSource::AccountKey(account_key) => {
+                Ok(AzureCredentials::AccountKey(account_key))
+            }
             AzureAuthSource::SasToken(token) => Ok(AzureCredentials::SasToken(token)),
             AzureAuthSource::AzureCli { ttl } => {
-                let AzureCoordinates { account, container } =
-                    account_and_container(channel, endpoint.addressing)?;
+                let container = key.container_in(channel)?;
                 let token = mint_user_delegation_sas(
-                    &account,
+                    key.account(),
                     &container,
                     permissions,
                     ttl,
-                    endpoint.scheme,
+                    scheme,
                 )
                 .await?;
                 Ok(AzureCredentials::SasToken(token))
@@ -228,9 +230,12 @@ impl AzureCredentialsOpts {
         self,
         permissions: &str,
         channel: &AzureChannelUrl,
-        endpoint: AzureEndpoint,
+        key: &AzureEndpointKey,
+        scheme: AzureScheme,
     ) -> Result<AzureCredentials, AzureCredentialsError> {
-        self.source()?.resolve(permissions, channel, endpoint).await
+        self.source()?
+            .resolve(permissions, channel, key, scheme)
+            .await
     }
 }
 
@@ -257,40 +262,39 @@ mod tests {
         }
     }
 
-    /// A channel whose coordinates cannot be derived under `endpoint`, proving
-    /// that resolving a verbatim credential does not need them.
-    fn underivable() -> (AzureChannelUrl, AzureEndpoint) {
-        let channel =
-            AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general").unwrap();
-        let endpoint = AzureEndpoint::default();
-        assert!(account_and_container(&channel, endpoint.addressing).is_err());
-        (channel, endpoint)
+    /// A channel whose container the key cannot address, proving that resolving a
+    /// verbatim credential does not need it.
+    fn unaddressable() -> (AzureChannelUrl, AzureEndpointKey) {
+        let channel = AzureChannelUrl::parse("az://acct.blob.core.windows.net").unwrap();
+        let key = AzureEndpointKey::host_style(channel.host()).unwrap();
+        assert!(key.container_in(&channel).is_err());
+        (channel, key)
     }
 
     #[tokio::test]
     async fn account_key_resolves() {
-        let (channel, endpoint) = underivable();
+        let (channel, key) = unaddressable();
         assert!(matches!(
-            opts(Some("key"), None, false).resolve("cw", &channel, endpoint).await,
+            opts(Some("key"), None, false).resolve("cw", &channel, &key, AzureScheme::Https).await,
             Ok(AzureCredentials::AccountKey(k)) if k.expose_secret() == "key"
         ));
     }
 
     #[tokio::test]
     async fn sas_token_resolves() {
-        let (channel, endpoint) = underivable();
+        let (channel, key) = unaddressable();
         assert!(matches!(
-            opts(None, Some("sv=..."), false).resolve("cw", &channel, endpoint).await,
+            opts(None, Some("sv=..."), false).resolve("cw", &channel, &key, AzureScheme::Https).await,
             Ok(AzureCredentials::SasToken(t)) if t.expose_secret() == "sv=..."
         ));
     }
 
     #[tokio::test]
     async fn none_is_rejected() {
-        let (channel, endpoint) = underivable();
+        let (channel, key) = unaddressable();
         assert!(matches!(
             opts(None, None, false)
-                .resolve("cw", &channel, endpoint)
+                .resolve("cw", &channel, &key, AzureScheme::Https)
                 .await,
             Err(AzureCredentialsError::Missing)
         ));

@@ -1,12 +1,12 @@
-//! Per-host endpoint options for Azure Blob channels.
+//! Per-endpoint options for Azure Blob channels.
 //!
-//! An entry in the `azure-options` config table is the only thing that grants a
-//! host or one of its containers anything. Without one, a channel on that host is
-//! fetched anonymously over https in host-style addressing. There is no hardcoded
-//! list of "official" Azure suffixes, which is what lets custom endpoints and the
-//! Azurite emulator work.
+//! An entry in the `azure-options` config table is the only thing that grants an
+//! endpoint or one of its containers anything. Without one, a channel is fetched
+//! anonymously over https and read host-style. There is no hardcoded list of
+//! "official" Azure suffixes, which is what lets custom endpoints and the Azurite
+//! emulator work.
 
-use crate::AzureCoordinates;
+use crate::ContainerName;
 
 /// Whether credentials may attach to requests for a container.
 ///
@@ -87,79 +87,7 @@ impl std::fmt::Display for AzureScheme {
     }
 }
 
-/// Where the storage account name is found in a blob URL.
-///
-/// Defaults to [`Addressing::HostStyle`], which is how real Azure addresses
-/// accounts. Serializes as the bool `path-style` in `azure-options`.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize),
-    serde(from = "bool", into = "bool")
-)]
-pub enum Addressing {
-    /// `<account>.blob.core.windows.net/<container>`. Requires a domain with at
-    /// least two labels, so IP literals and single-label hosts cannot be addressed
-    /// this way.
-    #[default]
-    HostStyle,
-
-    /// `<host>/<account>/<container>`. What Azurite and other emulators use, and
-    /// the only form that works for an IP or single-label host.
-    PathStyle,
-}
-
-impl Addressing {
-    /// Which path segment holds the container name under this addressing.
-    ///
-    /// One number for both [`account_and_container`](crate::account_and_container)
-    /// and [`container`](crate::container). If they disagreed, a grant looked up
-    /// for one container would be applied to another.
-    pub(crate) fn container_segment(self) -> usize {
-        match self {
-            // `<account>.host/<container>/…`
-            Addressing::HostStyle => 0,
-            // `host/<account>/<container>/…`
-            Addressing::PathStyle => 1,
-        }
-    }
-
-    /// How many leading path segments the account and container consume, and so
-    /// where a channel's root prefix starts.
-    #[cfg(feature = "opendal")]
-    pub(crate) fn segments_before_root(self) -> usize {
-        self.container_segment() + 1
-    }
-}
-
-impl From<bool> for Addressing {
-    fn from(value: bool) -> Self {
-        if value {
-            Addressing::PathStyle
-        } else {
-            Addressing::HostStyle
-        }
-    }
-}
-
-impl From<Addressing> for bool {
-    fn from(value: Addressing) -> Self {
-        matches!(value, Addressing::PathStyle)
-    }
-}
-
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AzureEndpoint {
-    pub scheme: AzureScheme,
-
-    pub addressing: Addressing,
-}
-
 /// What the fetch middleware needs to send one request.
-///
-/// [`Addressing`] is absent because the grant is already resolved by the time this
-/// exists: [`AzureEndpointOptions::fetch`] used the addressing to find the
-/// container, and the fetch path never derives an account name.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AzureFetchOptions {
     pub auth: Auth,
@@ -174,15 +102,14 @@ pub struct AzureFetchOptions {
 /// that view is the only way in. The default value is the no-entry behaviour, so
 /// callers can look an absent host up and fall back to `default()`.
 ///
-/// # Why the grant is per container and the endpoint is per host
+/// # Why the grant is per container
 ///
 /// Azure assigns RBAC per *container*, so one storage account routinely holds a
-/// mix of private and anonymous-read containers. A per-host grant cannot express
-/// that: signing the anonymous-read container 403s, and not signing breaks the
-/// private ones. `scheme` and `addressing` describe the endpoint, where two
-/// containers disagreeing about where the account name lives is a contradiction.
+/// mix of private and anonymous-read containers. A per-account grant cannot
+/// express that: signing the anonymous-read container 403s, and not signing
+/// breaks the private ones.
 ///
-/// There is therefore no host-level `auth` field at all. It is absent from the
+/// There is therefore no entry-level `auth` field at all. It is absent from the
 /// type rather than defaulted to false, so the one setting whose blast radius
 /// would be every container on the account is unrepresentable. The worst typo
 /// here grants one container.
@@ -190,7 +117,6 @@ pub struct AzureFetchOptions {
 /// ```toml
 /// [azure-options."mycompany.blob.core.windows.net"]
 /// scheme = "https"
-/// path-style = false
 ///
 /// [azure-options."mycompany.blob.core.windows.net".auth]
 /// releases = true
@@ -211,11 +137,7 @@ pub struct AzureFetchOptions {
 pub struct AzureEndpointOptions {
     scheme: AzureScheme,
 
-    #[cfg_attr(feature = "serde", serde(rename = "path-style", alias = "path_style"))]
-    addressing: Addressing,
-
-    /// Which containers on this host may be sent credentials, keyed
-    /// `account/container`.
+    /// Which containers under this key may be sent credentials.
     ///
     /// An explicit `false` is legal and redundant with omission, so a
     /// higher-precedence config file can revoke rather than only add.
@@ -226,38 +148,32 @@ pub struct AzureEndpointOptions {
         feature = "serde",
         serde(skip_serializing_if = "indexmap::IndexMap::is_empty")
     )]
-    auth: indexmap::IndexMap<AzureCoordinates, Auth>,
+    auth: indexmap::IndexMap<ContainerName, Auth>,
 }
 
 impl AzureEndpointOptions {
     pub fn new(
-        auth: impl IntoIterator<Item = (AzureCoordinates, Auth)>,
-        endpoint: AzureEndpoint,
+        auth: impl IntoIterator<Item = (ContainerName, Auth)>,
+        scheme: AzureScheme,
     ) -> Self {
         Self {
-            scheme: endpoint.scheme,
-            addressing: endpoint.addressing,
+            scheme,
             auth: auth.into_iter().collect(),
         }
     }
 
-    pub fn endpoint(&self) -> AzureEndpoint {
-        AzureEndpoint {
-            scheme: self.scheme,
-            addressing: self.addressing,
-        }
+    pub fn scheme(&self) -> AzureScheme {
+        self.scheme
     }
 
     /// The grant and wire scheme for one container, for the fetch path.
     ///
-    /// `coordinates` is an `Option` because a URL need not resolve to a pair —
-    /// a host-style IP literal carries no account label. That case is answered
-    /// here rather than at the call site, and can only mean anonymous: there is no
-    /// entry it could match.
-    pub fn fetch(&self, coordinates: Option<&AzureCoordinates>) -> AzureFetchOptions {
+    /// `container` is an `Option` because a URL need not name one. That case is
+    /// answered here rather than at the call site, and can only mean anonymous.
+    pub fn fetch(&self, container: Option<&ContainerName>) -> AzureFetchOptions {
         AzureFetchOptions {
-            auth: coordinates
-                .and_then(|coordinates| self.auth.get(coordinates))
+            auth: container
+                .and_then(|container| self.auth.get(container))
                 .copied()
                 .unwrap_or_default(),
             scheme: self.scheme,
@@ -268,10 +184,8 @@ impl AzureEndpointOptions {
     ///
     /// Includes the explicit `false`s: a caller validating or listing the table
     /// needs what the file says, not what it effectively means.
-    pub fn grants(&self) -> impl Iterator<Item = (&AzureCoordinates, Auth)> {
-        self.auth
-            .iter()
-            .map(|(coordinates, auth)| (coordinates, *auth))
+    pub fn grants(&self) -> impl Iterator<Item = (&ContainerName, Auth)> {
+        self.auth.iter().map(|(container, auth)| (container, *auth))
     }
 }
 
@@ -279,8 +193,8 @@ impl AzureEndpointOptions {
 mod tests {
     use super::*;
 
-    fn container(name: &str) -> AzureCoordinates {
-        AzureCoordinates::parse(&format!("acct/{name}")).expect("test coordinates")
+    fn container(name: &str) -> ContainerName {
+        ContainerName::new(name).expect("test container name")
     }
 
     #[test]
@@ -288,10 +202,9 @@ mod tests {
         let opts: AzureEndpointOptions = toml::from_str(
             r#"
             scheme = "http"
-            path-style = true
 
             [auth]
-            "acct/releases" = true
+            releases = true
             "#,
         )
         .unwrap();
@@ -299,10 +212,7 @@ mod tests {
             opts,
             AzureEndpointOptions::new(
                 [(container("releases"), Auth::DefaultChain)],
-                AzureEndpoint {
-                    scheme: AzureScheme::Http,
-                    addressing: Addressing::PathStyle,
-                },
+                AzureScheme::Http,
             )
         );
 
@@ -313,7 +223,7 @@ mod tests {
             AzureFetchOptions::default()
         );
         assert!(!empty.fetch(Some(&container("releases"))).auth.is_granted());
-        assert_eq!(empty.endpoint(), AzureEndpoint::default());
+        assert_eq!(empty.scheme(), AzureScheme::default());
     }
 
     #[test]
@@ -321,8 +231,8 @@ mod tests {
         let opts: AzureEndpointOptions = toml::from_str(
             r#"
             [auth]
-            "acct/releases" = true
-            "acct/public" = false
+            releases = true
+            public = false
             "#,
         )
         .unwrap();
@@ -347,19 +257,9 @@ mod tests {
 
     #[test]
     fn an_unusable_container_key_is_rejected() {
-        let err = toml::from_str::<AzureEndpointOptions>("[auth]\n\"acct/Releases\" = true\n")
+        let err = toml::from_str::<AzureEndpointOptions>("[auth]\nReleases = true\n")
             .expect_err("uppercase is not a legal container name");
         assert!(err.to_string().contains("Releases"), "{err}");
-    }
-
-    /// A container name alone does not identify a container: under path-style the
-    /// account comes from the first path segment, so `general` on a proxy fronting
-    /// two accounts would name both.
-    #[test]
-    fn a_grant_key_must_name_an_account() {
-        let err = toml::from_str::<AzureEndpointOptions>("[auth]\ngeneral = true\n")
-            .expect_err("a bare container name is not a grant key");
-        assert!(err.to_string().contains("general"), "{err}");
     }
 
     /// A misspelled field is a grant that can never match, and Azure reports the
@@ -368,9 +268,9 @@ mod tests {
     #[test]
     fn an_unknown_field_is_rejected() {
         for document in [
-            "[Auth]\n\"acct/releases\" = true\n",
-            "[authz]\n\"acct/releases\" = true\n",
-            "pathstyle = true\n",
+            "[Auth]\nreleases = true\n",
+            "[authz]\nreleases = true\n",
+            "path-style = true\n",
         ] {
             assert!(
                 toml::from_str::<AzureEndpointOptions>(document).is_err(),
@@ -386,15 +286,11 @@ mod tests {
                 (container("releases"), Auth::DefaultChain),
                 (container("public"), Auth::Anonymous),
             ],
-            AzureEndpoint {
-                scheme: AzureScheme::Http,
-                addressing: Addressing::PathStyle,
-            },
+            AzureScheme::Http,
         ))
         .unwrap();
-        assert!(toml.contains(r#""acct/releases" = true"#), "{toml}");
-        assert!(toml.contains(r#""acct/public" = false"#), "{toml}");
-        assert!(toml.contains("path-style = true"), "{toml}");
+        assert!(toml.contains("releases = true"), "{toml}");
+        assert!(toml.contains("public = false"), "{toml}");
         assert!(toml.contains(r#"scheme = "http""#), "{toml}");
         assert!(!toml.contains("DefaultChain"), "{toml}");
 
