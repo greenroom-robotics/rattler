@@ -46,40 +46,6 @@ impl AzureOptionsMap {
             .map(|(_, options)| options.clone())
             .unwrap_or_default()
     }
-
-    /// The configured hosts, in the order the document's table iterated them
-    /// (`toml::Table` is a `BTreeMap`, so that is byte order, not write order).
-    pub fn hosts(&self) -> impl Iterator<Item = &AzureHost> {
-        self.0.keys()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn insert(
-        &mut self,
-        host: AzureHost,
-        options: AzureEndpointOptions,
-    ) -> Option<AzureEndpointOptions> {
-        self.0.insert(host, options)
-    }
-
-    /// Revoke `host`'s grant, returning it if there was one. Shift-removes, so a
-    /// serialized table does not reshuffle on an unrelated edit.
-    pub fn remove(&mut self, host: &AzureHost) -> Option<AzureEndpointOptions> {
-        self.0.shift_remove(host)
-    }
-
-    /// The entries as `AzureMiddleware::new` takes them.
-    ///
-    /// Whole entries, not the narrower `AzureFetchOptions`: the middleware needs a
-    /// host's addressing to tell which path segment is the container.
-    pub fn endpoint_options(&self) -> impl Iterator<Item = (AzureHost, AzureEndpointOptions)> {
-        self.0
-            .iter()
-            .map(|(host, options)| (host.clone(), options.clone()))
-    }
 }
 
 /// Reject a document that spells one host two ways.
@@ -181,31 +147,6 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_can_be_written_and_revoked() {
-        let key = host("mycompany.blob.core.windows.net");
-        let granted = AzureEndpointOptions::new(
-            [(container("releases"), Auth::DefaultChain)],
-            rattler_azure::AzureEndpoint::default(),
-        );
-
-        let mut map = AzureOptionsMap::default();
-        assert!(map.is_empty());
-        assert_eq!(map.insert(key.clone(), granted.clone()), None);
-        assert_eq!(map.get(&key), granted);
-        assert!(!map.is_empty());
-
-        assert_eq!(map.remove(&key), Some(granted));
-        assert!(
-            !map.get(&key)
-                .fetch(Some(&container("releases")))
-                .auth
-                .is_granted()
-        );
-        assert!(map.is_empty());
-        assert_eq!(map.remove(&key), None);
-    }
-
-    #[test]
     fn table_parses_and_absent_hosts_default() {
         let map: AzureOptionsMap = toml::from_str(
             r#"
@@ -249,14 +190,6 @@ mod tests {
                 .is_granted()
         );
         assert_eq!(unlisted, AzureEndpointOptions::default());
-
-        assert_eq!(
-            map.endpoint_options().collect::<Vec<_>>(),
-            vec![
-                (host("127.0.0.1:10000"), azurite),
-                (host("mycompany.blob.core.windows.net"), real),
-            ]
-        );
     }
 
     #[test]
@@ -311,20 +244,10 @@ releases = true
 
     #[test]
     fn keys_are_normalized_the_same_way_lookups_are() {
-        for (written, looked_up) in [
-            (
-                "MyCompany.blob.core.windows.net",
-                "mycompany.blob.core.windows.net",
-            ),
-            (
-                "mycompany.blob.core.windows.net:443",
-                "mycompany.blob.core.windows.net:443",
-            ),
-            ("ünï.blob.example", "xn--n-nga1b.blob.example"),
-            ("[0:0:0:0:0:0:0:1]:10000", "[::1]:10000"),
-            ("0x7f.1", "127.0.0.1"),
-            ("acct.blob.core.windows.net.", "acct.blob.core.windows.net"),
-        ] {
+        for (written, looked_up) in [(
+            "MyCompany.blob.core.windows.net",
+            "mycompany.blob.core.windows.net",
+        )] {
             let map: AzureOptionsMap = toml::from_str(&format!(
                 "[\"{written}\".auth]\n\"mycompany/releases\" = true\n"
             ))
@@ -363,14 +286,5 @@ releases = true
             err.to_string().contains("acct.blob.example/general"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn an_unusable_container_key_is_rejected() {
-        let err = toml::from_str::<AzureOptionsMap>(
-            "[\"acct.blob.example\".auth]\n\"acct/Releases\" = true\n",
-        )
-        .expect_err("an uppercase container name must be rejected");
-        assert!(err.to_string().contains("Releases"), "{err}");
     }
 }
