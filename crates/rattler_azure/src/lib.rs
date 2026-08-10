@@ -1,16 +1,15 @@
-//! Helpers for deriving Azure Blob coordinates from channel URLs and for minting
-//! short-lived credentials for them.
+//! Parsing Azure Blob channel URLs and minting short-lived credentials for them.
 //!
-//! # Host model
+//! # Endpoint model
 //!
-//! The host a channel URL names is taken to be the storage endpoint it claims to
-//! be. Credentials and wire scheme are declared in [`options`], never inferred
-//! from the host name, and are keyed by an [`AzureEndpointKey`] — the URL prefix
-//! up to the container, whose shape says where the storage account is. The scheme
-//! is per endpoint; credentials are per *container*, the scope Azure's own RBAC
-//! has. The default grant is [`Auth::Anonymous`], so naming a host in a URL by
-//! itself sends nothing to it. Signing and sending live in `rattler_networking`,
-//! not here.
+//! A channel URL's authority is taken at face value as the storage endpoint it
+//! claims to be. Credentials and wire scheme are declared in [`options`], never
+//! inferred from the host name, and are keyed by an [`AzureEndpointKey`] — the URL
+//! prefix up to the container, whose shape says where the storage account is. The
+//! scheme is per endpoint; credentials are per *container*, the scope Azure's own
+//! RBAC has. The default grant is [`Auth::Anonymous`], so naming an endpoint in a
+//! URL by itself sends nothing to it. Signing and sending live in
+//! `rattler_networking`, not here.
 //!
 //! Userinfo (`user:pass@host`) is rejected wherever a host is parsed:
 //! `az://real.host@evil.example/…` reads as the real host while addressing the
@@ -51,12 +50,14 @@ pub enum AzureUrlError {
     /// or a domain with only one label.
     #[error(
         "Azure blob URL host `{0}` is not a dotted domain of the form `<account>.blob.<suffix>`, \
-         so its first label cannot be a storage account; such a host needs an `azure-options` key \
-         spelled `{0}/<account>`, which reads the account from the first path segment instead"
+         so its first label cannot be a storage account; read the account from the first path \
+         segment instead — with an `azure-options` key spelled `{0}/<account>` when fetching or \
+         indexing, or `--path-style` when uploading"
     )]
     InvalidHost(String),
 
-    /// An `azure-options` key names more than an endpoint and an account.
+    /// A written `azure-options` key is not a bare endpoint and account: it runs
+    /// past the account, or carries a query or fragment.
     #[error(
         "`{0}` is not an `azure-options` key: a key is a channel URL prefix up to the container, \
          so it is spelled `<host>` or `<host>/<account>` and nothing more"
@@ -323,10 +324,7 @@ impl std::fmt::Display for AccountPath {
     serde(try_from = "String", into = "String")
 )]
 pub enum AzureEndpointKey {
-    /// The account is the host's first label.
     HostStyle(AccountHost),
-
-    /// The account is the first path segment.
     PathStyle(AccountPath),
 }
 
@@ -429,9 +427,10 @@ impl From<AzureEndpointKey> for String {
 /// A channel URL, the `azure-options` entry it falls under, and the container it
 /// addresses under that entry.
 ///
-/// All three come out of one matched key, so they cannot disagree: the container is
-/// by definition the segment right after the key's prefix, and the key is a prefix
-/// of this channel's own URL. It is the only currency the Azure paths pass around,
+/// All three are built together, by one private constructor, out of the one
+/// channel — so the key is a prefix of that channel's own URL and the container is
+/// by definition the segment right after it, and no two of them can name a
+/// different endpoint. It is the only currency the Azure paths pass around,
 /// because a key and a channel handed over separately can name different hosts —
 /// and the endpoint would then be built from one while the container and root came
 /// from the other.
@@ -729,8 +728,6 @@ impl AzureHost {
         self.port
     }
 
-    /// The storage account label under host-style addressing.
-    ///
     /// `None` whenever the host cannot carry an account name. The stored
     /// [`url::Host`] answers that by construction: an IP literal is never a
     /// domain, so `127.0.0.1` cannot yield an account named `127`, and a domain
@@ -826,7 +823,7 @@ impl From<AzureHost> for String {
 /// disagree.
 ///
 /// The wire scheme is an argument to [`wire`](Self::wire) rather than a field
-/// because it comes from the host's `azure-options` entry, while
+/// because it comes from the matched `azure-options` entry, while
 /// [`parse`](Self::parse) runs as a clap `value_parser`, before any config file is
 /// read. `rattler-index` takes it from that entry; `rattler_upload` passes the
 /// default, because it reads no config file at all.
@@ -1327,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_past_the_container_is_rejected() {
+    fn a_key_past_the_account_is_rejected() {
         for written in [
             "proxy.internal/accta/general",
             "acct.blob.core.windows.net/general/noarch",
@@ -1337,7 +1334,7 @@ mod tests {
                     AzureEndpointKey::parse(written),
                     Err(AzureUrlError::InvalidKey(_))
                 ),
-                "{written} names past the container"
+                "{written} names past the account"
             );
         }
     }
@@ -1663,7 +1660,7 @@ mod tests {
     }
 
     /// A host-style key must be refused for a host it cannot derive an account
-    /// from, and the message must say which key to write instead.
+    /// from, and the message must name the path-segment reading to use instead.
     #[test]
     fn a_host_style_key_rejects_undottable_hosts() {
         for host in [

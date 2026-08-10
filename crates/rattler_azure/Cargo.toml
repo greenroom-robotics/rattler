@@ -16,8 +16,8 @@ default = []
 # `tokio` to run `az` without blocking the async runtime).
 clap = ["dep:clap", "dep:jiff", "dep:which", "dep:tokio"]
 opendal = ["dep:opendal"]
-# Serde derives for the `azure-options` config table: the per-host endpoint
-# options, the `AzureHost` used as their map key and the `ContainerName` keying
+# Serde derives for the `azure-options` config table: the per-endpoint options,
+# the `AzureEndpointKey` used as their map key and the `ContainerName` keying
 # their per-container grants. The types themselves are always compiled; only the
 # derives are gated. Pulls in `serde` alone, so config crates can depend on this
 # crate with default features off.
