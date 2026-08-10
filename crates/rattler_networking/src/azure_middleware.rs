@@ -2,9 +2,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use rattler_azure::{
-    Auth, AzureChannelUrl, AzureEndpointOptions, AzureFetchOptions, AzureHost, ContainerName,
-};
+use rattler_azure::{AzureChannelUrl, AzureEndpointOptions, AzureHost, AzureScheme, ContainerName};
 use reqsign_azure_storage::{Credential, DefaultCredentialProvider, RequestSigner};
 use reqsign_command_execute_tokio::TokioCommandExecute;
 use reqsign_core::{Context, OsEnv, ProvideCredential, Signer};
@@ -57,7 +55,7 @@ pub struct AzureMiddleware {
     /// config table is keyed by. An absent host behaves as a defaulted entry, so a
     /// miss is never a separate code path.
     ///
-    /// Entries and not the narrower [`AzureFetchOptions`]: the host's addressing
+    /// Entries and not the narrower [`rattler_azure::AzureFetchOptions`]: the host's addressing
     /// decides which path segment is the container, so the narrowing can only
     /// happen per request, in [`Self::resolve`].
     ///
@@ -70,26 +68,21 @@ pub struct AzureMiddleware {
 #[derive(Debug)]
 struct Resolved {
     channel: AzureChannelUrl,
-    container: Option<ContainerName>,
-    options: AzureFetchOptions,
+    grant: Grant,
+    scheme: AzureScheme,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Signing<'a> {
-    Anonymous,
-    Granted(&'a ContainerName),
-}
-
-impl<'a> Signing<'a> {
-    fn new(auth: Auth, container: Option<&'a ContainerName>) -> Self {
-        match (auth, container) {
-            (Auth::DefaultChain, Some(container)) => Self::Granted(container),
-            // `DefaultChain` without a container cannot arise — the grant was read
-            // out of a container's entry — and anonymous is the arm that sends
-            // nothing, which is the right way for an impossible pair to fall.
-            (Auth::DefaultChain | Auth::Anonymous, _) => Self::Anonymous,
-        }
-    }
+/// The container a request addresses, and whether it may be signed.
+///
+/// One value rather than an [`rattler_azure::Auth`] beside an `Option<ContainerName>`: a grant is
+/// only ever read out of a container's entry, so a grant without a container has no
+/// meaning and no representation here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Grant {
+    /// Send unsigned. Carries the container when the URL named one, for the 404
+    /// hint.
+    Ungranted(Option<ContainerName>),
+    Granted(ContainerName),
 }
 
 impl AzureMiddleware {
@@ -157,10 +150,16 @@ impl AzureMiddleware {
         let container = rattler_azure::container(&channel, entry.endpoint().addressing)
             .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::Error::from(e)))?;
 
+        let options = entry.fetch(container.as_ref());
+        let grant = match container {
+            Some(container) if options.auth.is_granted() => Grant::Granted(container),
+            container => Grant::Ungranted(container),
+        };
+
         Ok(Resolved {
-            options: entry.fetch(container.as_ref()),
-            container,
             channel,
+            grant,
+            scheme: options.scheme,
         })
     }
 
@@ -170,11 +169,11 @@ impl AzureMiddleware {
         url.query_pairs().any(|(key, _)| key == "sig")
     }
 
-    /// Under [`Signing::Anonymous`] the credential is not *resolved* either.
-    /// reqsign would otherwise probe the managed-identity / IMDS endpoint and block
-    /// until it times out (~30s where there is no metadata service), and would pull
-    /// an ambient credential into memory for a host the user never granted.
-    async fn sign(&self, req: &mut Request, signing: Signing<'_>) -> MiddlewareResult<()> {
+    /// Under [`Grant::Ungranted`] the credential is not *resolved* either. reqsign
+    /// would otherwise probe the managed-identity / IMDS endpoint and block until it
+    /// times out (~30s where there is no metadata service), and would pull an
+    /// ambient credential into memory for a host the user never granted.
+    async fn sign(&self, req: &mut Request, grant: &Grant) -> MiddlewareResult<()> {
         if Self::has_sas_token(req.url()) {
             return Ok(());
         }
@@ -184,8 +183,8 @@ impl AzureMiddleware {
                 .insert("x-ms-version", http::HeaderValue::from_static(X_MS_VERSION));
         }
 
-        let container = match signing {
-            Signing::Anonymous => {
+        let container = match grant {
+            Grant::Ungranted(_) => {
                 // The authority, not `host_str()`: a message naming a host the user
                 // could act on must carry the port, or it names a host that is not
                 // the one in their config.
@@ -195,7 +194,7 @@ impl AzureMiddleware {
                 );
                 return Ok(());
             }
-            Signing::Granted(container) => container,
+            Grant::Granted(container) => container,
         };
 
         let mut builder = http::Request::builder()
@@ -259,18 +258,17 @@ impl Middleware for AzureMiddleware {
 
         let Resolved {
             channel,
-            container,
-            options,
+            grant,
+            scheme,
         } = self.resolve(req.url())?;
-        *req.url_mut() = channel.wire(options.scheme);
-        self.sign(&mut req, Signing::new(options.auth, container.as_ref()))
-            .await?;
+        *req.url_mut() = channel.wire(scheme);
+        self.sign(&mut req, &grant).await?;
 
         let response = next.run(req, extensions).await?;
 
-        if let Some(container) = container.filter(|_| {
-            response.status() == http::StatusCode::NOT_FOUND && !options.auth.is_granted()
-        }) && first_404_for_container(channel.host(), &container)
+        if let Grant::Ungranted(Some(container)) = &grant
+            && response.status() == http::StatusCode::NOT_FOUND
+            && first_404_for_container(channel.host(), container)
         {
             // One line, and spelled the way `AzureUrlError::InvalidHost` spells its
             // fix: a wrapped multi-line hint is harder to grep out of a log, and
@@ -308,7 +306,7 @@ fn first_404_for_container(host: &AzureHost, container: &ContainerName) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use rattler_azure::{Addressing, AzureEndpoint, AzureScheme};
+    use rattler_azure::{Addressing, Auth, AzureEndpoint, AzureScheme};
 
     use super::*;
 
@@ -338,7 +336,7 @@ mod tests {
         let resolved = middleware
             .resolve(&Url::parse(url).expect("test url"))
             .expect("url should resolve");
-        resolved.channel.wire(resolved.options.scheme).to_string()
+        resolved.channel.wire(resolved.scheme).to_string()
     }
 
     fn resolve(middleware: &AzureMiddleware, url: &str) -> Resolved {
@@ -394,14 +392,13 @@ mod tests {
             "MyCompany.blob.core.windows.net.",
             granting("releases"),
         ));
-        assert!(
+        assert_eq!(
             resolve(
                 &middleware,
                 "az://mycompany.blob.core.windows.net/releases/x.json"
             )
-            .options
-            .auth
-            .is_granted()
+            .grant,
+            Grant::Granted(container("releases"))
         );
     }
 
@@ -420,16 +417,21 @@ mod tests {
             ),
         ));
 
-        for (url, granted) in [
-            ("az://mycompany.blob.core.windows.net/releases/x.json", true),
-            ("az://mycompany.blob.core.windows.net/public/x.json", false),
-            ("az://mycompany.blob.core.windows.net/staging/x.json", false),
+        for (url, expected) in [
+            (
+                "az://mycompany.blob.core.windows.net/releases/x.json",
+                Grant::Granted(container("releases")),
+            ),
+            (
+                "az://mycompany.blob.core.windows.net/public/x.json",
+                Grant::Ungranted(Some(container("public"))),
+            ),
+            (
+                "az://mycompany.blob.core.windows.net/staging/x.json",
+                Grant::Ungranted(Some(container("staging"))),
+            ),
         ] {
-            assert_eq!(
-                resolve(&middleware, url).options.auth.is_granted(),
-                granted,
-                "{url}"
-            );
+            assert_eq!(resolve(&middleware, url).grant, expected, "{url}");
         }
     }
 
@@ -440,8 +442,7 @@ mod tests {
             &path_style,
             "az://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json",
         );
-        assert_eq!(resolved.container, Some(container("general")));
-        assert!(resolved.options.auth.is_granted());
+        assert_eq!(resolved.grant, Grant::Granted(container("general")));
 
         // Host-style on the same URL reads the account segment as the container, so
         // the grant does not apply — the addressing is what decides which name a
@@ -460,8 +461,10 @@ mod tests {
             &host_style,
             "az://127.0.0.1:10000/devstoreaccount1/general/noarch/repodata.json",
         );
-        assert_eq!(resolved.container, Some(container("devstoreaccount1")));
-        assert!(!resolved.options.auth.is_granted());
+        assert_eq!(
+            resolved.grant,
+            Grant::Ungranted(Some(container("devstoreaccount1")))
+        );
     }
 
     #[test]
@@ -476,9 +479,11 @@ mod tests {
             "az://mycompany.blob.core.windows.net/",
             "az://mycompany.blob.core.windows.net/?comp=list",
         ] {
-            let resolved = resolve(&middleware, url);
-            assert_eq!(resolved.container, None, "{url}");
-            assert!(!resolved.options.auth.is_granted(), "{url}");
+            assert_eq!(
+                resolve(&middleware, url).grant,
+                Grant::Ungranted(None),
+                "{url}"
+            );
         }
     }
 
@@ -566,7 +571,7 @@ mod tests {
             .unwrap();
 
         middleware
-            .sign(&mut req, Signing::Anonymous)
+            .sign(&mut req, &Grant::Ungranted(None))
             .await
             .expect("an ungranted request must pass through unsigned");
 
@@ -601,7 +606,7 @@ mod tests {
             .unwrap();
 
         middleware
-            .sign(&mut req, Signing::Granted(&container("releases")))
+            .sign(&mut req, &Grant::Granted(container("releases")))
             .await
             .unwrap();
 
@@ -630,7 +635,7 @@ mod tests {
             .unwrap();
 
         let result = middleware
-            .sign(&mut req, Signing::Granted(&container("releases")))
+            .sign(&mut req, &Grant::Granted(container("releases")))
             .await;
 
         assert!(
@@ -671,7 +676,7 @@ mod tests {
             .unwrap();
 
         middleware
-            .sign(&mut req, Signing::Granted(&container("releases")))
+            .sign(&mut req, &Grant::Granted(container("releases")))
             .await
             .unwrap();
 
