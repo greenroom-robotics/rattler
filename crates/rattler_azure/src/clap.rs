@@ -23,6 +23,14 @@ pub enum AzureCredentialsError {
     #[error("no Azure credentials supplied: pass --account-key, --sas-token, or --azure-cli")]
     Missing,
 
+    #[error(
+        "`--azure-cli` mints its own SAS, so it cannot be combined with {flags}: the credential \
+         you passed would never be used. Drop {flags}, or drop `--azure-cli`. Credentials read \
+         from AZURE_STORAGE_KEY or AZURE_STORAGE_SAS_TOKEN are overridden by `--azure-cli` \
+         instead of refused, so only values passed on the command line are an error"
+    )]
+    CliConflict { flags: String },
+
     #[error(transparent)]
     Url(#[from] AzureUrlError),
 
@@ -82,18 +90,24 @@ impl AzureAuthSource {
 pub struct AzureCredentialsOpts {
     /// The Azure Storage account key.
     ///
-    /// Mutually exclusive with `--sas-token`. `--azure-cli` takes precedence over
-    /// both.
+    /// Lowest precedence of the three: `--sas-token` wins over it, and
+    /// `--azure-cli` over both. The three are deliberately not `conflicts_with`
+    /// each other, because clap applies a conflict to a value it read from the
+    /// environment too, and exporting both `AZURE_STORAGE_KEY` and
+    /// `AZURE_STORAGE_SAS_TOKEN` — what the `az` documentation tells you to do — is
+    /// not a usage error the user can undo from the command line.
     #[arg(
         long,
         env = "AZURE_STORAGE_KEY",
-        conflicts_with = "sas_token",
         help_heading = "Azure Credentials",
         value_parser = secret
     )]
     pub account_key: Option<SecretString>,
 
     /// A shared access signature (SAS) token, with or without a leading `?`.
+    ///
+    /// Takes precedence over `--account-key`, and is itself overridden by
+    /// `--azure-cli`.
     #[arg(
         long,
         env = "AZURE_STORAGE_SAS_TOKEN",
@@ -151,9 +165,53 @@ impl PartialEq for AzureCredentialsOpts {
     }
 }
 
+/// Whether `value` was typed on the command line rather than read from `var`.
+///
+/// clap does not carry a value's source into the derived struct, and reaching for
+/// [`clap::ArgMatches`] here would mean hand-writing `FromArgMatches` for a
+/// flattened struct. clap prefers the command line over the environment, so a
+/// value that differs from the variable's cannot have come from it. A value typed
+/// to be byte-identical to the variable reads as environment-sourced, which is the
+/// harmless direction: both spellings ask for the same credential.
+fn typed_on_command_line(var: &str, value: &SecretString) -> bool {
+    !std::env::var(var).is_ok_and(|from_env| from_env == value.expose_secret())
+}
+
 impl AzureCredentialsOpts {
+    /// The flags carrying a credential that was typed on the command line.
+    ///
+    /// Empty when the credentials only came from the environment, which
+    /// `--azure-cli` overrides silently.
+    fn explicit_credential_flags(&self) -> Vec<&'static str> {
+        [
+            (
+                "`--account-key`",
+                "AZURE_STORAGE_KEY",
+                self.account_key.as_ref(),
+            ),
+            (
+                "`--sas-token`",
+                "AZURE_STORAGE_SAS_TOKEN",
+                self.sas_token.as_ref(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(flag, var, value)| {
+            value
+                .filter(|value| typed_on_command_line(var, value))
+                .map(|_| flag)
+        })
+        .collect()
+    }
+
     pub fn source(&self) -> Result<AzureAuthSource, AzureCredentialsError> {
         if self.azure_cli {
+            let explicit = self.explicit_credential_flags();
+            if !explicit.is_empty() {
+                return Err(AzureCredentialsError::CliConflict {
+                    flags: explicit.join(" and "),
+                });
+            }
             Ok(AzureAuthSource::AzureCli {
                 ttl: Duration::from_secs(self.azure_cli_sas_ttl_minutes.saturating_mul(60)),
             })
@@ -233,11 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn azure_cli_beats_sas_beats_account_key() {
-        assert!(matches!(
-            opts(Some("key"), Some("sv=..."), true).source(),
-            Ok(AzureAuthSource::AzureCli { .. })
-        ));
+    fn sas_beats_account_key() {
         assert!(matches!(
             opts(Some("key"), Some("sv=..."), false).source(),
             Ok(AzureAuthSource::SasToken(t)) if t.expose_secret() == "sv=..."
@@ -284,8 +338,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn account_key_and_sas_token_conflict() {
+    /// Serialised env-var swap, since the vars below are process-global and the
+    /// values under test are exactly the ones clap reads from the environment.
+    fn with_env<R>(vars: &[(&str, Option<&str>)], body: impl FnOnce() -> R) -> R {
+        use std::sync::Mutex;
+
+        // SAFETY: the tests that touch these variables are serialised by LOCK.
+        fn set(var: &str, value: Option<&str>) {
+            match value {
+                Some(value) => unsafe { std::env::set_var(var, value) },
+                None => unsafe { std::env::remove_var(var) },
+            }
+        }
+
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(var, value)| {
+                let previous = std::env::var(var).ok();
+                set(var, *value);
+                (*var, previous)
+            })
+            .collect();
+        let out = body();
+        for (var, value) in previous {
+            set(var, value.as_deref());
+        }
+        out
+    }
+
+    fn parse(args: &[&str]) -> Result<AzureCredentialsOpts, clap::Error> {
         use clap::Parser;
 
         #[derive(Parser)]
@@ -294,10 +380,87 @@ mod tests {
             creds: AzureCredentialsOpts,
         }
 
-        let err = Cli::try_parse_from(["test", "--account-key", "k", "--sas-token", "sv=..."])
-            .map(|_| ())
-            .expect_err("passing both --account-key and --sas-token must be rejected");
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        Cli::try_parse_from(std::iter::once("test").chain(args.iter().copied()))
+            .map(|cli| cli.creds)
+    }
+
+    /// The regression this file was missing: both standard Azure variables
+    /// exported at once, which is what the `az` documentation tells users to do.
+    /// Driven through clap rather than by building the struct by hand, since the
+    /// bug lived in the parse.
+    #[test]
+    fn both_credential_env_vars_parse_and_resolve_by_precedence() {
+        with_env(
+            &[
+                ("AZURE_STORAGE_KEY", Some("key")),
+                ("AZURE_STORAGE_SAS_TOKEN", Some("sv=env")),
+            ],
+            || {
+                let opts = parse(&[]).expect("both Azure env vars set must not be a usage error");
+                assert!(matches!(
+                    opts.source(),
+                    Ok(AzureAuthSource::SasToken(t)) if t.expose_secret() == "sv=env"
+                ));
+
+                // `--azure-cli` overrides environment-sourced credentials rather
+                // than refusing them: there is no argv-side way to unset them.
+                let opts = parse(&["--azure-cli"]).expect("--azure-cli must parse alongside them");
+                assert!(matches!(
+                    opts.source(),
+                    Ok(AzureAuthSource::AzureCli { .. })
+                ));
+
+                // A credential typed on the command line still wins over the
+                // variable it shares a name with.
+                let opts = parse(&["--account-key", "typed"]).expect("should parse");
+                assert!(matches!(
+                    opts.source(),
+                    Ok(AzureAuthSource::SasToken(t)) if t.expose_secret() == "sv=env"
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn account_key_and_sas_token_together_are_resolved_by_precedence() {
+        with_env(
+            &[
+                ("AZURE_STORAGE_KEY", None),
+                ("AZURE_STORAGE_SAS_TOKEN", None),
+            ],
+            || {
+                let opts = parse(&["--account-key", "k", "--sas-token", "sv=..."])
+                    .expect("passing both credentials must not be a usage error");
+                assert!(matches!(
+                    opts.source(),
+                    Ok(AzureAuthSource::SasToken(t)) if t.expose_secret() == "sv=..."
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn azure_cli_with_typed_credentials_is_an_error() {
+        with_env(
+            &[
+                ("AZURE_STORAGE_KEY", None),
+                ("AZURE_STORAGE_SAS_TOKEN", None),
+            ],
+            || {
+                let opts = parse(&["--azure-cli", "--account-key", "k", "--sas-token", "sv=..."])
+                    .expect("the combination is rejected by `source`, not by clap");
+                let err = opts
+                    .source()
+                    .map(|_| ())
+                    .expect_err("--azure-cli with typed credentials must be refused");
+                let message = err.to_string();
+                assert!(
+                    message.contains("`--account-key` and `--sas-token`"),
+                    "{message}"
+                );
+                assert!(matches!(err, AzureCredentialsError::CliConflict { .. }));
+            },
+        );
     }
 
     #[test]

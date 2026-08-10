@@ -187,7 +187,7 @@ const EDIT_MATRIX: &[(&str, &str)] = &[
     ),
     (
         r#"azure-options."acct.blob.core.windows.net""#,
-        r#"{"auth": {"releases": true}}"#,
+        r#"{"auth": {"acct/releases": true}}"#,
     ),
 ];
 
@@ -238,12 +238,12 @@ fn edit_matrix_set_roundtrip_unset() {
 #[test]
 fn edit_grants_one_container_at_a_time() {
     let host = rattler_azure::AzureHost::parse("acct.blob.core.windows.net").unwrap();
-    let releases = rattler_azure::ContainerName::new("releases").unwrap();
-    let public = rattler_azure::ContainerName::new("public").unwrap();
+    let releases = rattler_azure::AzureCoordinates::parse("acct/releases").unwrap();
+    let public = rattler_azure::AzureCoordinates::parse("acct/public").unwrap();
 
     let mut config = Config::default();
     for (container, value) in [("releases", "true"), ("public", "false")] {
-        let key = format!(r#"azure-options."acct.blob.core.windows.net".auth.{container}"#);
+        let key = format!(r#"azure-options."acct.blob.core.windows.net".auth."acct/{container}""#);
         config
             .set(&key, Some(value.to_string()))
             .unwrap_or_else(|e| panic!("{key} must be settable: {e}"));
@@ -265,7 +265,7 @@ fn edit_grants_one_container_at_a_time() {
 
     config
         .set(
-            r#"azure-options."acct.blob.core.windows.net".auth.releases"#,
+            r#"azure-options."acct.blob.core.windows.net".auth."acct/releases""#,
             None,
         )
         .unwrap();
@@ -322,8 +322,11 @@ fn merge_semantics() {
     let mycompany = merged
         .azure_options
         .get(&rattler_azure::AzureHost::parse("mycompany.blob.core.windows.net").unwrap());
-    for (container, granted) in [("releases", true), ("staging", true), ("public", false)] {
-        let container = rattler_azure::ContainerName::new(container).unwrap();
+    // The override layer states the host's whole grant table, so `releases` —
+    // which only the lower layer names — is gone.
+    for (container, granted) in [("releases", false), ("staging", true), ("public", false)] {
+        let container =
+            rattler_azure::AzureCoordinates::parse(&format!("mycompany/{container}")).unwrap();
         assert_eq!(
             mycompany.fetch(Some(&container)).auth.is_granted(),
             granted,

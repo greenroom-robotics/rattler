@@ -142,12 +142,22 @@ expression: "(unused, normalized(config))"
                         scheme: Https,
                         addressing: HostStyle,
                         auth: {
-                            ContainerName(
-                                "public",
-                            ): Anonymous,
-                            ContainerName(
-                                "staging",
-                            ): DefaultChain,
+                            AzureCoordinates {
+                                account: AccountName(
+                                    "mycompany",
+                                ),
+                                container: ContainerName(
+                                    "public",
+                                ),
+                            }: Anonymous,
+                            AzureCoordinates {
+                                account: AccountName(
+                                    "mycompany",
+                                ),
+                                container: ContainerName(
+                                    "staging",
+                                ),
+                            }: DefaultChain,
                         },
                     },
                 },

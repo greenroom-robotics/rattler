@@ -212,21 +212,36 @@ expression: "(unused, normalized(config))"
                         scheme: Http,
                         addressing: PathStyle,
                         auth: {
-                            ContainerName(
-                                "general",
-                            ): DefaultChain,
+                            AzureCoordinates {
+                                account: AccountName(
+                                    "devstoreaccount1",
+                                ),
+                                container: ContainerName(
+                                    "general",
+                                ),
+                            }: DefaultChain,
                         },
                     },
                     AzureHost("mycompany.blob.core.windows.net"): AzureEndpointOptions {
                         scheme: Https,
                         addressing: HostStyle,
                         auth: {
-                            ContainerName(
-                                "public",
-                            ): Anonymous,
-                            ContainerName(
-                                "releases",
-                            ): DefaultChain,
+                            AzureCoordinates {
+                                account: AccountName(
+                                    "mycompany",
+                                ),
+                                container: ContainerName(
+                                    "public",
+                                ),
+                            }: Anonymous,
+                            AzureCoordinates {
+                                account: AccountName(
+                                    "mycompany",
+                                ),
+                                container: ContainerName(
+                                    "releases",
+                                ),
+                            }: DefaultChain,
                         },
                     },
                 },

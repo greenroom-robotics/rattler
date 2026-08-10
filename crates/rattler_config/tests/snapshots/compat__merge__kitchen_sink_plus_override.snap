@@ -57,16 +57,15 @@ scheme = "http"
 path-style = true
 
 [azure-options."127.0.0.1:10000".auth]
-general = true
+"devstoreaccount1/general" = true
 
 [azure-options."mycompany.blob.core.windows.net"]
 scheme = "https"
 path-style = false
 
 [azure-options."mycompany.blob.core.windows.net".auth]
-public = false
-releases = true
-staging = true
+"mycompany/public" = false
+"mycompany/staging" = true
 
 [index-config]
 write-zst = true

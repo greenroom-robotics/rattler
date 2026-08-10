@@ -148,6 +148,13 @@ pub enum AzureUrlError {
          `az://<account>.blob.core.windows.net/<container>/...`: got `{0}`"
     )]
     InvalidScheme(String),
+
+    /// A grant key is not spelled `account/container`.
+    #[error(
+        "`{0}` is not an `<account>/<container>` pair; an `azure-options` grant names both, \
+         because a container name alone does not identify a container under path-style addressing"
+    )]
+    InvalidCoordinates(String),
 }
 
 /// A storage account name that has passed Azure's naming rules: 3-24 characters
@@ -156,7 +163,7 @@ pub enum AzureUrlError {
 /// Those rules are the only thing keeping option-shaped text (`--as-user`, `-o`)
 /// out of the `az` argv in [`mint_user_delegation_sas`], which is why the mint
 /// takes this type rather than a `&str`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AccountName(String);
 
 impl AccountName {
@@ -247,10 +254,58 @@ impl From<ContainerName> for String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The account and container an Azure Blob URL addresses.
+///
+/// This is also the key of an `auth` table in `azure-options`, spelled
+/// `account/container`. Keying on the container alone would be wrong under
+/// path-style addressing, where the account lives in the first path segment
+/// rather than the host: two accounts fronted by one proxy would share a key, and
+/// a grant for your own `accta/general` would credential a request to
+/// `acctb/general`. Azure scopes RBAC per `(account, container)`, so the key does
+/// too — under host-style the account is redundant with the host, but one spelling
+/// at one depth beats a shape that changes with `path-style`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize),
+    serde(try_from = "String", into = "String")
+)]
 pub struct AzureCoordinates {
     pub account: AccountName,
     pub container: ContainerName,
+}
+
+impl AzureCoordinates {
+    /// Parse the `account/container` spelling used as a grant key.
+    pub fn parse(value: &str) -> Result<Self, AzureUrlError> {
+        let (account, container) = value
+            .split_once('/')
+            .ok_or_else(|| AzureUrlError::InvalidCoordinates(value.to_string()))?;
+        Ok(Self {
+            account: AccountName::new(account)?,
+            container: ContainerName::new(container)?,
+        })
+    }
+}
+
+impl std::fmt::Display for AzureCoordinates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.account, self.container)
+    }
+}
+
+impl TryFrom<String> for AzureCoordinates {
+    type Error = AzureUrlError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<AzureCoordinates> for String {
+    fn from(coordinates: AzureCoordinates) -> Self {
+        coordinates.to_string()
+    }
 }
 
 /// Derive the storage account name and container from an Azure Blob channel URL.
@@ -476,6 +531,20 @@ impl AzureHost {
 
     pub fn port(&self) -> Option<u16> {
         self.port
+    }
+
+    /// This host with its port dropped, when it carries one that `scheme` reaches
+    /// by default.
+    ///
+    /// `host` and `host:443` name the same endpoint over https, but not over http,
+    /// so the two spellings can only be collapsed by something holding the scheme.
+    /// A grant written either way must match a URL written the other, since a
+    /// missed grant is reported by Azure as a 404 rather than as an auth failure.
+    pub fn without_default_port(&self, scheme: AzureScheme) -> Option<Self> {
+        (self.port? == scheme.default_port()).then(|| Self {
+            host: self.host.clone(),
+            port: None,
+        })
     }
 
     /// The storage account label under host-style addressing.

@@ -6,7 +6,7 @@
 //! list of "official" Azure suffixes, which is what lets custom endpoints and the
 //! Azurite emulator work.
 
-use crate::ContainerName;
+use crate::AzureCoordinates;
 
 /// Whether credentials may attach to requests for a container.
 ///
@@ -77,6 +77,18 @@ impl AzureScheme {
         match self {
             AzureScheme::Https => "https",
             AzureScheme::Http => "http",
+        }
+    }
+
+    /// The port this scheme reaches when an authority does not spell one.
+    ///
+    /// `AzureHost` keeps a written port, because it cannot know the scheme its
+    /// host will be used with — so `host` and `host:443` are different keys until
+    /// something that does know the scheme says otherwise. This is that thing.
+    pub fn default_port(self) -> u16 {
+        match self {
+            AzureScheme::Https => 443,
+            AzureScheme::Http => 80,
         }
     }
 }
@@ -201,7 +213,12 @@ pub struct AzureFetchOptions {
 #[cfg_attr(
     feature = "serde",
     derive(serde::Deserialize, serde::Serialize),
-    serde(rename_all = "kebab-case", default)
+    // `deny_unknown_fields`, because a silently-missed grant is the worst failure
+    // this table has: Azure answers an anonymous read of a private container with
+    // 404, not 403, so a misspelled `[Auth]` surfaces as "channel not found" with
+    // nothing pointing at the typo. Container names are already held to Azure's
+    // rules for the same reason — a key that can never match is a config error.
+    serde(rename_all = "kebab-case", default, deny_unknown_fields)
 )]
 pub struct AzureEndpointOptions {
     scheme: AzureScheme,
@@ -209,11 +226,11 @@ pub struct AzureEndpointOptions {
     #[cfg_attr(feature = "serde", serde(rename = "path-style", alias = "path_style"))]
     addressing: Addressing,
 
-    /// Which containers on this host may be sent credentials.
+    /// Which containers on this host may be sent credentials, keyed
+    /// `account/container`.
     ///
-    /// An explicit `false` is legal and redundant with omission, which is what
-    /// lets a higher-precedence config file revoke a grant a lower one made (see
-    /// [`Self::layered_over`]).
+    /// An explicit `false` is legal and redundant with omission, so a
+    /// higher-precedence config file can revoke rather than only add.
     ///
     /// Declared last, because the TOML serializer must emit an entry's scalars
     /// before its tables.
@@ -221,12 +238,12 @@ pub struct AzureEndpointOptions {
         feature = "serde",
         serde(skip_serializing_if = "indexmap::IndexMap::is_empty")
     )]
-    auth: indexmap::IndexMap<ContainerName, Auth>,
+    auth: indexmap::IndexMap<AzureCoordinates, Auth>,
 }
 
 impl AzureEndpointOptions {
     pub fn new(
-        auth: impl IntoIterator<Item = (ContainerName, Auth)>,
+        auth: impl IntoIterator<Item = (AzureCoordinates, Auth)>,
         endpoint: AzureEndpoint,
     ) -> Self {
         Self {
@@ -245,13 +262,14 @@ impl AzureEndpointOptions {
 
     /// The grant and wire scheme for one container, for the fetch path.
     ///
-    /// `container` is an `Option` because a URL need not name one. That case is
-    /// answered here rather than at the call site, and can only mean anonymous:
-    /// there is no entry it could match.
-    pub fn fetch(&self, container: Option<&ContainerName>) -> AzureFetchOptions {
+    /// `coordinates` is an `Option` because a URL need not resolve to a pair —
+    /// a host-style IP literal carries no account label. That case is answered
+    /// here rather than at the call site, and can only mean anonymous: there is no
+    /// entry it could match.
+    pub fn fetch(&self, coordinates: Option<&AzureCoordinates>) -> AzureFetchOptions {
         AzureFetchOptions {
-            auth: container
-                .and_then(|container| self.auth.get(container))
+            auth: coordinates
+                .and_then(|coordinates| self.auth.get(coordinates))
                 .copied()
                 .unwrap_or_default(),
             scheme: self.scheme,
@@ -262,24 +280,10 @@ impl AzureEndpointOptions {
     ///
     /// Includes the explicit `false`s: a caller validating or listing the table
     /// needs what the file says, not what it effectively means.
-    pub fn grants(&self) -> impl Iterator<Item = (&ContainerName, Auth)> {
-        self.auth.iter().map(|(container, auth)| (container, *auth))
-    }
-
-    /// This entry layered over the one a lower-precedence config file wrote.
-    ///
-    /// `scheme` and `addressing` describe the endpoint as a whole, so this entry
-    /// replaces them outright. Grants merge per container, so a file naming one
-    /// container does not drop a grant on a container it never mentions. An
-    /// explicit `false` still revokes, so the merge is not a one-way ratchet.
-    pub fn layered_over(&self, lower: &Self) -> Self {
-        let mut auth = lower.auth.clone();
-        auth.extend(self.auth.iter().map(|(c, auth)| (c.clone(), *auth)));
-        Self {
-            scheme: self.scheme,
-            addressing: self.addressing,
-            auth,
-        }
+    pub fn grants(&self) -> impl Iterator<Item = (&AzureCoordinates, Auth)> {
+        self.auth
+            .iter()
+            .map(|(coordinates, auth)| (coordinates, *auth))
     }
 }
 
@@ -287,8 +291,8 @@ impl AzureEndpointOptions {
 mod tests {
     use super::*;
 
-    fn container(name: &str) -> ContainerName {
-        ContainerName::new(name).expect("test container name")
+    fn container(name: &str) -> AzureCoordinates {
+        AzureCoordinates::parse(&format!("acct/{name}")).expect("test coordinates")
     }
 
     #[test]
@@ -299,7 +303,7 @@ mod tests {
             path-style = true
 
             [auth]
-            releases = true
+            "acct/releases" = true
             "#,
         )
         .unwrap();
@@ -329,8 +333,8 @@ mod tests {
         let opts: AzureEndpointOptions = toml::from_str(
             r#"
             [auth]
-            releases = true
-            public = false
+            "acct/releases" = true
+            "acct/public" = false
             "#,
         )
         .unwrap();
@@ -354,47 +358,37 @@ mod tests {
     }
 
     #[test]
-    fn layering_replaces_the_endpoint_and_merges_the_grants() {
-        let lower: AzureEndpointOptions = toml::from_str(
-            r#"
-            path-style = true
-
-            [auth]
-            releases = true
-            staging = true
-            "#,
-        )
-        .unwrap();
-        let higher: AzureEndpointOptions = toml::from_str(
-            r#"
-            scheme = "http"
-
-            [auth]
-            staging = false
-            internal = true
-            "#,
-        )
-        .unwrap();
-
-        let merged = higher.layered_over(&lower);
-
-        assert_eq!(merged.endpoint(), higher.endpoint());
-        assert!(
-            merged.fetch(Some(&container("releases"))).auth.is_granted(),
-            "a grant the higher file never mentions must survive"
-        );
-        assert!(
-            !merged.fetch(Some(&container("staging"))).auth.is_granted(),
-            "an explicit `false` in the higher file must revoke the lower grant"
-        );
-        assert!(merged.fetch(Some(&container("internal"))).auth.is_granted());
-    }
-
-    #[test]
     fn an_unusable_container_key_is_rejected() {
-        let err = toml::from_str::<AzureEndpointOptions>("[auth]\nReleases = true\n")
+        let err = toml::from_str::<AzureEndpointOptions>("[auth]\n\"acct/Releases\" = true\n")
             .expect_err("uppercase is not a legal container name");
         assert!(err.to_string().contains("Releases"), "{err}");
+    }
+
+    /// A container name alone does not identify a container: under path-style the
+    /// account comes from the first path segment, so `general` on a proxy fronting
+    /// two accounts would name both.
+    #[test]
+    fn a_grant_key_must_name_an_account() {
+        let err = toml::from_str::<AzureEndpointOptions>("[auth]\ngeneral = true\n")
+            .expect_err("a bare container name is not a grant key");
+        assert!(err.to_string().contains("general"), "{err}");
+    }
+
+    /// A misspelled field is a grant that can never match, and Azure reports the
+    /// resulting anonymous read of a private container as 404 rather than 403 — so
+    /// without this it surfaces as "channel not found".
+    #[test]
+    fn an_unknown_field_is_rejected() {
+        for document in [
+            "[Auth]\n\"acct/releases\" = true\n",
+            "[authz]\n\"acct/releases\" = true\n",
+            "pathstyle = true\n",
+        ] {
+            assert!(
+                toml::from_str::<AzureEndpointOptions>(document).is_err(),
+                "silently ignored: {document}"
+            );
+        }
     }
 
     #[test]
@@ -410,8 +404,8 @@ mod tests {
             },
         ))
         .unwrap();
-        assert!(toml.contains("releases = true"), "{toml}");
-        assert!(toml.contains("public = false"), "{toml}");
+        assert!(toml.contains(r#""acct/releases" = true"#), "{toml}");
+        assert!(toml.contains(r#""acct/public" = false"#), "{toml}");
         assert!(toml.contains("path-style = true"), "{toml}");
         assert!(toml.contains(r#"scheme = "http""#), "{toml}");
         assert!(!toml.contains("DefaultChain"), "{toml}");

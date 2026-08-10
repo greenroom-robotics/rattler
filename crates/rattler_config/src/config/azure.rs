@@ -1,22 +1,8 @@
 use indexmap::IndexMap;
-use rattler_azure::{AzureEndpointOptions, AzureHost, AzureScheme};
+use rattler_azure::{AzureEndpointOptions, AzureHost};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-
-/// Whether a credential may cross this host's network unencrypted.
-///
-/// A single-label name (`localhost`, a compose service) has no public DNS
-/// resolution, so it counts as local; anything with a dot does not.
-fn is_local(host: &AzureHost) -> bool {
-    match host.host() {
-        url::Host::Domain(domain) => !domain.contains('.'),
-        url::Host::Ipv4(ip) => {
-            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
-        }
-        url::Host::Ipv6(ip) => ip.is_loopback() || ip.is_unspecified(),
-    }
-}
 
 /// Per-host options for Azure Blob channels, keyed by endpoint authority
 /// (including a port where one is used, e.g. `127.0.0.1:10000`).
@@ -41,7 +27,24 @@ pub struct AzureOptionsMap(IndexMap<AzureHost, AzureEndpointOptions>);
 
 impl AzureOptionsMap {
     pub fn get(&self, host: &AzureHost) -> AzureEndpointOptions {
-        self.0.get(host).cloned().unwrap_or_default()
+        if let Some(options) = self.0.get(host) {
+            return options.clone();
+        }
+
+        // `host` and `host:443` are the same https endpoint, and a user may write
+        // either in the config and the other in a channel URL. `AzureHost` keeps
+        // the written port because it has no scheme to judge it against; the entry
+        // does, so the collapse happens here. Both directions, since either side
+        // may be the one carrying the port.
+        self.0
+            .iter()
+            .find(|(key, options)| {
+                let scheme = options.endpoint().scheme;
+                key.without_default_port(scheme).as_ref() == Some(host)
+                    || host.without_default_port(scheme).as_ref() == Some(*key)
+            })
+            .map(|(_, options)| options.clone())
+            .unwrap_or_default()
     }
 
     /// The configured hosts, in the order the document's table iterated them
@@ -114,46 +117,26 @@ impl Config for AzureOptionsMap {
     }
 
     fn merge_config(self, other: &Self) -> Result<Self, super::MergeError> {
-        // Merge the two maps, with `other`'s entries layered over existing keys.
-        // The host-scoped fields — `scheme`, `path-style` — replace wholesale, but
-        // the grants merge per container: a higher-precedence file naming one
-        // container must not discard a grant a lower file made on a different
-        // container it never mentions. It can still revoke the container it does
-        // name, because an explicit `false` is a legal grant.
+        // An entry replaces wholesale rather than merging field by field. Merging
+        // let two individually-valid files produce a combination neither wrote: a
+        // system file granting a container over https, plus a user file setting
+        // only `scheme = "http"` on the same host, used to yield a cleartext grant.
+        // An entry is one unit — its scheme, addressing and grants describe one
+        // endpoint — so the layer that names a host owns it.
         let mut merged = self.0;
-        for (key, value) in &other.0 {
-            let layered = match merged.get(key) {
-                Some(lower) => value.layered_over(lower),
-                None => value.clone(),
-            };
-            merged.insert(key.clone(), layered);
-        }
+        merged.extend(
+            other
+                .0
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         Ok(AzureOptionsMap(merged))
     }
 
-    fn validate(&self) -> Result<(), super::ValidationError> {
-        for (host, options) in &self.0 {
-            if options.endpoint().scheme != AzureScheme::Http || is_local(host) {
-                continue;
-            }
-            // One granted container is enough: the scheme is host-scoped, so its
-            // requests all ride the same cleartext connection.
-            if let Some((container, _)) = options.grants().find(|(_, auth)| auth.is_granted()) {
-                return Err(super::ValidationError::Invalid(format!(
-                    "`azure-options.\"{host}\".auth` grants credentials to `{container}` over \
-                     cleartext http. A credential may only be sent unencrypted to a local \
-                     endpoint: use an https scheme, or address the emulator by loopback address."
-                )));
-            }
-        }
-        Ok(())
-    }
-
     fn keys(&self) -> Vec<String> {
-        // Quoted, because every Azure authority contains dots and an unquoted key
-        // is not the TOML path the user must pass to `config set`/`unset`. A
-        // container name never needs quoting — Azure's rules leave nothing in one
-        // that a bare TOML key cannot hold.
+        // Quoted, because every Azure authority contains dots and the grant keys
+        // an `account/container` slash, and an unquoted key is not the TOML path
+        // the user must pass to `config set`/`unset`.
         //
         // The per-container grants are listed as their own keys so each is
         // separately unsettable. There is deliberately no `."<host>".auth` key: the
@@ -167,7 +150,10 @@ impl Config for AzureOptionsMap {
                 let host = toml::Value::from(host.to_string()).to_string();
                 let grants = options
                     .grants()
-                    .map(|(container, _)| format!("{host}.auth.{container}"))
+                    .map(|(coordinates, _)| {
+                        let coordinates = toml::Value::from(coordinates.to_string()).to_string();
+                        format!("{host}.auth.{coordinates}")
+                    })
                     .collect::<Vec<_>>();
                 std::iter::once(host).chain(grants)
             })
@@ -177,7 +163,7 @@ impl Config for AzureOptionsMap {
 
 #[cfg(test)]
 mod tests {
-    use rattler_azure::{Addressing, Auth, AzureScheme, ContainerName};
+    use rattler_azure::{Addressing, Auth, AzureCoordinates, AzureScheme};
 
     use super::*;
 
@@ -185,8 +171,13 @@ mod tests {
         AzureHost::parse(authority).expect("test host should parse")
     }
 
-    fn container(name: &str) -> ContainerName {
-        ContainerName::new(name).expect("test container name")
+    fn coords(account: &str, container: &str) -> AzureCoordinates {
+        AzureCoordinates::parse(&format!("{account}/{container}")).expect("test coordinates")
+    }
+
+    /// A container on the account every test host belongs to.
+    fn container(name: &str) -> AzureCoordinates {
+        coords("mycompany", name)
     }
 
     #[test]
@@ -219,14 +210,14 @@ mod tests {
         let map: AzureOptionsMap = toml::from_str(
             r#"
             ["mycompany.blob.core.windows.net".auth]
-            releases = true
+            "mycompany/releases" = true
 
             ["127.0.0.1:10000"]
             scheme = "http"
             path-style = true
 
             ["127.0.0.1:10000".auth]
-            general = true
+            "devstoreaccount1/general" = true
             "#,
         )
         .unwrap();
@@ -241,7 +232,9 @@ mod tests {
 
         let azurite = map.get(&host("127.0.0.1:10000"));
         assert_eq!(
-            azurite.fetch(Some(&container("general"))).auth,
+            azurite
+                .fetch(Some(&coords("devstoreaccount1", "general")))
+                .auth,
             Auth::DefaultChain
         );
         assert_eq!(azurite.endpoint().scheme, AzureScheme::Http);
@@ -264,35 +257,6 @@ mod tests {
                 (host("mycompany.blob.core.windows.net"), real),
             ]
         );
-    }
-
-    #[test]
-    fn cleartext_grants_are_confined_to_local_endpoints() {
-        for authority in ["127.0.0.1:10000", "[::1]:10000", "azurite:10000"] {
-            let map: AzureOptionsMap = toml::from_str(&format!(
-                "[\"{authority}\"]\nscheme = \"http\"\n[\"{authority}\".auth]\ngeneral = true\n"
-            ))
-            .unwrap();
-            assert!(map.validate().is_ok(), "{authority} is local");
-        }
-
-        for authority in ["mycompany.blob.core.windows.net", "internal.example.com"] {
-            let map: AzureOptionsMap = toml::from_str(&format!(
-                "[\"{authority}\"]\nscheme = \"http\"\n[\"{authority}\".auth]\npublic = false\nreleases = true\n"
-            ))
-            .unwrap();
-            let err = map.validate().expect_err("{authority} is routable");
-            assert!(err.to_string().contains("releases"), "{err}");
-
-            let https: AzureOptionsMap =
-                toml::from_str(&format!("[\"{authority}\".auth]\nreleases = true\n")).unwrap();
-            assert!(https.validate().is_ok());
-            let anonymous: AzureOptionsMap = toml::from_str(&format!(
-                "[\"{authority}\"]\nscheme = \"http\"\n[\"{authority}\".auth]\nreleases = false\n"
-            ))
-            .unwrap();
-            assert!(anonymous.validate().is_ok());
-        }
     }
 
     #[test]
@@ -323,25 +287,26 @@ releases = true
     }
 
     #[test]
-    fn merge_layers_grants_per_container() {
-        let system: AzureOptionsMap =
-            toml::from_str("[\"host.example\".auth]\nreleases = true\nstaging = true\n").unwrap();
+    fn merge_replaces_the_grant_table_wholesale() {
+        let system: AzureOptionsMap = toml::from_str(
+            "[\"host.example\".auth]\n\"mycompany/releases\" = true\n\"mycompany/staging\" = true\n",
+        )
+        .unwrap();
         let user: AzureOptionsMap =
-            toml::from_str("[\"host.example\".auth]\nstaging = false\ninternal = true\n").unwrap();
+            toml::from_str("[\"host.example\".auth]\n\"mycompany/internal\" = true\n").unwrap();
 
         let entry = system
             .merge_config(&user)
             .unwrap()
             .get(&host("host.example"));
-        assert!(
-            entry.fetch(Some(&container("releases"))).auth.is_granted(),
-            "a grant the user file never mentions must survive the merge"
-        );
-        assert!(
-            !entry.fetch(Some(&container("staging"))).auth.is_granted(),
-            "an explicit `false` must revoke a lower-precedence grant"
-        );
         assert!(entry.fetch(Some(&container("internal"))).auth.is_granted());
+        // The higher-precedence file states the whole grant table for the host, so
+        // a grant it does not restate is revoked rather than inherited: a table
+        // half-read from a file the user is not looking at is the worse surprise.
+        assert!(
+            !entry.fetch(Some(&container("releases"))).auth.is_granted(),
+            "a grant the higher-precedence file omits must not survive the merge"
+        );
     }
 
     #[test]
@@ -360,8 +325,10 @@ releases = true
             ("0x7f.1", "127.0.0.1"),
             ("acct.blob.core.windows.net.", "acct.blob.core.windows.net"),
         ] {
-            let map: AzureOptionsMap =
-                toml::from_str(&format!("[\"{written}\".auth]\nreleases = true\n")).unwrap();
+            let map: AzureOptionsMap = toml::from_str(&format!(
+                "[\"{written}\".auth]\n\"mycompany/releases\" = true\n"
+            ))
+            .unwrap();
 
             assert!(
                 map.get(&host(looked_up))
@@ -374,7 +341,7 @@ releases = true
                 map.keys(),
                 vec![
                     format!("\"{looked_up}\""),
-                    format!("\"{looked_up}\".auth.releases"),
+                    format!("\"{looked_up}\".auth.\"mycompany/releases\""),
                 ],
                 "{written}"
             );
@@ -389,7 +356,7 @@ releases = true
     #[test]
     fn an_unparseable_key_is_rejected() {
         let err = toml::from_str::<AzureOptionsMap>(
-            "[\"acct.blob.example/general\".auth]\nreleases = true\n",
+            "[\"acct.blob.example/general\".auth]\n\"acct/releases\" = true\n",
         )
         .expect_err("a key carrying a path must be rejected");
         assert!(
@@ -400,9 +367,10 @@ releases = true
 
     #[test]
     fn an_unusable_container_key_is_rejected() {
-        let err =
-            toml::from_str::<AzureOptionsMap>("[\"acct.blob.example\".auth]\nReleases = true\n")
-                .expect_err("an uppercase container name must be rejected");
+        let err = toml::from_str::<AzureOptionsMap>(
+            "[\"acct.blob.example\".auth]\n\"acct/Releases\" = true\n",
+        )
+        .expect_err("an uppercase container name must be rejected");
         assert!(err.to_string().contains("Releases"), "{err}");
     }
 }

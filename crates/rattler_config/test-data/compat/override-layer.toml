@@ -22,5 +22,5 @@ force-path-style = false
 # Grants merge per container, unlike every other nested table here: this layer
 # adds one and revokes one, and the lower layer's `releases = true` survives both.
 [azure-options."mycompany.blob.core.windows.net".auth]
-staging = true
-public = false
+"mycompany/staging" = true
+"mycompany/public" = false
