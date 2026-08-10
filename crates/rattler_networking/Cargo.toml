@@ -25,7 +25,6 @@ azure = [
     "dep:reqsign-command-execute-tokio",
     "dep:reqsign-file-read-tokio",
     "dep:reqsign-http-send-reqwest",
-    "tokio",
 ]
 system-integration = ["keyring", "netrc-rs", "dirs"]
 keyring = [

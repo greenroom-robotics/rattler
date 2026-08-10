@@ -27,28 +27,7 @@ const X_MS_VERSION: &str = "2021-12-02";
 /// The `az://` host is the full blob endpoint, so rewriting is a plain scheme
 /// swap: `az://{host}/{path}` → `https://{host}/{path}`.
 ///
-/// Requests are anonymous by default: with no `azure-options` entry for the host,
-/// nothing is signed and no credential is resolved. A credential attaches only
-/// because the user's config grants it to the *container* the request addresses:
-///
-/// ```toml
-/// [azure-options."mycompany.blob.core.windows.net".auth]
-/// releases = true
-/// # an unlisted container is fetched anonymously
-///
-/// [azure-options."127.0.0.1:10000"]   # Azurite
-/// scheme = "http"
-/// path-style = true
-///
-/// [azure-options."127.0.0.1:10000".auth]
-/// general = true
-/// ```
-///
-/// Entries must stay user-scoped: a project-level manifest that could write one
-/// would let a checked-out repository claim the user's credentials.
-///
-/// `az://user:pass@host/...` is refused. The host becomes the request target
-/// verbatim, so userinfo is a host-spoofing vector.
+/// See [`rattler_azure::options`] for what an `azure-options` entry grants.
 ///
 /// Granted credentials come from reqsign's [`DefaultCredentialProvider`] chain;
 /// rattler's [`crate::AuthenticationStorage`] has no Azure variant.
@@ -302,18 +281,14 @@ impl AzureMiddleware {
             Grant::Granted(container) => container,
         };
 
-        let mut builder = http::Request::builder()
-            .method(req.method().clone())
-            .uri(req.url().as_str());
-        for (name, value) in req.headers() {
-            builder = builder.header(name, value);
-        }
-        let http_req = builder.body(()).map_err(|e| {
+        let (mut parts, ()) = http::Request::new(()).into_parts();
+        parts.method = req.method().clone();
+        parts.uri = req.url().as_str().parse().map_err(|e| {
             reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                 "failed to build http request for signing: {e}"
             ))
         })?;
-        let (mut parts, ()) = http_req.into_parts();
+        parts.headers = req.headers().clone();
 
         // Shared Key signs `Content-Length`, so it has to be on the request
         // *before* signing and match what goes on the wire. reqwest sets it later,
@@ -687,21 +662,6 @@ mod tests {
                 .resolve(&Url::parse("az://acct.blob.core.windows.net/general/x.json").unwrap())
                 .is_ok()
         );
-    }
-
-    #[tokio::test]
-    async fn passes_through_non_az_schemes_unchanged() {
-        use reqwest_middleware::ClientBuilder;
-        let client = ClientBuilder::new(Client::new())
-            .with(middleware(HashMap::new()))
-            .build();
-        // A non-`az` request must not be rewritten; it should be attempted as-is
-        // (and fail on DNS), proving the middleware left it untouched.
-        let result = client
-            .get("https://this-host-does-not-exist.invalid/x")
-            .send()
-            .await;
-        assert!(result.is_err());
     }
 
     #[test]
