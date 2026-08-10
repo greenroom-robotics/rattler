@@ -161,10 +161,26 @@ class AzureMiddleware:
     """
     Middleware to work with az:// URLs.
 
-    Every fetch is anonymous: the per-host `azure-options` table is not exposed to
-    Python yet, so private containers and custom endpoints are out of reach. Azure
-    answers an unauthorized read of a private container with a 404, so that is what
-    surfaces.
+    The per-host `azure-options` table is not exposed to Python yet, so this
+    middleware signs nothing: it rewrites `az://<host>/<container>/...` to
+    `https://<host>/<container>/...` and sends the request as it stands. That
+    covers every https blob endpoint, sovereign clouds included, with no
+    configuration. It also covers private containers reached with a SAS token,
+    because a URL that already carries a `sig` query parameter authenticates
+    itself and is passed through untouched.
+
+    Two cases do need the `azure-options` table and so are out of reach from
+    Python: a private container read with an ambient Azure credential rather
+    than a SAS token, and an endpoint served over plain `http`, such as the
+    Azurite emulator. Azure answers an unauthorized read of a private container
+    with a 404 rather than a 403, so the first case surfaces as a missing file.
+
+    This middleware must be placed *after* `AuthenticationMiddleware` in the
+    list handed to `Client`. It rewrites `az://` to `https://`, and
+    `AuthenticationMiddleware` deliberately ignores non-http(s) URLs, so the
+    reverse order would let a stored `*.blob.core.windows.net` credential attach
+    to an `az://` container that was never granted one. `Client` rejects that
+    order with a `ValueError`.
 
     Examples
     --------

@@ -37,6 +37,14 @@ class Client:
         user_agent: str | None = None,
         timeout: int | None = None,
     ) -> None:
+        """
+        Create a client that applies `middlewares` in the order given.
+
+        Raises:
+            ValueError: if `AzureMiddleware` is listed before
+                `AuthenticationMiddleware`. See `AzureMiddleware` for why that
+                order is unsafe.
+        """
         self._client = PyClientWithMiddleware(
             [middleware._middleware for middleware in middlewares] if middlewares else None,
             headers,

@@ -2,7 +2,7 @@ use crate::{
     error::PyRattlerError,
     networking::middleware::{AddHeadersMiddleware, PyMiddleware},
 };
-use pyo3::{PyResult, pyclass, pymethods};
+use pyo3::{PyResult, exceptions::PyValueError, pyclass, pymethods};
 use rattler_networking::{
     AuthenticationMiddleware, AuthenticationStorage, AzureMiddleware, GCSMiddleware, LazyClient,
     MirrorMiddleware, OciMiddleware, S3Middleware,
@@ -22,8 +22,42 @@ pub struct PyClientWithMiddleware {
     pub(crate) inner: ClientWithMiddleware,
 }
 
+/// `AzureMiddleware` may not precede `AuthenticationMiddleware`.
+///
+/// `AuthenticationMiddleware` skips any URL whose scheme is not `http` or
+/// `https`, because its entries are keyed by host alone and `az://` carries its
+/// own grant model. `AzureMiddleware` rewrites `az://` to `https://` before it
+/// calls the rest of the stack. Put the azure middleware first and that gate
+/// never sees an `az://` URL, so a stored `*.blob.core.windows.net` credential
+/// attaches to a container that was never granted one.
+fn check_middleware_order(middlewares: &[PyMiddleware]) -> PyResult<()> {
+    let azure = middlewares
+        .iter()
+        .position(|m| matches!(m, PyMiddleware::Azure(_)));
+    let authentication = middlewares
+        .iter()
+        .position(|m| matches!(m, PyMiddleware::Authentication(_)));
+
+    match (azure, authentication) {
+        (Some(azure), Some(authentication)) if azure < authentication => {
+            Err(PyValueError::new_err(
+                "AzureMiddleware must come after AuthenticationMiddleware. AzureMiddleware rewrites \
+             `az://` URLs to `https://`, and AuthenticationMiddleware ignores URLs that are not \
+             already http(s), so this order would let a stored `*.blob.core.windows.net` \
+             credential attach to a container that has no `azure-options` grant. Write \
+             `Client([AuthenticationMiddleware(), AzureMiddleware()])` instead.",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 #[pymethods]
 impl PyClientWithMiddleware {
+    /// Build a client from `middlewares`, applied in the order given.
+    ///
+    /// The one order this rejects is `AzureMiddleware` ahead of
+    /// `AuthenticationMiddleware`; see [`check_middleware_order`].
     #[new]
     #[pyo3(signature = (middlewares=None, headers=None, user_agent=None, timeout=None))]
     pub fn new(
@@ -33,6 +67,7 @@ impl PyClientWithMiddleware {
         timeout: Option<u64>,
     ) -> PyResult<Self> {
         let middlewares = middlewares.unwrap_or_default();
+        check_middleware_order(&middlewares)?;
 
         let mut client_builder = reqwest::Client::builder();
 

@@ -129,7 +129,6 @@ impl From<PyGCSMiddleware> for GCSMiddleware {
 /// anonymous over https. Exposing the per-host options table to Python, as
 /// `PyS3Config` does for buckets, is follow-up work.
 #[pyclass(from_py_object)]
-#[repr(transparent)]
 #[derive(Clone)]
 pub struct PyAzureMiddleware {}
 

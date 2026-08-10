@@ -8,6 +8,14 @@ on:
       - crates/rattler_index/**
       - crates/rattler_networking/**
       - crates/rattler_upload/**
+      # The gateway owns the shard-index revalidation path, and its bare-304
+      # handling exists because that is what Azure answers with.
+      - crates/rattler_repodata_gateway/**
+      # `az://` URLs and their credentials pass through redaction on the way to
+      # logs and errors, and the bindings and the CLI both wire the middleware.
+      - crates/rattler_redaction/**
+      - crates/rattler-bin/**
+      - py-rattler/**
       # An opendal bump touches only the root manifest, and these tests are the
       # canary for the opendal bug the upload path works around.
       - Cargo.toml
@@ -42,16 +50,16 @@ jobs:
 
     # No secrets: the emulator's `devstoreaccount1` credentials are published
     # constants, spelled out in the tests, and only ever reach loopback.
+    #
+    # There is no `--health-cmd` here on purpose. It would run inside the
+    # container and so could only reach the container's own loopback, which
+    # says nothing about the published port the tests actually connect to. The
+    # readiness check runs on the runner instead, as the first step below.
     services:
       azurite:
         image: mcr.microsoft.com/azure-storage/azurite:3.36.0
         ports:
           - 10000:10000
-        options: >-
-          --health-cmd "nc -z 127.0.0.1 10000"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 30
 
     steps:
       - name: Checkout source code
@@ -59,13 +67,49 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Wait for the blob endpoint the tests connect to
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          # Speak HTTP to the published port from the runner, which is exactly
+          # what the tests do. Azurite refuses an unsigned container list, so
+          # any HTTP status is the proof we want: the blob service is bound to
+          # a routable address and answering. `000` means curl never got a
+          # response.
+          for _ in $(seq 1 60); do
+            status="$(curl --silent --output /dev/null --max-time 5 \
+              --write-out '%{http_code}' \
+              'http://127.0.0.1:10000/devstoreaccount1?comp=list' || echo 000)"
+            if [ "$status" != "000" ]; then
+              echo "Azurite blob endpoint is reachable (HTTP $status)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Azurite never answered on 127.0.0.1:10000" >&2
+          exit 1
+
       - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
           environments: default
 
-      - name: Run the Azurite integration tests
+      # One invocation per package: `cargo` unions every `-p` with every
+      # `--test`, it does not pair them up, so a single command would only pick
+      # the right targets for as long as both target names stay unique.
+      # `--no-tests=fail` turns an unsatisfied `required-features` into a
+      # failure instead of a green run over nothing.
+      - name: Run the Azurite index tests
+        timeout-minutes: 30
         run: |
-          pixi run -vv -- cargo nextest run --run-ignored all \
+          pixi run -vv -- cargo nextest run --locked --no-tests=fail \
+            --run-ignored all \
+            --features rattler_index/azure \
+            -p rattler_index --test azure_azurite
+
+      - name: Run the Azurite fetch tests
+        timeout-minutes: 30
+        run: |
+          pixi run -vv -- cargo nextest run --locked --no-tests=fail \
+            --run-ignored all \
             --features rattler_networking/azure \
-            -p rattler_index --test azure_azurite \
             -p rattler_networking --test azure_azurite_fetch
