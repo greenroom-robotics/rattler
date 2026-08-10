@@ -55,10 +55,6 @@ pub struct AzureMiddleware {
     /// config table is keyed by. An absent host behaves as a defaulted entry, so a
     /// miss is never a separate code path.
     ///
-    /// Entries and not the narrower [`rattler_azure::AzureFetchOptions`]: the host's addressing
-    /// decides which path segment is the container, so the narrowing can only
-    /// happen per request, in [`Self::resolve`].
-    ///
     /// A plain `HashMap` rather than `rattler_config::AzureOptionsMap`, as in
     /// [`crate::S3Middleware`]: the config type would force a `rattler_config` edge
     /// on the `azure` feature.
@@ -73,10 +69,6 @@ struct Resolved {
 }
 
 /// The container a request addresses, and whether it may be signed.
-///
-/// One value rather than an [`rattler_azure::Auth`] beside an `Option<ContainerName>`: a grant is
-/// only ever read out of a container's entry, so a grant without a container has no
-/// meaning and no representation here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Grant {
     /// Send unsigned. Carries the container when the URL named one, for the 404
@@ -171,8 +163,8 @@ impl AzureMiddleware {
 
     /// Under [`Grant::Ungranted`] the credential is not *resolved* either. reqsign
     /// would otherwise probe the managed-identity / IMDS endpoint and block until it
-    /// times out (~30s where there is no metadata service), and would pull an
-    /// ambient credential into memory for a host the user never granted.
+    /// times out, and would pull an ambient credential into memory for a host the user
+    /// never granted.
     async fn sign(&self, req: &mut Request, grant: &Grant) -> MiddlewareResult<()> {
         if Self::has_sas_token(req.url()) {
             return Ok(());
@@ -266,22 +258,32 @@ impl Middleware for AzureMiddleware {
 
         let response = next.run(req, extensions).await?;
 
-        if let Grant::Ungranted(Some(container)) = &grant
+        if let Grant::Ungranted(container) = &grant
             && response.status() == http::StatusCode::NOT_FOUND
-            && first_404_for_container(channel.host(), container)
+            && first_404_for(channel.host(), container.as_ref())
         {
-            // One line, and spelled the way `AzureUrlError::InvalidHost` spells its
-            // fix: a wrapped multi-line hint is harder to grep out of a log, and
-            // the two guided messages should read as the same instruction.
-            tracing::warn!(
-                "`{}` returned 404 and container `{container}` has no `azure-options` auth grant. \
-                 Azure answers an anonymous read of a *private* container with 404 rather than \
-                 403, so a missing grant looks exactly like a missing file. If the container is \
-                 private, grant it in your user configuration with \
-                 `[azure-options.\"{}\".auth]` and `{container} = true`.",
-                channel.canonical(),
-                channel.host()
-            );
+            if let Some(container) = container {
+                tracing::warn!(
+                    "`{}` returned 404 and container `{container}` has no `azure-options` auth \
+                     grant. Azure answers an anonymous read of a *private* container with 404 \
+                     rather than 403, so a missing grant looks exactly like a missing file. If \
+                     the container is private, grant it in your user configuration with \
+                     `[azure-options.\"{}\".auth]` and `{container} = true`.",
+                    channel.canonical(),
+                    channel.host()
+                );
+            } else {
+                tracing::warn!(
+                    "`{}` returned 404 and names no container, so no `azure-options` auth grant \
+                     can apply to it. Azure answers an anonymous read of a *private* container \
+                     with 404 rather than 403, so a missing grant looks exactly like a missing \
+                     file. Check that the URL names a container, and that \
+                     `[azure-options.\"{}\"]` spells `path-style` the way this endpoint expects \
+                     — under path-style the container is the second path segment, not the first.",
+                    channel.canonical(),
+                    channel.host()
+                );
+            }
         }
 
         Ok(response)
@@ -293,15 +295,16 @@ impl Middleware for AzureMiddleware {
 /// A 404 is the *normal* answer to plenty of requests a healthy public channel
 /// makes: the repodata gateway probes for a shard index under every subdir, and a
 /// non-sharded channel misses every time. Per container and not per host, because
-/// the line to add differs per container.
-fn first_404_for_container(host: &AzureHost, container: &ContainerName) -> bool {
-    static HINTED: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashSet<(AzureHost, ContainerName)>>,
-    > = std::sync::LazyLock::new(Default::default);
+/// the line to add differs per container. A URL naming no container gets one hint
+/// of its own per host.
+fn first_404_for(host: &AzureHost, container: Option<&ContainerName>) -> bool {
+    type Hinted = std::collections::HashSet<(AzureHost, Option<ContainerName>)>;
+    static HINTED: std::sync::LazyLock<std::sync::Mutex<Hinted>> =
+        std::sync::LazyLock::new(Default::default);
     HINTED
         .lock()
         .expect("the 404-hint set is never held across a panic")
-        .insert((host.clone(), container.clone()))
+        .insert((host.clone(), container.cloned()))
 }
 
 #[cfg(test)]
@@ -741,6 +744,28 @@ mod tests {
 
         assert!(logs_contain(&format!("[azure-options.\"{host}\".auth]")));
         assert!(logs_contain("general = true"));
+    }
+
+    /// A URL naming no container cannot be fixed by granting one, so its hint points
+    /// at the URL and the host's addressing instead.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_404_hint_for_a_container_less_url_points_at_the_addressing() {
+        let host = spawn_404_server().await;
+        let middleware = middleware(options(&host.to_string(), emulator_entry([])));
+
+        let status = reqwest_middleware::ClientBuilder::new(Client::new())
+            .with(middleware)
+            .build()
+            .get(format!("az://{host}/"))
+            .send()
+            .await
+            .expect("request through azure middleware failed")
+            .status();
+        assert_eq!(status, 404);
+
+        assert!(logs_contain("names no container"));
+        assert!(logs_contain("path-style"));
     }
 
     #[tokio::test]
