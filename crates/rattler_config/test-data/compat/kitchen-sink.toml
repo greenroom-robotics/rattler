@@ -40,15 +40,14 @@ region = "eu-central-1"
 force-path-style = true
 
 [azure-options."mycompany.blob.core.windows.net".auth]
-"mycompany/releases" = true
-"mycompany/public" = false
+releases = true
+public = false
 
-[azure-options."127.0.0.1:10000"]
+[azure-options."127.0.0.1:10000/devstoreaccount1"]
 scheme = "http"
-path-style = true
 
-[azure-options."127.0.0.1:10000".auth]
-"devstoreaccount1/general" = true
+[azure-options."127.0.0.1:10000/devstoreaccount1".auth]
+general = true
 
 [index-config]
 write-zst = true

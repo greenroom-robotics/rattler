@@ -19,8 +19,8 @@ endpoint-url = "https://minio.example.com"
 region = "auto"
 force-path-style = false
 
-# Grants merge per container, unlike every other nested table here: this layer
-# adds one and revokes one, and the lower layer's `releases = true` survives both.
+# An entry replaces the lower layer's wholesale, so the `releases = true` written
+# there does not survive this layer restating the table.
 [azure-options."mycompany.blob.core.windows.net".auth]
-"mycompany/staging" = true
-"mycompany/public" = false
+staging = true
+public = false

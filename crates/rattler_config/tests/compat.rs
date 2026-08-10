@@ -187,7 +187,7 @@ const EDIT_MATRIX: &[(&str, &str)] = &[
     ),
     (
         r#"azure-options."acct.blob.core.windows.net""#,
-        r#"{"auth": {"acct/releases": true}}"#,
+        r#"{"auth": {"releases": true}}"#,
     ),
 ];
 
@@ -237,19 +237,19 @@ fn edit_matrix_set_roundtrip_unset() {
 
 #[test]
 fn edit_grants_one_container_at_a_time() {
-    let host = rattler_azure::AzureHost::parse("acct.blob.core.windows.net").unwrap();
-    let releases = rattler_azure::AzureCoordinates::parse("acct/releases").unwrap();
-    let public = rattler_azure::AzureCoordinates::parse("acct/public").unwrap();
+    let key = rattler_azure::AzureEndpointKey::parse("acct.blob.core.windows.net").unwrap();
+    let releases = rattler_azure::ContainerName::new("releases").unwrap();
+    let public = rattler_azure::ContainerName::new("public").unwrap();
 
     let mut config = Config::default();
     for (container, value) in [("releases", "true"), ("public", "false")] {
-        let key = format!(r#"azure-options."acct.blob.core.windows.net".auth."acct/{container}""#);
+        let path = format!(r#"azure-options."acct.blob.core.windows.net".auth."{container}""#);
         config
-            .set(&key, Some(value.to_string()))
-            .unwrap_or_else(|e| panic!("{key} must be settable: {e}"));
+            .set(&path, Some(value.to_string()))
+            .unwrap_or_else(|e| panic!("{path} must be settable: {e}"));
     }
 
-    let entry = config.azure_options.get(&host);
+    let entry = config.azure_options.get(&key);
     assert!(entry.fetch(Some(&releases)).auth.is_granted());
     assert!(!entry.fetch(Some(&public)).auth.is_granted());
 
@@ -260,16 +260,16 @@ fn edit_grants_one_container_at_a_time() {
                 Some("true".to_string())
             )
             .is_err(),
-        "a host-wide grant must not be settable"
+        "an endpoint-wide grant must not be settable"
     );
 
     config
         .set(
-            r#"azure-options."acct.blob.core.windows.net".auth."acct/releases""#,
+            r#"azure-options."acct.blob.core.windows.net".auth."releases""#,
             None,
         )
         .unwrap();
-    let entry = config.azure_options.get(&host);
+    let entry = config.azure_options.get(&key);
     assert!(!entry.fetch(Some(&releases)).auth.is_granted());
     assert_eq!(entry.grants().count(), 1, "`public` must survive");
 }
@@ -321,12 +321,11 @@ fn merge_semantics() {
     assert_eq!(per_channel.disable_zstd, Some(true)); // from layer 2
     let mycompany = merged
         .azure_options
-        .get(&rattler_azure::AzureHost::parse("mycompany.blob.core.windows.net").unwrap());
+        .get(&rattler_azure::AzureEndpointKey::parse("mycompany.blob.core.windows.net").unwrap());
     // The override layer states the host's whole grant table, so `releases` —
     // which only the lower layer names — is gone.
     for (container, granted) in [("releases", false), ("staging", true), ("public", false)] {
-        let container =
-            rattler_azure::AzureCoordinates::parse(&format!("mycompany/{container}")).unwrap();
+        let container = rattler_azure::ContainerName::new(container).unwrap();
         assert_eq!(
             mycompany.fetch(Some(&container)).auth.is_granted(),
             granted,

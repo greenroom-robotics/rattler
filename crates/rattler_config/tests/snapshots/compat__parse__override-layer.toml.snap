@@ -138,26 +138,22 @@ expression: "(unused, normalized(config))"
             ),
             azure_options: AzureOptionsMap(
                 {
-                    AzureHost("mycompany.blob.core.windows.net"): AzureEndpointOptions {
+                    HostStyle(
+                        AccountHost {
+                            host: AzureHost("mycompany.blob.core.windows.net"),
+                            account: AccountName(
+                                "mycompany",
+                            ),
+                        },
+                    ): AzureEndpointOptions {
                         scheme: Https,
-                        addressing: HostStyle,
                         auth: {
-                            AzureCoordinates {
-                                account: AccountName(
-                                    "mycompany",
-                                ),
-                                container: ContainerName(
-                                    "public",
-                                ),
-                            }: Anonymous,
-                            AzureCoordinates {
-                                account: AccountName(
-                                    "mycompany",
-                                ),
-                                container: ContainerName(
-                                    "staging",
-                                ),
-                            }: DefaultChain,
+                            ContainerName(
+                                "public",
+                            ): Anonymous,
+                            ContainerName(
+                                "staging",
+                            ): DefaultChain,
                         },
                     },
                 },
