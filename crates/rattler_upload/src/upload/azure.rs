@@ -1,17 +1,19 @@
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
-    sync::Mutex,
 };
 
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use miette::IntoDiagnostic;
 use opendal::{Configurator, ErrorKind};
-use rattler_azure::{AzureChannelUrl, AzureCredentials, AzureEndpoint};
+use rattler_azure::{
+    AzureChannelUrl, AzureCoordinates, AzureCredentials, AzureEndpoint, account_and_container,
+};
 
 use crate::upload::{
     object_store::{
-        BlobStore, BlobUploadTarget, PACKAGE_CONCURRENCY, stream_package_to_object_store,
+        BlobStore, BlobStoreError, BlobUploadTarget, DESIRED_CHUNK_SIZE, PACKAGE_CONCURRENCY,
+        UploadFailure, stream_package_to_object_store,
     },
     opt::ForceOverwrite,
     package::ExtractedPackage,
@@ -21,11 +23,6 @@ use crate::upload::{
 /// Creating and writing blobs needs `c` + `w`. `r` is needed on top because the
 /// overwrite guard `stat`s each blob first, and a `stat` (HEAD Blob) is a read.
 pub(crate) const AZURE_UPLOAD_SAS_PERMISSIONS: &str = "rcw";
-
-enum PackageOutcome {
-    Uploaded,
-    Failed(String),
-}
 
 /// Uploads packages to a channel in an Azure Blob Storage container.
 ///
@@ -42,82 +39,103 @@ pub async fn upload_package_to_azure(
     let config =
         rattler_azure::azblob_config(&credentials, &channel, endpoint).into_diagnostic()?;
 
+    // The account and container the requests below are aimed at. `azblob_config`
+    // has already derived them, but it keeps them to itself, and an opendal error
+    // names neither.
+    let coordinates = account_and_container(&channel, endpoint.addressing).into_diagnostic()?;
+
     let builder = config.into_builder();
     let op = BlobStore::new(builder).into_diagnostic()?;
 
     // Upload multiple packages concurrently. Each package is written to its own
-    // key, so the individual uploads are independent. The first failure aborts
-    // the remaining uploads rather than letting them run to completion, so the
-    // outcomes are recorded as they land and summarised below — otherwise a run
-    // that failed halfway would report one package and stay silent about the
-    // rest.
-    let outcomes = Mutex::new(Vec::new());
-    let result = futures::stream::iter(package_files.iter())
-        .map(Ok)
-        .try_for_each_concurrent(PACKAGE_CONCURRENCY, |package_file| {
+    // key, so the individual uploads are independent. Every upload runs to
+    // completion even once one has failed, matching the S3 path: a future dropped
+    // mid-upload never reaches the code that discards its staged blocks, and Azure
+    // bills for uncommitted blocks until they age out a week later.
+    let outcomes: Vec<(PathBuf, miette::Result<()>)> = futures::stream::iter(package_files.iter())
+        .map(|package_file| {
             let op = op.clone();
             let channel = &channel;
-            let outcomes = &outcomes;
+            let coordinates = &coordinates;
             async move {
-                let result = upload_single_package(&op, channel, package_file, force).await;
-                let outcome = match &result {
-                    Ok(()) => PackageOutcome::Uploaded,
-                    Err(e) => PackageOutcome::Failed(e.to_string()),
-                };
-                outcomes
-                    .lock()
-                    .expect("upload outcome mutex poisoned")
-                    .push((package_file.clone(), outcome));
-                result
+                let result =
+                    upload_single_package(&op, channel, coordinates, package_file, force).await;
+                (package_file.clone(), result)
             }
         })
+        .buffer_unordered(PACKAGE_CONCURRENCY)
+        .collect()
         .await;
 
-    let outcomes = outcomes
-        .into_inner()
-        .expect("upload outcome mutex poisoned");
-    let summary = summarize(&outcomes, package_files.len());
-    match result {
-        Ok(()) => {
+    let summary = summarize(&outcomes);
+    let mut failures = outcomes.into_iter().filter_map(|(_, result)| result.err());
+    match failures.next() {
+        None => {
             tracing::info!("{summary}");
             Ok(())
         }
-        Err(e) => {
+        // Every package has an outcome in `summary`; the report carries the first
+        // failure, since a `miette::Report` holds one error.
+        Some(first) => {
             tracing::error!("{summary}");
-            Err(e)
+            Err(first)
         }
     }
 }
 
-/// Renders the per-package outcomes of a run. A package without an outcome was
-/// dropped mid-upload by the fail-fast stream, or never started.
-fn summarize(outcomes: &[(PathBuf, PackageOutcome)], total: usize) -> String {
+/// Renders the per-package outcomes of a run, which cover every package: no
+/// upload is abandoned once another has failed.
+fn summarize(outcomes: &[(PathBuf, miette::Result<()>)]) -> String {
     let failed: Vec<_> = outcomes
         .iter()
-        .filter_map(|(path, outcome)| match outcome {
-            PackageOutcome::Failed(message) => Some((path, message)),
-            PackageOutcome::Uploaded => None,
-        })
+        .filter_map(|(path, result)| result.as_ref().err().map(|error| (path, error)))
         .collect();
     let uploaded = outcomes.len() - failed.len();
-    let not_attempted = total - outcomes.len();
 
     let mut summary = format!(
-        "Azure upload summary: uploaded {uploaded} / failed {} / not attempted {not_attempted}",
+        "Azure upload summary: uploaded {uploaded} / failed {}",
         failed.len()
     );
-    for (path, message) in failed {
-        let _ = write!(summary, "\n  failed: {}: {message}", path.display());
-    }
-    if not_attempted > 0 {
-        summary.push_str("\n  not attempted: cancelled mid-upload or never started");
+    for (path, error) in failed {
+        let _ = write!(summary, "\n  failed: {}: {error}", path.display());
     }
     summary
+}
+
+/// Explains a store error in terms of the account and container the request was
+/// aimed at, neither of which opendal's own error mentions.
+fn explain(
+    error: BlobStoreError,
+    coordinates: &AzureCoordinates,
+    blob_url: &str,
+) -> miette::Report {
+    let AzureCoordinates { account, container } = coordinates;
+    let context = match error.kind() {
+        // A container that is not there answers a blob request with the same
+        // `NotFound` a missing blob does, so a wrong container — or a wrong
+        // account — is otherwise indistinguishable from a first upload.
+        ErrorKind::NotFound => format!(
+            "could not reach {blob_url}: container `{container}` in account `{account}` may not \
+             exist"
+        ),
+        // A SAS minted by `--azure-cli` is short-lived and is never renewed, so a
+        // long run can outlive its own credential.
+        ErrorKind::PermissionDenied => format!(
+            "access to container `{container}` in account `{account}` was denied for {blob_url}; \
+             a SAS minted by `--azure-cli` expires after `--azure-cli-sas-ttl-minutes` (30 by \
+             default) and is not renewed mid-run, so a long upload can outlive it"
+        ),
+        _ => {
+            format!("failed to upload {blob_url} to container `{container}` in account `{account}`")
+        }
+    };
+    miette::Report::new(error).wrap_err(context)
 }
 
 async fn upload_single_package(
     op: &BlobStore,
     channel: &AzureChannelUrl,
+    coordinates: &AzureCoordinates,
     package_file: &Path,
     force: ForceOverwrite,
 ) -> miette::Result<()> {
@@ -154,11 +172,31 @@ async fn upload_single_package(
                 miette::bail!("Package {blob_url} already exists. Use --force to overwrite.");
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(e).into_diagnostic(),
+            Err(e) => return Err(explain(e, coordinates, &blob_url)),
         }
     }
 
-    stream_package_to_object_store(op, &target, package_file, &blob_url, force).await
+    // azblob attaches user metadata and content-disposition on the single-shot Put
+    // Blob path only, never on the Put Block List commit a larger package takes,
+    // and there is no set-metadata operation on the backend to repair it
+    // afterwards. The blob therefore lands without `package-sha256`,
+    // `package-md5` or its content-disposition. Say so, rather than letting the
+    // schema of an uploaded blob depend silently on its size.
+    let size = fs_err::metadata(package_file).into_diagnostic()?.len();
+    if size > DESIRED_CHUNK_SIZE as u64 {
+        tracing::warn!(
+            "{blob_url} is larger than {DESIRED_CHUNK_SIZE} bytes, so it is uploaded through \
+             Azure's multi-block path, which carries no blob metadata: package-sha256, \
+             package-md5 and content-disposition will be missing on this blob."
+        );
+    }
+
+    stream_package_to_object_store(op, &target, package_file, &blob_url, force)
+        .await
+        .map_err(|failure| match failure {
+            UploadFailure::Store(e) => explain(e, coordinates, &blob_url),
+            failure => failure.into_report(&blob_url),
+        })
 }
 
 #[cfg(test)]
@@ -168,7 +206,7 @@ mod test {
     use opendal::services::Memory;
     use rattler_azure::AzureChannelUrl;
 
-    use super::{BlobStore, PackageOutcome, summarize, upload_single_package};
+    use super::{AzureCoordinates, BlobStore, summarize, upload_single_package};
     use crate::upload::opt::ForceOverwrite;
     use crate::upload::package::ExtractedPackage;
     use crate::upload::test_utils::test_package_path;
@@ -179,6 +217,11 @@ mod test {
 
     fn test_channel() -> AzureChannelUrl {
         AzureChannelUrl::parse("az://account.blob.core.windows.net/container/prefix").unwrap()
+    }
+
+    fn test_coordinates() -> AzureCoordinates {
+        rattler_azure::account_and_container(&test_channel(), rattler_azure::Addressing::HostStyle)
+            .unwrap()
     }
 
     fn package_key() -> String {
@@ -200,13 +243,25 @@ mod test {
         let channel = test_channel();
         let package = test_package_path();
 
-        upload_single_package(&op, &channel, &package, ForceOverwrite(true))
-            .await
-            .expect("initial force upload should succeed");
+        upload_single_package(
+            &op,
+            &channel,
+            &test_coordinates(),
+            &package,
+            ForceOverwrite(true),
+        )
+        .await
+        .expect("initial force upload should succeed");
 
-        let err = upload_single_package(&op, &channel, &package, ForceOverwrite(false))
-            .await
-            .expect_err("upload over an existing blob without --force must fail");
+        let err = upload_single_package(
+            &op,
+            &channel,
+            &test_coordinates(),
+            &package,
+            ForceOverwrite(false),
+        )
+        .await
+        .expect_err("upload over an existing blob without --force must fail");
         assert!(
             err.to_string().contains("already exists"),
             "unexpected error: {err}"
@@ -219,6 +274,7 @@ mod test {
         upload_single_package(
             &op,
             &test_channel(),
+            &test_coordinates(),
             &test_package_path(),
             ForceOverwrite(false),
         )
@@ -238,6 +294,7 @@ mod test {
         upload_single_package(
             &op,
             &test_channel(),
+            &test_coordinates(),
             &test_package_path(),
             ForceOverwrite(false),
         )
@@ -256,19 +313,18 @@ mod test {
     #[test]
     fn test_summary_counts_and_names_outcomes() {
         let outcomes = vec![
-            (PathBuf::from("a.conda"), PackageOutcome::Uploaded),
+            (PathBuf::from("a.conda"), Ok(())),
             (
                 PathBuf::from("b.conda"),
-                PackageOutcome::Failed("Package b already exists".to_string()),
+                Err(miette::miette!("Package b already exists")),
             ),
         ];
 
-        let summary = summarize(&outcomes, 4);
+        let summary = summarize(&outcomes);
         assert!(
-            summary.contains("uploaded 1 / failed 1 / not attempted 2"),
+            summary.contains("uploaded 1 / failed 1"),
             "unexpected summary: {summary}"
         );
         assert!(summary.contains("failed: b.conda: Package b already exists"));
-        assert!(summary.contains("not attempted: cancelled mid-upload or never started"));
     }
 }

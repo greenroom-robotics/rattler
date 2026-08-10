@@ -55,7 +55,7 @@ pub(crate) mod object_store {
     use std::{collections::HashMap, path::Path};
 
     use miette::IntoDiagnostic;
-    use opendal::{ErrorKind, Operator, options::WriteOptions};
+    use opendal::{ErrorKind, Operator, layers::RetryLayer, options::WriteOptions};
     use rattler_digest::{HashingReader, Md5, Md5Hash, Sha256, Sha256Hash};
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     use tokio_util::bytes::BytesMut;
@@ -71,7 +71,7 @@ pub(crate) mod object_store {
     #[derive(Clone)]
     pub(crate) struct BlobStore(Operator);
 
-    #[derive(Debug, thiserror::Error)]
+    #[derive(Debug, thiserror::Error, miette::Diagnostic)]
     #[error("{message}")]
     pub(crate) struct BlobStoreError {
         kind: ErrorKind,
@@ -98,11 +98,33 @@ pub(crate) mod object_store {
         }
     }
 
+    /// Retries transient failures, so a single 503 does not throw away a
+    /// multi-hundred-megabyte upload. Mirrors the policy the index path applies in
+    /// `rattler_index`, including its notify hook: opendal's default retry
+    /// interceptor logs the failing request URL, and for a SAS the credential is
+    /// *in* that URL.
+    fn retry_layer() -> RetryLayer<impl Fn(opendal::layers::RetryEvent<'_>) + Clone> {
+        RetryLayer::new().with_notify(|event: opendal::layers::RetryEvent<'_>| {
+            tracing::warn!(
+                target: "opendal::layers::retry",
+                "will retry {:?} (attempt {}) after {}s because: {}",
+                event.op,
+                event.attempt,
+                event.retry_after.as_secs_f64(),
+                rattler_redaction::redact_signatures_in_text(
+                    &format!("{:?}", event.err),
+                    rattler_redaction::DEFAULT_REDACTION_STR,
+                ),
+            );
+        })
+    }
+
     impl BlobStore {
         pub(crate) fn new(builder: impl opendal::Builder) -> Result<Self, BlobStoreError> {
             Ok(Self(
                 Operator::new(builder)
                     .map_err(BlobStoreError::new)?
+                    .layer(retry_layer())
                     .finish(),
             ))
         }
@@ -149,7 +171,7 @@ pub(crate) mod object_store {
     /// but the last below 5 MiB, and Azure Blob bills per block, so both prefer few
     /// large chunks. Peak buffered bytes per run are 160 MiB
     /// (`PACKAGE_CONCURRENCY * PART_CONCURRENCY * DESIRED_CHUNK_SIZE`).
-    const DESIRED_CHUNK_SIZE: usize = 1024 * 1024 * 10;
+    pub(crate) const DESIRED_CHUNK_SIZE: usize = 1024 * 1024 * 10;
 
     /// Number of chunks of a single package that are uploaded concurrently.
     const PART_CONCURRENCY: usize = 4;
@@ -211,24 +233,59 @@ pub(crate) mod object_store {
         })
     }
 
+    /// Why streaming a package to the object store failed.
+    ///
+    /// [`UploadFailure::Store`] is kept apart from the rest so that a backend can
+    /// explain its own store errors: only the caller knows which account,
+    /// container or bucket the request was aimed at.
+    pub(crate) enum UploadFailure {
+        /// The blob is already there and `--force` was not given.
+        AlreadyExists,
+        /// The object store refused or failed a request.
+        Store(BlobStoreError),
+        /// Reading or hashing the local package failed.
+        Local(miette::Report),
+    }
+
+    impl UploadFailure {
+        /// Renders the failure for `destination`, the blob as the user addressed
+        /// it. A caller that can say more about a [`UploadFailure::Store`] should
+        /// handle that variant before falling back to this.
+        pub(crate) fn into_report(self, destination: &str) -> miette::Report {
+            match self {
+                UploadFailure::AlreadyExists => {
+                    miette::miette!(
+                        "Package {destination} already exists. Use --force to overwrite."
+                    )
+                }
+                UploadFailure::Store(e) => {
+                    miette::Report::new(e).wrap_err(format!("failed to upload {destination}"))
+                }
+                UploadFailure::Local(report) => report,
+            }
+        }
+    }
+
     /// Streams `package_file` to `target`'s key through `op`.
     ///
-    /// `destination` is the blob as the user addressed it, used in the log and
-    /// the "already exists" error. `if_not_exists` is only asked of the backend,
-    /// which may drop it; the caller owns any guard on top.
+    /// `destination` is the blob as the user addressed it, used only in the log
+    /// line. `if_not_exists` is only asked of the backend, which may drop it; the
+    /// caller owns any guard on top.
     pub(crate) async fn stream_package_to_object_store(
         store: &BlobStore,
         target: &BlobUploadTarget,
         package_file: &Path,
         destination: &str,
         force: ForceOverwrite,
-    ) -> miette::Result<()> {
+    ) -> Result<(), UploadFailure> {
         let HashedFile {
             mut reader,
             size,
             sha256,
             md5,
-        } = hash_file(package_file).await?;
+        } = hash_file(package_file)
+            .await
+            .map_err(UploadFailure::Local)?;
 
         // S3 honours both. azblob never sends content-disposition, and drops user
         // metadata on its Put Block List commit, so a package above
@@ -245,9 +302,6 @@ pub(crate) mod object_store {
             ..WriteOptions::default()
         };
 
-        let already_exists =
-            || miette::miette!("Package {destination} already exists. Use --force to overwrite.");
-
         // `if_not_exists` is not evaluated here on either backend: both build their
         // writer with a pure constructor and issue nothing until the first chunk, so
         // a lost race always surfaces at `close()` below. This arm covers what
@@ -255,8 +309,10 @@ pub(crate) mod object_store {
         // exists so that the answer cannot depend on which backend is in play.
         let mut writer = match store.writer(target.key(), options).await {
             Ok(writer) => writer,
-            Err(e) if e.kind() == ErrorKind::ConditionNotMatch => return Err(already_exists()),
-            Err(e) => return Err(e).into_diagnostic(),
+            Err(e) if e.kind() == ErrorKind::ConditionNotMatch => {
+                return Err(UploadFailure::AlreadyExists);
+            }
+            Err(e) => return Err(UploadFailure::Store(e)),
         };
 
         if let Err(e) = stream_chunks(&mut writer, &mut reader, size).await {
@@ -272,9 +328,9 @@ pub(crate) mod object_store {
             Err(e) => {
                 discard_partial_upload(&mut writer, destination).await;
                 if e.kind() == ErrorKind::ConditionNotMatch {
-                    return Err(already_exists());
+                    return Err(UploadFailure::AlreadyExists);
                 }
-                Err(e).into_diagnostic()
+                Err(UploadFailure::Store(e))
             }
         }
     }
@@ -285,16 +341,23 @@ pub(crate) mod object_store {
         writer: &mut BlobWriter,
         reader: &mut (impl AsyncReadExt + Unpin),
         size: u64,
-    ) -> miette::Result<()> {
+    ) -> Result<(), UploadFailure> {
         let mut remaining_size = size as usize;
         while remaining_size > 0 {
             let chunk_size = remaining_size.min(DESIRED_CHUNK_SIZE);
             let mut chunk = BytesMut::zeroed(chunk_size);
 
-            let bytes_read = reader.read_exact(&mut chunk[..]).await.into_diagnostic()?;
+            let bytes_read = reader
+                .read_exact(&mut chunk[..])
+                .await
+                .into_diagnostic()
+                .map_err(UploadFailure::Local)?;
             debug_assert_eq!(bytes_read, chunk.len());
 
-            writer.write(chunk.freeze()).await.into_diagnostic()?;
+            writer
+                .write(chunk.freeze())
+                .await
+                .map_err(UploadFailure::Store)?;
 
             remaining_size = remaining_size.saturating_sub(bytes_read);
         }

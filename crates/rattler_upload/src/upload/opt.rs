@@ -415,8 +415,12 @@ pub struct S3Opts {
     pub credentials: rattler_s3::clap::S3CredentialsOpts,
 
     /// Replace files if it already exists.
-    #[arg(long)]
-    pub force: bool,
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new().map(ForceOverwrite)
+    )]
+    pub force: ForceOverwrite,
 }
 
 /// Options for uploading to Azure Blob Storage.

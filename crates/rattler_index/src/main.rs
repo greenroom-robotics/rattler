@@ -391,7 +391,7 @@ mod tests {
             path-style = true
 
             [azure-options."127.0.0.1:10000".auth]
-            general = true
+            "devstoreaccount1/general" = true
             "#,
         );
         let channel =

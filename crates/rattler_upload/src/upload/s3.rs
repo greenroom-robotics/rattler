@@ -23,7 +23,7 @@ pub async fn upload_package_to_s3(
     channel: Url,
     credentials: ResolvedS3Credentials,
     package_files: &[PathBuf],
-    force: bool,
+    force: ForceOverwrite,
 ) -> miette::Result<()> {
     let bucket = channel
         .host_str()
@@ -51,9 +51,7 @@ pub async fn upload_package_to_s3(
         .map(|package_file| {
             let op = op.clone();
             let channel = &channel;
-            async move {
-                upload_single_package(&op, channel, bucket, package_file, force.into()).await
-            }
+            async move { upload_single_package(&op, channel, bucket, package_file, force).await }
         })
         .buffer_unordered(PACKAGE_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -76,5 +74,7 @@ async fn upload_single_package(
     let target = BlobUploadTarget::from_package(&package)?;
     let destination = format!("s3://{bucket}{}/{}", channel.path(), target.key());
 
-    stream_package_to_object_store(op, &target, package_file, &destination, force).await
+    stream_package_to_object_store(op, &target, package_file, &destination, force)
+        .await
+        .map_err(|e| e.into_report(&destination))
 }

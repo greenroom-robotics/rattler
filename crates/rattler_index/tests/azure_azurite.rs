@@ -19,8 +19,8 @@ use std::{collections::HashMap, path::PathBuf};
 
 use opendal::{Configurator, ErrorKind, Operator, services::AzblobConfig};
 use rattler_azure::{
-    Addressing, Auth, AzureChannelUrl, AzureCredentials, AzureEndpoint, AzureEndpointOptions,
-    AzureHost, AzureScheme, ContainerName,
+    Addressing, Auth, AzureChannelUrl, AzureCoordinates, AzureCredentials, AzureEndpoint,
+    AzureEndpointOptions, AzureHost, AzureScheme,
 };
 use rattler_index::{IndexAzureConfig, PackageRevisionAssignment, index_azure};
 
@@ -67,7 +67,8 @@ fn channel(prefix: &str) -> AzureChannelUrl {
 fn azurite_options() -> AzureEndpointOptions {
     AzureEndpointOptions::new(
         [(
-            ContainerName::new(CONTAINER).expect("azurite container name"),
+            AzureCoordinates::parse(&format!("{ACCOUNT}/{CONTAINER}"))
+                .expect("azurite account and container names"),
             Auth::DefaultChain,
         )],
         AzureEndpoint {
