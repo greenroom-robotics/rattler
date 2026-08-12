@@ -2,7 +2,7 @@
 use async_trait::async_trait;
 use reqsign_azure_storage::{Credential, DefaultCredentialProvider, RequestSigner};
 use reqsign_command_execute_tokio::TokioCommandExecute;
-use reqsign_core::{Context, ErrorKind, OsEnv, ProvideCredential, Signer};
+use reqsign_core::{Context, OsEnv, ProvideCredential, Signer};
 use reqsign_file_read_tokio::TokioFileRead;
 use reqsign_http_send_reqwest::ReqwestHttpSend;
 use reqwest::{Client, Request, Response};
@@ -28,9 +28,13 @@ const X_MS_VERSION: &str = "2021-12-02";
 /// consulted for Azure — there is no `Authentication` Azure variant — so
 /// per-host credentials configured there do not apply to `az://` requests.
 ///
-/// When no credential resolves at all, the request is sent **unsigned** rather
-/// than failing, so public/anonymous containers remain reachable with zero
-/// ambient credentials.
+/// A credential that fails to resolve is an error, not a fallback to an
+/// unsigned request. reqsign collapses "no credential configured" and "the
+/// credential source broke" into the same [`reqsign_core::ErrorKind::CredentialInvalid`], so
+/// sending unsigned on that signal turns a transient `az` failure into an
+/// anonymous request and a bare `401` from Azure, several layers from the
+/// cause. Every `az://` request here is signing-intended, so there is no case
+/// where going anonymous is the right answer.
 #[derive(Clone)]
 pub struct AzureMiddleware {
     /// reqsign signer; caches the resolved credential internally.
@@ -85,13 +89,15 @@ impl AzureMiddleware {
 
     /// Sign a reqwest `Request` in place using reqsign.
     ///
-    /// Two cases short-circuit without touching the request:
-    /// - The URL already carries an explicit SAS (`?...&sig=...`). Signing would
-    ///   add an `Authorization` header that Azure prefers over the SAS, silently
-    ///   overriding the caller's explicit token.
-    /// - No credential resolves. reqsign surfaces this as
-    ///   [`ErrorKind::CredentialInvalid`]; the request is then sent unsigned so
-    ///   public/anonymous containers stay reachable.
+    /// One case short-circuits without touching the request: the URL already
+    /// carries an explicit SAS (`?...&sig=...`). Signing would add an
+    /// `Authorization` header that Azure prefers over the SAS, silently
+    /// overriding the caller's explicit token.
+    ///
+    /// A signing failure is propagated. reqsign reports only "failed to load
+    /// signing credential" — its chain walks past a provider that errors exactly
+    /// as it walks past one that finds nothing — so the host is attached here,
+    /// where it is still in scope, along with the ways to fix it.
     async fn sign(&self, req: &mut Request) -> MiddlewareResult<()> {
         if Self::has_sas_token(req.url()) {
             return Ok(());
@@ -115,14 +121,17 @@ impl AzureMiddleware {
         })?;
         let (mut parts, ()) = http_req.into_parts();
 
-        match self.signer.sign(&mut parts, None).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::CredentialInvalid => {
-                tracing::debug!("no Azure credential resolved; sending `az://` request unsigned");
-                return Ok(());
-            }
-            Err(e) => return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(e))),
-        }
+        self.signer.sign(&mut parts, None).await.map_err(|e| {
+            let authority = req.url().authority();
+            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                "could not resolve an Azure credential for `{authority}`: {e}\n\
+                 \n\
+                 Try one of:\n\
+                 \x20 - `az login`\n\
+                 \x20 - `AZURE_STORAGE_ACCOUNT_NAME` and `AZURE_STORAGE_ACCOUNT_KEY` in the \
+                 environment"
+            ))
+        })?;
 
         *req.headers_mut() = parts.headers;
         let signed_url = Url::parse(&parts.uri.to_string()).map_err(|e| {
@@ -222,12 +231,14 @@ mod tests {
         ));
     }
 
-    /// With no credential resolvable, a signable `az://` request must be passed
-    /// through UNSIGNED (not errored), so public/anonymous containers work with
-    /// zero ambient credentials. An empty provider chain resolves nothing, which
-    /// reqsign reports as `CredentialInvalid`.
+    /// A credential that does not resolve must ERROR, never fall through to an
+    /// unsigned request: against a private container an unsigned request is a
+    /// bare `401` from Azure, which hides the real cause (a broken `az`) behind
+    /// an auth error several layers from it. An empty provider chain resolves
+    /// nothing, which reqsign reports as `CredentialInvalid` — the same signal
+    /// a failed `az account get-access-token` produces.
     #[tokio::test]
-    async fn passes_request_through_unsigned_when_no_credential() {
+    async fn errors_when_no_credential_resolves() {
         use reqsign_core::ProvideCredentialChain;
 
         let middleware = AzureMiddleware::with_credential_provider(
@@ -239,18 +250,19 @@ mod tests {
             .build()
             .unwrap();
 
-        middleware
+        let err = middleware
             .sign(&mut req)
             .await
-            .expect("a request with no resolvable credential must pass through unsigned");
+            .expect_err("an unresolvable credential must not be sent as an unsigned request");
 
+        let msg = err.to_string();
         assert!(
-            req.headers().get(http::header::AUTHORIZATION).is_none(),
-            "unsigned request must not carry an Authorization header"
+            msg.contains("acct.blob.core.windows.net"),
+            "the error must name the host the user can act on, got: {msg}"
         );
         assert!(
-            !req.url().query_pairs().any(|(k, _)| k == "sig"),
-            "unsigned request must not gain a SAS query parameter"
+            msg.contains("az login"),
+            "the error must carry a remedy, got: {msg}"
         );
     }
 
