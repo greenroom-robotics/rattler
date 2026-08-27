@@ -28,6 +28,12 @@ use crate::upload::package::{ExtractedPackage, sha256_sum};
 pub(crate) mod test_utils;
 
 mod anaconda;
+#[cfg(feature = "azure")]
+mod azure;
+#[cfg(feature = "azure")]
+pub(crate) use azure::AZURE_UPLOAD_SAS_PERMISSIONS;
+#[cfg(feature = "azure")]
+pub use azure::upload_package_to_azure;
 #[cfg(feature = "sigstore-sign")]
 pub mod attestation;
 mod cloudsmith;
@@ -43,6 +49,361 @@ pub use s3::upload_package_to_s3;
 pub use anaconda::AnacondaError;
 pub use cloudsmith::CloudsmithError;
 pub use prefix::{PrefixUploadError, upload_package_to_prefix};
+
+#[cfg(any(feature = "s3", feature = "azure"))]
+pub(crate) mod object_store {
+    use std::{collections::HashMap, path::Path};
+
+    use miette::IntoDiagnostic;
+    use opendal::{ErrorKind, Operator, layers::RetryLayer, options::WriteOptions};
+    use rattler_digest::{HashingReader, Md5, Md5Hash, Sha256, Sha256Hash};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    use tokio_util::bytes::BytesMut;
+
+    use crate::upload::{opt::ForceOverwrite, package::ExtractedPackage};
+
+    /// An object store whose errors cannot carry a credential.
+    ///
+    /// opendal stamps the request URL into every HTTP error's context and prints
+    /// it from both `Display` and `Debug`. For Azure the SAS is in that URL, so an
+    /// unmasked opendal error is a leaked credential. The inner [`Operator`] is
+    /// private and the only error out is [`BlobStoreError`], which masks.
+    #[derive(Clone)]
+    pub(crate) struct BlobStore(Operator);
+
+    #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+    #[error("{message}")]
+    pub(crate) struct BlobStoreError {
+        kind: ErrorKind,
+        message: String,
+    }
+
+    impl BlobStoreError {
+        fn new(err: opendal::Error) -> Self {
+            Self {
+                kind: err.kind(),
+                // `Debug` rather than `Display`: it is the spelling that keeps the
+                // source chain and the operation.
+                message: rattler_redaction::redact_signatures_in_text(
+                    &format!("{err:?}"),
+                    rattler_redaction::DEFAULT_REDACTION_STR,
+                )
+                .into_owned(),
+            }
+        }
+
+        pub(crate) fn kind(&self) -> ErrorKind {
+            self.kind
+        }
+    }
+
+    /// Retries transient failures, so a single 503 does not throw away a
+    /// multi-hundred-megabyte upload. Mirrors the policy the index path applies in
+    /// `rattler_index`, including its notify hook: opendal's default retry
+    /// interceptor logs the failing request URL, and for a SAS the credential is
+    /// *in* that URL.
+    fn retry_layer() -> RetryLayer<impl Fn(opendal::layers::RetryEvent<'_>) + Clone> {
+        RetryLayer::new().with_notify(|event: opendal::layers::RetryEvent<'_>| {
+            tracing::warn!(
+                target: "opendal::layers::retry",
+                "will retry {:?} (attempt {}) after {}s because: {}",
+                event.op,
+                event.attempt,
+                event.retry_after.as_secs_f64(),
+                rattler_redaction::redact_signatures_in_text(
+                    &format!("{:?}", event.err),
+                    rattler_redaction::DEFAULT_REDACTION_STR,
+                ),
+            );
+        })
+    }
+
+    impl BlobStore {
+        pub(crate) fn new(builder: impl opendal::Builder) -> Result<Self, BlobStoreError> {
+            Ok(Self(
+                Operator::new(builder)
+                    .map_err(BlobStoreError::new)?
+                    .layer(retry_layer())
+                    .finish(),
+            ))
+        }
+
+        pub(crate) async fn stat(&self, path: &str) -> Result<opendal::Metadata, BlobStoreError> {
+            self.0.stat(path).await.map_err(BlobStoreError::new)
+        }
+
+        async fn writer(
+            &self,
+            path: &str,
+            options: WriteOptions,
+        ) -> Result<BlobWriter, BlobStoreError> {
+            self.0
+                .writer_options(path, options)
+                .await
+                .map(BlobWriter)
+                .map_err(BlobStoreError::new)
+        }
+    }
+
+    /// A writer that masks its errors, for the reason [`BlobStore`] gives.
+    struct BlobWriter(opendal::Writer);
+
+    impl BlobWriter {
+        async fn write(&mut self, chunk: tokio_util::bytes::Bytes) -> Result<(), BlobStoreError> {
+            self.0.write(chunk).await.map_err(BlobStoreError::new)
+        }
+
+        async fn close(&mut self) -> Result<(), BlobStoreError> {
+            self.0
+                .close()
+                .await
+                .map(|_| ())
+                .map_err(BlobStoreError::new)
+        }
+
+        async fn abort(&mut self) -> Result<(), BlobStoreError> {
+            self.0.abort().await.map_err(BlobStoreError::new)
+        }
+    }
+
+    /// Size of a single chunk handed to the writer. S3 rejects every multipart part
+    /// but the last below 5 MiB, and Azure Blob bills per block, so both prefer few
+    /// large chunks. Peak buffered bytes per run are 160 MiB
+    /// (`PACKAGE_CONCURRENCY * PART_CONCURRENCY * DESIRED_CHUNK_SIZE`).
+    pub(crate) const DESIRED_CHUNK_SIZE: usize = 1024 * 1024 * 10;
+
+    const PART_CONCURRENCY: usize = 4;
+
+    pub(crate) const PACKAGE_CONCURRENCY: usize = 4;
+
+    pub(crate) struct BlobUploadTarget {
+        key: String,
+        filename: String,
+    }
+
+    impl BlobUploadTarget {
+        pub(crate) fn from_package(package: &ExtractedPackage<'_>) -> miette::Result<Self> {
+            let subdir = package
+                .subdir()
+                .ok_or_else(|| miette::miette!("Failed to get subdir"))?;
+            let filename = package
+                .filename()
+                .ok_or_else(|| miette::miette!("Failed to get filename"))?;
+            Ok(Self {
+                key: format!("{subdir}/{filename}"),
+                filename: filename.to_string(),
+            })
+        }
+
+        pub(crate) fn key(&self) -> &str {
+            &self.key
+        }
+    }
+
+    /// A file measured and hashed in one pass over a single handle, then rewound.
+    /// Size and hashes therefore always describe the same bytes.
+    struct HashedFile<R> {
+        reader: R,
+        size: u64,
+        sha256: Sha256Hash,
+        md5: Md5Hash,
+    }
+
+    async fn hash_file(
+        path: &Path,
+    ) -> miette::Result<HashedFile<impl AsyncReadExt + AsyncSeekExt + Unpin>> {
+        let file =
+            tokio::io::BufReader::new(fs_err::tokio::File::open(path).await.into_diagnostic()?);
+        let sha256_reader = HashingReader::<_, Sha256>::new(file);
+        let mut md5_reader = HashingReader::<_, Md5>::new(sha256_reader);
+        let size = tokio::io::copy(&mut md5_reader, &mut tokio::io::sink())
+            .await
+            .into_diagnostic()?;
+        let (sha256_reader, md5) = md5_reader.finalize();
+        let (mut reader, sha256) = sha256_reader.finalize();
+        reader.rewind().await.into_diagnostic()?;
+        Ok(HashedFile {
+            reader,
+            size,
+            sha256,
+            md5,
+        })
+    }
+
+    /// Why streaming a package to the object store failed.
+    ///
+    /// [`UploadFailure::Store`] is kept apart from the rest so that a backend can
+    /// explain its own store errors: only the caller knows which account,
+    /// container or bucket the request was aimed at.
+    pub(crate) enum UploadFailure {
+        AlreadyExists,
+        Store(BlobStoreError),
+        Local(miette::Report),
+    }
+
+    impl UploadFailure {
+        pub(crate) fn into_report(self, destination: &str) -> miette::Report {
+            match self {
+                UploadFailure::AlreadyExists => {
+                    miette::miette!(
+                        "Package {destination} already exists. Use --force to overwrite."
+                    )
+                }
+                UploadFailure::Store(e) => {
+                    miette::Report::new(e).wrap_err(format!("failed to upload {destination}"))
+                }
+                UploadFailure::Local(report) => report,
+            }
+        }
+    }
+
+    /// `destination` is the blob as the user addressed it, used only in the log
+    /// line. `if_not_exists` is only asked of the backend, which may drop it; the
+    /// caller owns any guard on top.
+    pub(crate) async fn stream_package_to_object_store(
+        store: &BlobStore,
+        target: &BlobUploadTarget,
+        package_file: &Path,
+        destination: &str,
+        force: ForceOverwrite,
+    ) -> Result<(), UploadFailure> {
+        let HashedFile {
+            mut reader,
+            size,
+            sha256,
+            md5,
+        } = hash_file(package_file)
+            .await
+            .map_err(UploadFailure::Local)?;
+
+        // S3 honours both. azblob never sends content-disposition, and drops user
+        // metadata on its Put Block List commit, so a package above
+        // `DESIRED_CHUNK_SIZE` lands there with neither.
+        let options = WriteOptions {
+            chunk: Some(DESIRED_CHUNK_SIZE),
+            concurrent: PART_CONCURRENCY,
+            content_disposition: Some(format!("attachment; filename={}", target.filename)),
+            user_metadata: Some(HashMap::from([
+                (String::from("package-sha256"), hex::encode(sha256)),
+                (String::from("package-md5"), hex::encode(md5)),
+            ])),
+            if_not_exists: !force.is_enabled(),
+            ..WriteOptions::default()
+        };
+
+        // `if_not_exists` is not evaluated here on either backend: both build their
+        // writer with a pure constructor and issue nothing until the first chunk, so
+        // a lost race always surfaces at `close()` below. This arm covers what
+        // `writer()` itself can reject — a capability opendal refuses up front — and
+        // exists so that the answer cannot depend on which backend is in play.
+        let mut writer = match store.writer(target.key(), options).await {
+            Ok(writer) => writer,
+            Err(e) if e.kind() == ErrorKind::ConditionNotMatch => {
+                return Err(UploadFailure::AlreadyExists);
+            }
+            Err(e) => return Err(UploadFailure::Store(e)),
+        };
+
+        if let Err(e) = stream_chunks(&mut writer, &mut reader, size).await {
+            discard_partial_upload(&mut writer, destination).await;
+            return Err(e);
+        }
+
+        match writer.close().await {
+            Ok(_) => {
+                tracing::info!("Uploaded package to {destination}");
+                Ok(())
+            }
+            Err(e) => {
+                discard_partial_upload(&mut writer, destination).await;
+                if e.kind() == ErrorKind::ConditionNotMatch {
+                    return Err(UploadFailure::AlreadyExists);
+                }
+                Err(UploadFailure::Store(e))
+            }
+        }
+    }
+
+    async fn stream_chunks(
+        writer: &mut BlobWriter,
+        reader: &mut (impl AsyncReadExt + Unpin),
+        size: u64,
+    ) -> Result<(), UploadFailure> {
+        let mut remaining_size = size as usize;
+        while remaining_size > 0 {
+            let chunk_size = remaining_size.min(DESIRED_CHUNK_SIZE);
+            let mut chunk = BytesMut::zeroed(chunk_size);
+
+            let bytes_read = reader
+                .read_exact(&mut chunk[..])
+                .await
+                .into_diagnostic()
+                .map_err(UploadFailure::Local)?;
+            debug_assert_eq!(bytes_read, chunk.len());
+
+            writer
+                .write(chunk.freeze())
+                .await
+                .map_err(UploadFailure::Store)?;
+
+            remaining_size = remaining_size.saturating_sub(bytes_read);
+        }
+        Ok(())
+    }
+
+    /// Uncommitted parts are billed until they are discarded. S3 discards them
+    /// here; azblob's abort is a no-op, so Azure only collects its uncommitted
+    /// blocks after a week without further writes to the blob.
+    async fn discard_partial_upload(writer: &mut BlobWriter, destination: &str) {
+        if let Err(e) = writer.abort().await {
+            tracing::warn!("Failed to discard the partial upload of {destination}: {e}");
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+        use super::{BlobStoreError, hash_file};
+        use crate::upload::test_utils::test_package_path;
+        use opendal::ErrorKind;
+        use rattler_digest::{Md5, Sha256, compute_file_digest};
+
+        #[tokio::test]
+        async fn test_hash_file_size_and_hashes_agree_with_the_file() {
+            let path = test_package_path();
+            let hashed = hash_file(&path).await.expect("hashing the package failed");
+
+            assert_eq!(hashed.size, std::fs::metadata(&path).unwrap().len());
+            assert_eq!(
+                hashed.sha256,
+                compute_file_digest::<Sha256>(&path).unwrap(),
+                "recorded sha256 must match the file's"
+            );
+            assert_eq!(
+                hashed.md5,
+                compute_file_digest::<Md5>(&path).unwrap(),
+                "recorded md5 must match the file's"
+            );
+        }
+
+        #[test]
+        fn blob_store_errors_do_not_carry_a_signature() {
+            let err = BlobStoreError::new(
+                opendal::Error::new(ErrorKind::NotFound, "blob not found").with_context(
+                    "url",
+                    "https://acct.blob.core.windows.net/c/p?sv=2025-01-05&sig=s3cr3t",
+                ),
+            );
+
+            let message = err.to_string();
+            assert!(!message.contains("s3cr3t"), "{message}");
+            assert_eq!(err.kind(), ErrorKind::NotFound);
+            assert!(
+                message.contains("acct.blob.core.windows.net/c/p"),
+                "{message}"
+            );
+        }
+    }
+}
 
 /// Returns the style to use for a progress bar that is currently in progress.
 fn default_bytes_style() -> Result<indicatif::ProgressStyle, TemplateError> {

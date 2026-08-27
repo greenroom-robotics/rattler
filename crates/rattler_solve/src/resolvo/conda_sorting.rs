@@ -11,7 +11,7 @@ use resolvo::{
 };
 
 use super::{NameType, SolverMatchSpec, SolverPackageRecord};
-use crate::resolvo::CondaDependencyProvider;
+use crate::{ChannelPriority, resolvo::CondaDependencyProvider};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum CompareStrategy {
@@ -49,6 +49,16 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
         let solvable = pool.resolve_solvable(id);
 
         &solvable.record
+    }
+
+    /// Returns the channel-priority rank of a solvable. A lower rank indicates a
+    /// higher-priority channel. Records without a channel (and virtual packages
+    /// / extras) rank last.
+    fn channel_rank(&self, id: SolvableId) -> u32 {
+        match self.solvable_record(id) {
+            SolverPackageRecord::Record(rec) => self.solver.provider().channel_rank(&rec.channel),
+            SolverPackageRecord::Extra { .. } | SolverPackageRecord::VirtualPackage(..) => u32::MAX,
+        }
     }
 
     /// Reference to the pool
@@ -92,6 +102,18 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
             (false, true) => return Ordering::Less,
             _ => {}
         };
+
+        // Under flexible channel priority, prefer candidates from
+        // higher-priority channels (lower rank) before comparing versions. This
+        // makes the solver exhaust a higher-priority channel's versions before
+        // falling back to a lower-priority channel, while still leaving the
+        // lower-priority channels available as a fallback.
+        if self.solver.provider().channel_priority == ChannelPriority::Flexible {
+            match self.channel_rank(a).cmp(&self.channel_rank(b)) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
 
         // Otherwise, select the variant with the highest version
         match (self.strategy, a_record.version().cmp(&b_record.version())) {
@@ -254,25 +276,27 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
             .sorted_by_key(|name| self.pool().resolve_package_name(*name))
             .collect_vec();
 
-        // A closure that locates the highest version of a dependency for a solvable.
-        let mut find_highest_version_for_set = |version_set_ids: &Vec<VersionSetId>| {
+        // The best version of a dependency that this solvable can end up with.
+        //
+        // A solvable can require the same package more than once: a recipe lists a bare
+        // `nodejs` next to the `nodejs >=26.5.1,<27.0a0` pin from its run-export. Only
+        // versions matching all of the requirements can be selected, so take the lowest
+        // of their highest versions. Taking the highest would score every build by the
+        // bare requirement, which matches everything and separates nothing.
+        //
+        // This is an approximation. It does not intersect the requirements, only takes
+        // the lowest of their individual maxima. Enough to order candidates.
+        let mut find_best_selectable_version = |version_set_ids: &Vec<VersionSetId>| {
             version_set_ids
                 .iter()
                 .filter_map(|id| find_highest_version(*id, self.solver, version_cache))
                 .map(|v| TrackedFeatureVersion::new(v.0, v.1))
-                .fold(None, |init, version| {
-                    if let Some(init) = init {
-                        Some(
-                            if version.compare_with_strategy(&init, CompareStrategy::Default)
-                                == Ordering::Less
-                            {
-                                version
-                            } else {
-                                init
-                            },
-                        )
+                .reduce(|a, b| {
+                    // Better sorts first, so `Greater` means `a` is the more restrictive.
+                    if a.compare_with_strategy(&b, CompareStrategy::Default) == Ordering::Greater {
+                        a
                     } else {
-                        Some(version)
+                        b
                     }
                 })
         };
@@ -283,10 +307,10 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
             for &name in sorted_unique_names.iter() {
                 let a_version = id_and_deps
                     .get(&(*a, name))
-                    .and_then(&mut find_highest_version_for_set);
+                    .and_then(&mut find_best_selectable_version);
                 let b_version = id_and_deps
                     .get(&(*b, name))
-                    .and_then(&mut find_highest_version_for_set);
+                    .and_then(&mut find_best_selectable_version);
 
                 // Deal with the case where resolving the version set doesn't actually select a
                 // version

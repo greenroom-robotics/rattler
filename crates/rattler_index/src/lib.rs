@@ -18,7 +18,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use bytes::buf::Buf;
 use fs_err::{self as fs};
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -26,16 +25,15 @@ use indexmap::IndexMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 #[cfg(any(feature = "s3", feature = "azure"))]
 use opendal::layers::RetryLayer;
-#[cfg(feature = "azure")]
-use opendal::services::AzblobConfig;
 #[cfg(feature = "s3")]
 use opendal::services::S3Config;
 use opendal::{Configurator, Operator, services::FsConfig};
 #[cfg(feature = "azure")]
-use rattler_azure::AzureCredentials;
+use rattler_azure::{AzureCredentials, AzureEndpointKey, AzureLocation, AzureScheme};
 use rattler_conda_types::{
-    ChannelInfo, ChannelRelations, PackageRecord, PatchInstructions, Platform, RepoData, Shard,
-    ShardedRepodata, ShardedSubdirInfo, UrlOrPath, V3Packages, WhlPackageRecord,
+    ChannelInfo, ChannelNotice, ChannelNotices, ChannelRelations, PackageRecord, PatchInstructions,
+    Platform, RepoData, Shard, ShardedRepodata, ShardedSubdirInfo, UrlOrPath, V3Packages,
+    WhlPackageRecord,
     package::{
         CondaArchiveType, DistArchiveIdentifier, DistArchiveType, IndexJson, PackageFile,
         RunExportsJson, WheelArchiveType,
@@ -59,20 +57,25 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing::Instrument;
-#[cfg(any(feature = "s3", feature = "azure"))]
+#[cfg(feature = "s3")]
 use url::Url;
 
-/// Channel metadata written into generated repodata.
+/// Metadata published while indexing a channel.
 ///
-/// Distinct from [`IndexChannelConfig`] — that type describes the indexer's
-/// behavior knobs (zst, shards, revisions, ...). `ChannelMetadata` is just the
-/// data that ends up under `info` in the generated repodata.
+/// Distinct from [`IndexChannelConfig`] — that type also describes indexer
+/// behavior knobs (zst, shards, revisions, ...). This type contains metadata
+/// written to generated repodata and the channel-root `notices.json` file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelMetadata {
     /// The `info.base_url` value written to `repodata.json`.
     pub base_url: Option<String>,
     /// The `info.channel_relations` value written to `repodata.json`.
     pub channel_relations: Option<ChannelRelations>,
+    /// CEP-6 notices to write to the channel root.
+    ///
+    /// `None` leaves an existing `notices.json` untouched, while `Some` writes
+    /// the supplied notices (including an explicitly empty list).
+    pub notices: Option<Vec<ChannelNotice>>,
 }
 
 impl ChannelMetadata {
@@ -84,6 +87,7 @@ impl ChannelMetadata {
                 .channel_relations
                 .clone()
                 .filter(|relations| !relations.is_empty()),
+            notices: config.notices.clone(),
         }
     }
 }
@@ -139,9 +143,11 @@ pub struct IndexStats {
 const REPODATA_FROM_PACKAGES: &str = "repodata_from_packages.json";
 const REPODATA: &str = "repodata.json";
 const REPODATA_SHARDS: &str = "repodata_shards.msgpack.zst";
+const CHANNEL_NOTICES: &str = "notices.json";
 const ZSTD_REPODATA_COMPRESSION_LEVEL: i32 = 19;
 const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
-const CACHE_CONTROL_REPODATA: &str = "public, max-age=300"; // 5 minutes
+/// The `Cache-Control` written on generated repodata.
+pub const CACHE_CONTROL_REPODATA: &str = "public, max-age=300"; // 5 minutes
 
 /// Returns a retry policy optimized for write operations with potential lock contention.
 ///
@@ -772,28 +778,21 @@ async fn index_subdir_inner(
             }
         };
 
-    let existing = op.list_with(&format!("{}/", subdir.as_str())).await?;
-    // get the md5 hashes of each uploaded .conda, storing an optional md5 hash and a archive size
-    // for each, so that we can later check if the contents has changed
-    let uploaded_hashes: HashMap<DistArchiveIdentifier, Option<&str>> = existing
+    // List all the packages in the subdirectory.
+    let uploaded_packages: HashSet<DistArchiveIdentifier> = op
+        .list_with(&format!("{}/", subdir.as_str()))
+        .await?
         .iter()
         .filter_map(|entry| {
-            let meta = entry.metadata();
-            if meta.mode().is_file() {
+            if entry.metadata().mode().is_file() {
+                let filename = entry.name().to_string();
                 // Check if the file is an archive package file.
-                DistArchiveIdentifier::try_from_filename(entry.name())
-                    // opendal populates content_md5 from the backend's Content-MD5
-                    // header on list (verified for azure/azblob via the azure_md5_probe
-                    // test). md5 is documented best-effort, so backends that omit it
-                    // yield None here and those packages get re-indexed.
-                    .map(|id| (id, meta.content_md5()))
+                DistArchiveIdentifier::try_from_filename(&filename)
             } else {
                 None
             }
         })
         .collect();
-    let uploaded_packages: HashSet<DistArchiveIdentifier> =
-        uploaded_hashes.keys().cloned().collect();
 
     tracing::debug!(
         "Found {} already uploaded packages in subdir {}.",
@@ -818,43 +817,6 @@ async fn index_subdir_inner(
     );
 
     for filename in &packages_to_delete {
-        registered_packages.remove(filename);
-    }
-
-    // Re-index packages whose file no longer matches the md5 recorded in the
-    // previous repodata. `.conda`/`.tar.bz2` archives aren't reproducible, so a
-    // package rebuilt and republished under the same filename has different
-    // bytes; without this the stale record's sha256/size are kept and clients
-    // hit a hash mismatch on download. Dropping the mismatched entry here moves
-    // it into `packages_to_add` below, which re-reads and re-hashes it.
-    let stale = registered_packages
-        .iter()
-        .filter(|(id, pkg)| {
-            // Not stale only if the backend's md5 matches the one in the previous
-            // repodata. opendal exposes content_md5 as the base64 Content-MD5 header
-            // (e.g. azure), so decode it to raw bytes before comparing to the record's
-            // 16-byte digest. Missing/undecodable md5 => treat as stale and re-index.
-            if let Some(Some(new_md5)) = uploaded_hashes.get(id)
-                && let Some(old_md5) = pkg.record.md5
-                && let Ok(new_md5) = base64::engine::general_purpose::STANDARD.decode(new_md5)
-                && old_md5.as_slice() == new_md5.as_slice()
-            {
-                false
-            } else {
-                true
-            }
-        })
-        .map(|(id, _)| id.clone())
-        .collect::<Vec<_>>();
-
-    if !stale.is_empty() {
-        tracing::warn!(
-            "Re-indexing {} packages in subdir {} whose md5 changed since the last index.",
-            stale.len(),
-            subdir
-        );
-    }
-    for filename in &stale {
         registered_packages.remove(filename);
     }
 
@@ -1565,11 +1527,12 @@ pub async fn index_s3_with_channel_metadata(
 /// Configuration for `index_azure`
 #[cfg(feature = "azure")]
 pub struct IndexAzureConfig {
-    /// The channel to index, as an Azure Blob URL
-    /// (`https://<account>.blob.core.windows.net/<container>/<prefix>`).
-    pub channel: Url,
+    /// The channel to index.
+    pub location: AzureLocation,
     /// The credentials to use for Azure Blob access.
     pub credentials: AzureCredentials,
+    /// The wire scheme.
+    pub scheme: AzureScheme,
     /// The target platform to index.
     pub target_platform: Option<Platform>,
     /// The path to a repodata patch to apply to the index.
@@ -1588,77 +1551,24 @@ pub struct IndexAzureConfig {
     pub max_parallel: usize,
     /// The multi-progress bar to use for the index.
     pub multi_progress: Option<MultiProgress>,
-    // NOTE: no `precondition_checks` field. opendal's azblob service does not
-    // support conditional (`if_match`) writes, so precondition checks can only
-    // ever be disabled here; the Azure path hardcodes `Disabled` rather than
-    // exposing a knob whose enabled state always fails.
+    // NOTE: no `precondition_checks` field. opendal's azblob service supports no
+    // conditional (`if_match`) writes, so any index of an already-populated channel
+    // would fail under `Enabled`; the Azure path hardcodes `Disabled`.
 }
 
-/// Build an opendal `AzblobConfig` from a channel URL and credentials.
-///
-/// The account name, endpoint, container, and root prefix are all derived from
-/// the URL (`https://<account>.blob.core.windows.net/<container>/<prefix>`); the
-/// credentials supply only the account key or SAS token.
-#[cfg(feature = "azure")]
-fn azblob_config(
-    credentials: &AzureCredentials,
-    channel: &Url,
-) -> Result<AzblobConfig, anyhow::Error> {
-    let host = channel
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("No host in Azure blob URL"))?;
-    let account_name = host
-        .split('.')
-        .next()
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Could not derive account name from Azure blob URL"))?;
-
-    let mut segments = channel
-        .path_segments()
-        .ok_or_else(|| anyhow::anyhow!("No path in Azure blob URL"))?;
-    let container = segments
-        .next()
-        .filter(|segment| !segment.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("No container in Azure blob URL"))?;
-    let root = format!("/{}", segments.collect::<Vec<_>>().join("/"));
-
-    // Preserve a non-default port so custom endpoints (e.g. the Azurite
-    // emulator on :10000) work; real Azure uses the scheme default (443).
-    let authority = match channel.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    };
-
-    let (account_key, sas_token) = match credentials {
-        AzureCredentials::AccountKey(key) => (Some(key.clone()), None),
-        AzureCredentials::SasToken(token) => (None, Some(token.clone())),
-    };
-
-    Ok(AzblobConfig {
-        endpoint: Some(format!("{}://{}", channel.scheme(), authority)),
-        account_name: Some(account_name.to_string()),
-        container: container.to_string(),
-        root: Some(root),
-        account_key,
-        sas_token,
-        ..Default::default()
-    })
-}
-
-/// Create a new `repodata.json` for all packages in the channel at the given
-/// Azure Blob URL.
+/// Create a new `repodata.json` for all packages in the Azure Blob channel.
 #[cfg(feature = "azure")]
 pub async fn index_azure(config: IndexAzureConfig) -> anyhow::Result<()> {
     index_azure_with_channel_metadata(config, ChannelMetadata::default()).await
 }
 
-/// Create a new `repodata.json` for all packages in the channel at the given
-/// Azure Blob URL and write channel metadata into the generated repodata.
+/// As [`index_azure`], writing channel metadata into the generated repodata.
 #[cfg(feature = "azure")]
 pub async fn index_azure_with_channel_metadata(
     IndexAzureConfig {
-        channel,
+        location,
         credentials,
+        scheme,
         target_platform,
         repodata_patch,
         write_zst,
@@ -1671,9 +1581,35 @@ pub async fn index_azure_with_channel_metadata(
     }: IndexAzureConfig,
     channel_metadata: ChannelMetadata,
 ) -> anyhow::Result<()> {
-    let azblob_config = azblob_config(&credentials, &channel)?;
+    let azblob_config = rattler_azure::azblob_config(&credentials, &location, scheme)?;
+    let (key, container) = location.addressed()?;
     let builder = azblob_config.into_builder();
-    let op = Operator::new(builder)?.layer(RetryLayer::new()).finish();
+    // opendal's default retry interceptor logs the error with its `url` context, and
+    // for a SAS the credential is *in* that URL. Same message, signature masked.
+    let op = Operator::new(builder)?
+        .layer(
+            RetryLayer::new().with_notify(|event: opendal::layers::RetryEvent<'_>| {
+                tracing::warn!(
+                    target: "opendal::layers::retry",
+                    "will retry {:?} (attempt {}) after {}s because: {}",
+                    event.op,
+                    event.attempt,
+                    event.retry_after.as_secs_f64(),
+                    rattler_redaction::redact_signatures_in_text(
+                        &format!("{:?}", event.err),
+                        rattler_redaction::DEFAULT_REDACTION_STR,
+                    ),
+                );
+            }),
+        )
+        .finish();
+
+    // A missing container answers a list with the same `NotFound` an empty prefix
+    // does, so ask once here, where the answer can still be attributed to the
+    // container and account.
+    if let Err(e) = op.list_with("").await {
+        return Err(explain_azure_error(e, key, container));
+    }
 
     index_with_channel_metadata(
         target_platform,
@@ -1686,13 +1622,73 @@ pub async fn index_azure_with_channel_metadata(
         force,
         max_parallel,
         multi_progress,
-        // opendal's azblob service can't do conditional writes, so preconditions
-        // must be disabled (matching the filesystem backend).
         PreconditionChecks::Disabled,
         channel_metadata,
     )
     .await
     .map(|_| ())
+    .map_err(|e| annotate_azure_failure(e, key, container))
+}
+
+/// Names the account and container an opendal error does not mention.
+#[cfg(feature = "azure")]
+fn explain_azure_error(
+    error: opendal::Error,
+    key: &AzureEndpointKey,
+    container: &rattler_azure::ContainerName,
+) -> anyhow::Error {
+    let account = key.account();
+    match error.kind() {
+        opendal::ErrorKind::NotFound => anyhow::Error::new(error).context(format!(
+            "could not list container `{container}` in account `{account}`: the container may not \
+             exist, or the account name may not be the one you meant"
+        )),
+        opendal::ErrorKind::PermissionDenied => {
+            anyhow::Error::new(error).context(azure_permission_denied_hint(key, container))
+        }
+        _ => anyhow::Error::new(error).context(format!(
+            "failed to reach container `{container}` in account `{account}`"
+        )),
+    }
+}
+
+#[cfg(feature = "azure")]
+fn azure_permission_denied_hint(
+    key: &AzureEndpointKey,
+    container: &rattler_azure::ContainerName,
+) -> String {
+    let account = key.account();
+    let addressing = match key {
+        AzureEndpointKey::HostStyle(_) => format!(
+            "; `{account}` was taken from the host's first label, so if the account is a path \
+             segment instead, name the endpoint `{}/<account>`",
+            key.host()
+        ),
+        AzureEndpointKey::PathStyle(_) => String::new(),
+    };
+    format!(
+        "access to container `{container}` in account `{account}` was denied; a SAS minted by \
+         `--azure-cli` expires after `--azure-cli-sas-ttl-minutes` (30 by default) and is not \
+         renewed mid-run, so a long index can outlive it{addressing}"
+    )
+}
+
+#[cfg(feature = "azure")]
+fn annotate_azure_failure(
+    error: anyhow::Error,
+    key: &AzureEndpointKey,
+    container: &rattler_azure::ContainerName,
+) -> anyhow::Error {
+    let denied = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<opendal::Error>())
+        .any(|cause| cause.kind() == opendal::ErrorKind::PermissionDenied);
+
+    if denied {
+        error.context(azure_permission_denied_hint(key, container))
+    } else {
+        error
+    }
 }
 
 /// Create a new `repodata.json` for all packages in the given operator's root.
@@ -1759,6 +1755,11 @@ pub async fn index_with_channel_metadata(
     precondition_checks: PreconditionChecks,
     channel_metadata: ChannelMetadata,
 ) -> anyhow::Result<IndexStats> {
+    let notices_metadata = if channel_metadata.notices.is_some() {
+        Some(RepodataFileMetadata::new(&op, CHANNEL_NOTICES, precondition_checks).await?)
+    } else {
+        None
+    };
     let entries = op.list_with("").await?;
 
     // If requested `target_platform` subdir does not exist, we create it.
@@ -1863,7 +1864,45 @@ pub async fn index_with_channel_metadata(
             }
         }
     }
+
+    // Publish notices only after all repodata updates succeeded, so a failed
+    // indexing operation cannot partially update channel-level messaging.
+    if let (Some(notices), Some(metadata)) = (&channel_metadata.notices, notices_metadata.as_ref())
+    {
+        write_channel_notices_with_metadata(&op, notices, metadata).await?;
+    }
+
     Ok(stats)
+}
+
+/// Write CEP-6 channel notices to the channel root.
+pub async fn write_channel_notices(op: &Operator, notices: &[ChannelNotice]) -> anyhow::Result<()> {
+    let metadata =
+        RepodataFileMetadata::new(op, CHANNEL_NOTICES, PreconditionChecks::Disabled).await?;
+    write_channel_notices_with_metadata(op, notices, &metadata).await
+}
+
+async fn write_channel_notices_with_metadata(
+    op: &Operator,
+    notices: &[ChannelNotice],
+    metadata: &RepodataFileMetadata,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(&ChannelNotices {
+        notices: notices.to_vec(),
+    })?;
+    let mut writer = op
+        .write_with(CHANNEL_NOTICES, bytes)
+        .content_type("application/json")
+        .cache_control(CACHE_CONTROL_REPODATA);
+    if metadata.precondition_checks.is_enabled() {
+        if let Some(etag) = &metadata.etag {
+            writer = writer.if_match(etag);
+        } else if !metadata.file_existed {
+            writer = writer.if_not_exists(true);
+        }
+    }
+    writer.await?;
+    Ok(())
 }
 
 /// Ensures that a channel has a valid `noarch/repodata.json` file.
@@ -1998,46 +2037,17 @@ mod tests {
 
     #[cfg(feature = "azure")]
     #[test]
-    fn azblob_config_derives_fields_from_url() {
-        let channel =
-            Url::parse("https://stgrcondachannel.blob.core.windows.net/general/sub/dir").unwrap();
-        let credentials = AzureCredentials::SasToken("sv=token".to_string());
-
-        let config = azblob_config(&credentials, &channel).unwrap();
-
-        assert_eq!(
-            config.endpoint.as_deref(),
-            Some("https://stgrcondachannel.blob.core.windows.net")
-        );
-        assert_eq!(config.account_name.as_deref(), Some("stgrcondachannel"));
-        assert_eq!(config.container, "general");
-        assert_eq!(config.root.as_deref(), Some("/sub/dir"));
-        assert_eq!(config.sas_token.as_deref(), Some("sv=token"));
-        assert_eq!(config.account_key, None);
-    }
-
-    #[cfg(feature = "azure")]
-    #[test]
-    fn azblob_config_container_only_url() {
-        let channel = Url::parse("https://stgrcondachannel.blob.core.windows.net/general").unwrap();
-        let credentials = AzureCredentials::AccountKey("key".to_string());
-
-        let config = azblob_config(&credentials, &channel).unwrap();
-
-        assert_eq!(config.container, "general");
-        assert_eq!(config.root.as_deref(), Some("/"));
-        assert_eq!(config.account_key.as_deref(), Some("key"));
-        assert_eq!(config.sas_token, None);
-    }
-
-    #[cfg(feature = "azure")]
-    #[test]
     fn azblob_config_preserves_non_default_port() {
-        let channel =
-            Url::parse("http://devstoreaccount1.blob.localhost:10000/testcontainer/ch").unwrap();
-        let credentials = AzureCredentials::AccountKey("key".to_string());
+        let channel = rattler_azure::AzureChannelUrl::parse(
+            "az://devstoreaccount1.blob.localhost:10000/testcontainer/ch",
+        )
+        .unwrap();
+        let location =
+            rattler_azure::locate_as(&channel, rattler_azure::AzureAddressing::HostStyle).unwrap();
+        let credentials = AzureCredentials::AccountKey("key".into());
 
-        let config = azblob_config(&credentials, &channel).unwrap();
+        let config =
+            rattler_azure::azblob_config(&credentials, &location, AzureScheme::Http).unwrap();
 
         assert_eq!(
             config.endpoint.as_deref(),

@@ -20,12 +20,15 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use url::Url;
 
+use crate::config::azure::AzureOptionsMap;
 use crate::config::s3::S3OptionsMap;
 use crate::config::{
     build::BuildConfig, concurrency::ConcurrencyConfig, index::IndexConfig, proxy::ProxyConfig,
     repodata_config::RepodataConfig, run_post_link_scripts::RunPostLinkScripts,
 };
+use crate::locations::{ConfigLayer, ConfigLocation};
 
+pub mod azure;
 pub mod build;
 pub mod channel_config;
 pub mod concurrency;
@@ -194,6 +197,10 @@ pub struct CommonConfig {
     #[serde(skip_serializing_if = "S3OptionsMap::is_default")]
     pub s3_options: S3OptionsMap,
 
+    #[serde(default)]
+    #[serde(skip_serializing_if = "AzureOptionsMap::is_default")]
+    pub azure_options: AzureOptionsMap,
+
     /// Per-channel configuration for `rattler-index`.
     #[serde(default, skip_serializing_if = "IndexConfig::is_empty")]
     pub index_config: IndexConfig,
@@ -251,6 +258,7 @@ impl Default for CommonConfig {
             concurrency: ConcurrencyConfig::default(),
             proxy_config: ProxyConfig::default(),
             s3_options: S3OptionsMap::default(),
+            azure_options: AzureOptionsMap::default(),
             index_config: IndexConfig::default(),
             run_post_link_scripts: None,
             allow_symbolic_links: None,
@@ -305,6 +313,7 @@ impl Config for CommonConfig {
             concurrency: self.concurrency.merge_config(&other.concurrency)?,
             proxy_config: self.proxy_config.merge_config(&other.proxy_config)?,
             s3_options: self.s3_options.merge_config(&other.s3_options)?,
+            azure_options: self.azure_options.merge_config(&other.azure_options)?,
             index_config: self.index_config.merge_config(&other.index_config)?,
             run_post_link_scripts: other
                 .run_post_link_scripts
@@ -322,6 +331,7 @@ impl Config for CommonConfig {
         self.concurrency.validate()?;
         self.proxy_config.validate()?;
         self.s3_options.validate()?;
+        self.azure_options.validate()?;
         self.index_config.validate()?;
         Ok(())
     }
@@ -338,6 +348,7 @@ impl Config for CommonConfig {
             "allow-hard-links".to_string(),
             "allow-ref-links".to_string(),
             "s3-options".to_string(),
+            "azure-options".to_string(),
             "index-config".to_string(),
         ];
         keys.extend(prefixed_keys("build", self.build.keys()));
@@ -348,6 +359,7 @@ impl Config for CommonConfig {
         keys.extend(prefixed_keys("concurrency", self.concurrency.keys()));
         keys.extend(prefixed_keys("proxy-config", self.proxy_config.keys()));
         keys.extend(prefixed_keys("s3-options", self.s3_options.keys()));
+        keys.extend(prefixed_keys("azure-options", self.azure_options.keys()));
         keys
     }
 }
@@ -432,6 +444,9 @@ where
     /// should surface these to the user as warnings (they are typos or
     /// keys of other tools).
     pub fn from_toml_str(input: &str) -> Result<(Self, BTreeSet<String>), toml::de::Error> {
+        azure::ensure_no_colliding_keys(&input.parse()?)
+            .map_err(serde::de::Error::custom::<String>)?;
+
         // The document is deserialized twice: once into the common
         // configuration and once into the extension. Each pass records the
         // keys it did not recognize; only keys unknown to *both* passes are
@@ -493,10 +508,64 @@ where
         ))
     }
 
+    /// Parse a *shared* configuration file from a TOML string.
+    ///
+    /// Shared files (see [`crate::locations::ConfigLayer::Shared`]) may only
+    /// contain the keys shared by all rattler-based tools: the document is
+    /// deserialized into [`CommonConfig`] alone and the extension is left at
+    /// its default. Returns the parsed configuration together with the set
+    /// of keys [`CommonConfig`] did not recognize, including extension keys
+    /// the tool itself would understand, so that a shared file means the
+    /// same thing to every tool reading it.
+    pub fn from_toml_str_shared(input: &str) -> Result<(Self, BTreeSet<String>), toml::de::Error> {
+        let mut unknown = BTreeSet::new();
+        let common: CommonConfig = serde_ignored::deserialize(
+            toml::de::Deserializer::parse(input)?,
+            |path: serde_ignored::Path<'_>| {
+                unknown.insert(path.to_string());
+            },
+        )?;
+
+        Ok((
+            Self {
+                common,
+                extensions: T::default(),
+                loaded_from: Vec::new(),
+            },
+            unknown,
+        ))
+    }
+
+    /// Parse the file at `path` according to its `layer` and merge it into
+    /// `self`, warning about ignored keys.
+    fn merge_from_path(self, path: &Path, layer: ConfigLayer) -> Result<Self, LoadError> {
+        let content = fs_err::read_to_string(path)?;
+        let (mut other, unused) = match layer {
+            ConfigLayer::Shared => Self::from_toml_str_shared(&content)?,
+            ConfigLayer::Tool => Self::from_toml_str(&content)?,
+        };
+        for key in &unused {
+            match layer {
+                ConfigLayer::Shared => tracing::warn!(
+                    "Ignoring configuration key `{key}` in {}: not a key shared by all rattler-based tools",
+                    path.display()
+                ),
+                ConfigLayer::Tool => tracing::warn!(
+                    "Ignoring unknown configuration key `{key}` in {}",
+                    path.display()
+                ),
+            }
+        }
+        other.loaded_from.push(path.to_path_buf());
+        self.merge_config(&other)
+            .map_err(|e| LoadError::MergeError(e, path.to_path_buf()))
+    }
+
     /// Load the configuration by merging all the given files, in order:
-    /// later files take precedence over earlier ones. Unrecognized keys are
-    /// reported as `tracing` warnings; the merged configuration is validated
-    /// before it is returned.
+    /// later files take precedence over earlier ones. Every file is parsed
+    /// as a tool file (common keys plus extension keys); unrecognized keys
+    /// are reported as `tracing` warnings. The merged configuration is
+    /// validated before it is returned.
     ///
     /// Missing files result in an error; callers that search default
     /// locations should filter for existing files first (see
@@ -506,37 +575,43 @@ where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        Self::load_from_locations(paths.into_iter().map(|path| ConfigLocation {
+            path: path.as_ref().to_path_buf(),
+            layer: ConfigLayer::Tool,
+        }))
+    }
+
+    /// Load the configuration by merging all the given locations, in order:
+    /// later locations take precedence over earlier ones. Each file is
+    /// parsed according to its layer: shared files accept only the common
+    /// keys (see [`ConfigBase::from_toml_str_shared`]), tool files also
+    /// accept the extension keys. Unrecognized keys are reported as
+    /// `tracing` warnings; the merged configuration is validated before it
+    /// is returned.
+    pub fn load_from_locations<I>(locations: I) -> Result<Self, LoadError>
+    where
+        I: IntoIterator<Item = ConfigLocation>,
+    {
         let mut config = Self::default();
 
-        for path in paths {
-            let path = path.as_ref();
-            let content = fs_err::read_to_string(path)?;
-            let (mut other, unused) = Self::from_toml_str(&content)?;
-            for key in &unused {
-                tracing::warn!(
-                    "Ignoring unknown configuration key `{key}` in {}",
-                    path.display()
-                );
-            }
-            other.loaded_from.push(path.to_path_buf());
-            config = config
-                .merge_config(&other)
-                .map_err(|e| LoadError::MergeError(e, path.to_path_buf()))?;
+        for location in locations {
+            config = config.merge_from_path(&location.path, location.layer)?;
         }
 
         config.validate()?;
         Ok(config)
     }
 
-    /// Load the configuration from the default locations of the given tools
-    /// (e.g. `&["pixi", "rattler-build"]`), skipping files that do not
-    /// exist. See [`crate::locations::config_search_paths`] for the exact
-    /// search order.
-    pub fn load_from_default_locations(tool_dirs: &[&str]) -> Result<Self, LoadError> {
-        Self::load_from_files(
-            crate::locations::config_search_paths(tool_dirs)
+    /// Load the configuration from the default locations of the given tool
+    /// (e.g. `"rattler-build"`), skipping files that do not exist: the
+    /// shared `rattler` configuration layered with the tool's own files.
+    /// See [`crate::locations::config_search_paths`] for the exact search
+    /// order.
+    pub fn load_from_default_locations(tool: &str) -> Result<Self, LoadError> {
+        Self::load_from_locations(
+            crate::locations::config_search_paths(tool)
                 .into_iter()
-                .filter(|path| path.is_file()),
+                .filter(|location| location.path.is_file()),
         )
     }
 }

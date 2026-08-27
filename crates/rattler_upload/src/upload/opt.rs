@@ -1,7 +1,7 @@
 //! Command-line options.
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, builder::TypedValueParser as _};
 use rattler_conda_types::utils::url_with_trailing_slash::UrlWithTrailingSlash;
 use rattler_networking::AuthenticationStorage;
 use url::Url;
@@ -123,6 +123,9 @@ pub enum ServerType {
     Cloudsmith(CloudsmithOpts),
     #[cfg(feature = "s3")]
     S3(S3Opts),
+    #[cfg(feature = "azure")]
+    #[command(name = "az")]
+    Azure(AzureOpts),
     #[clap(hide = true)]
     CondaForge(CondaForgeOpts),
 }
@@ -412,8 +415,47 @@ pub struct S3Opts {
     pub credentials: rattler_s3::clap::S3CredentialsOpts,
 
     /// Replace files if it already exists.
-    #[arg(long)]
-    pub force: bool,
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new().map(ForceOverwrite)
+    )]
+    pub force: ForceOverwrite,
+}
+
+/// Options for uploading to Azure Blob Storage.
+///
+/// Authenticate with `--account-key`, `--sas-token` or `--azure-cli`. More than
+/// one may be given: `--azure-cli` wins over `--sas-token`, which wins over
+/// `--account-key`.
+#[cfg(feature = "azure")]
+#[derive(Clone, Debug, PartialEq, Parser)]
+pub struct AzureOpts {
+    /// The channel URL in the Azure Blob container to upload the package to,
+    /// e.g., `az://myaccount.blob.core.windows.net/my-container/my-channel`
+    #[arg(short, long, env = "AZURE_CHANNEL")]
+    pub channel: rattler_azure::AzureChannelUrl,
+
+    /// Read the storage account from the channel URL's first path segment rather
+    /// than the host's first label.
+    ///
+    /// Needed for an endpoint that fronts an account instead of being named after
+    /// one — an IP literal, a single-label host, the Azurite emulator.
+    // The account itself is not a flag: it is already at path segment 0 of the
+    // channel URL, and naming it twice would let the two disagree.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub path_style: bool,
+
+    #[clap(flatten)]
+    pub credentials: rattler_azure::clap::AzureCredentialsOpts,
+
+    /// Replace files if it already exists.
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new().map(ForceOverwrite)
+    )]
+    pub force: ForceOverwrite,
 }
 
 #[derive(Debug)]
@@ -601,5 +643,57 @@ impl CondaForgeData {
             provider,
             dry_run,
         }
+    }
+}
+
+#[cfg(all(test, feature = "azure"))]
+mod test {
+    use super::{AzureOpts, ForceOverwrite};
+    use clap::Parser;
+
+    #[test]
+    fn test_azure_path_style_selects_the_account_from_the_path() {
+        let args = [
+            "az",
+            "--channel",
+            "az://proxy.internal/accta/general/mychannel",
+        ];
+
+        let host_style = AzureOpts::try_parse_from(args).unwrap();
+        assert!(!host_style.path_style);
+        let located =
+            rattler_azure::locate_as(&host_style.channel, host_style.path_style.into()).unwrap();
+        assert_eq!(located.addressed().unwrap().0.account().as_str(), "proxy");
+
+        let path_style = AzureOpts::try_parse_from(args.iter().chain(["--path-style"].iter()))
+            .expect("--path-style should parse");
+        assert!(path_style.path_style);
+        let located =
+            rattler_azure::locate_as(&path_style.channel, path_style.path_style.into()).unwrap();
+        let (key, container) = located.addressed().unwrap();
+        assert_eq!(key.account().as_str(), "accta");
+        assert_eq!(key.to_string(), "proxy.internal/accta");
+        assert_eq!(container.as_str(), "general");
+    }
+
+    #[test]
+    fn test_azure_host_style_refuses_a_host_with_no_account_label() {
+        let opts = AzureOpts::try_parse_from([
+            "az",
+            "--channel",
+            "az://127.0.0.1:10000/devstoreaccount1/general",
+        ])
+        .unwrap();
+        assert!(rattler_azure::locate_as(&opts.channel, opts.path_style.into()).is_err());
+    }
+
+    #[test]
+    fn test_azure_force_parses_as_a_flag() {
+        let args = ["az", "--channel", "az://account.blob.core.windows.net/c"];
+        let opts = AzureOpts::try_parse_from(args).unwrap();
+        assert_eq!(opts.force, ForceOverwrite(false));
+
+        let opts = AzureOpts::try_parse_from(args.iter().chain(["--force"].iter())).unwrap();
+        assert_eq!(opts.force, ForceOverwrite(true));
     }
 }

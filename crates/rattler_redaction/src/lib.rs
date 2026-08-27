@@ -1,7 +1,51 @@
+use std::borrow::Cow;
+
 use url::Url;
 
 /// A default string to use for redaction.
 pub const DEFAULT_REDACTION_STR: &str = "********";
+
+/// The signature is the credential itself; the rest of such a URL is inert without
+/// it and stays readable.
+const SIGNATURE_PARAM: &str = "sig";
+
+/// Mask the signature of a pre-signed URL wherever one appears in `text`.
+///
+/// Takes text rather than a [`Url`] because that is the shape the leak has:
+/// storage backends quote the request URL inside error messages.
+pub fn redact_signatures_in_text<'a>(text: &'a str, redaction: &str) -> Cow<'a, str> {
+    let mut out = String::new();
+    let mut written = 0;
+
+    for (separator, _) in text.char_indices().filter(|(_, c)| *c == '?' || *c == '&') {
+        let pair = &text[separator + 1..];
+        let Some(equals) = pair.find('=') else {
+            continue;
+        };
+        if !pair[..equals].eq_ignore_ascii_case(SIGNATURE_PARAM) {
+            continue;
+        }
+
+        let value = separator + 1 + equals + 1;
+        let end = value
+            + text[value..]
+                .find(|c: char| c == '&' || c.is_whitespace() || "\"',)]}".contains(c))
+                .unwrap_or(text.len() - value);
+        if end == value || value < written {
+            continue;
+        }
+
+        out.push_str(&text[written..value]);
+        out.push_str(redaction);
+        written = end;
+    }
+
+    if written == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[written..]);
+    Cow::Owned(out)
+}
 
 /// Anaconda channels are not always publicly available. This function checks if a URL contains a
 /// secret by identifying whether it contains certain patterns. If it does, the function returns a
@@ -28,28 +72,43 @@ pub fn redact_known_secrets_from_url(url: &Url, redaction: &str) -> Option<Url> 
         url.set_password(Some(redaction)).ok()?;
     }
 
-    let mut segments = url.path_segments()?;
-    match (segments.next(), segments.next()) {
-        (Some("t"), Some(_)) => {
-            let remainder = segments.collect::<Vec<_>>();
-            let mut redacted_path = format!(
-                "t/{redaction}{separator}",
-                separator = if remainder.is_empty() { "" } else { "/" },
-            );
-
-            for (idx, segment) in remainder.iter().enumerate() {
-                redacted_path.push_str(segment);
-                // if the original url ends with a slash, we need to add it to the redacted path
-                if idx < remainder.len() - 1 {
-                    redacted_path.push('/');
-                }
-            }
-
-            url.set_path(&redacted_path);
-            Some(url)
-        }
-        _ => Some(url),
+    if let Some(query) = url.query()
+        && let Cow::Owned(masked) = redact_signatures_in_text(&format!("?{query}"), redaction)
+    {
+        url.set_query(Some(&masked[1..]));
     }
+
+    // A URL that cannot be a base has no `/t/<token>/` to mask but may still have
+    // carried a signature above; returning `None` would throw that masking away,
+    // since callers fall back to the unredacted URL.
+    let token_prefixed = url.path_segments().is_some_and(|mut segments| {
+        matches!((segments.next(), segments.next()), (Some("t"), Some(_)))
+    });
+
+    if token_prefixed {
+        let remainder = url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .skip(2)
+            .collect::<Vec<_>>();
+        let mut redacted_path = format!(
+            "t/{redaction}{separator}",
+            separator = if remainder.is_empty() { "" } else { "/" },
+        );
+
+        for (idx, segment) in remainder.iter().enumerate() {
+            redacted_path.push_str(segment);
+            // if the original url ends with a slash, we need to add it to the redacted path
+            if idx < remainder.len() - 1 {
+                redacted_path.push('/');
+            }
+        }
+
+        url.set_path(&redacted_path);
+    }
+
+    Some(url)
 }
 
 /// A trait to redact known secrets from a type.
@@ -94,6 +153,37 @@ impl Redact for Url {
 mod test {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn test_redact_signatures_in_text() {
+        let message = "unexpected status code 403, url=https://acct.blob.core.windows.net/c/p?sv=2025-01-05&se=2026-08-05T00%3A00Z&sig=aBcD%2Fefg%3D, op=stat";
+        assert_eq!(
+            redact_signatures_in_text(message, DEFAULT_REDACTION_STR),
+            format!(
+                "unexpected status code 403, url=https://acct.blob.core.windows.net/c/p?sv=2025-01-05&se=2026-08-05T00%3A00Z&sig={DEFAULT_REDACTION_STR}, op=stat"
+            )
+        );
+
+        assert!(matches!(
+            redact_signatures_in_text("https://prefix.dev/conda-forge?a=b", "X"),
+            Cow::Borrowed(_)
+        ));
+
+        assert_eq!(
+            redact_signatures_in_text("https://h/p?design=keep&sig=drop", "X"),
+            "https://h/p?design=keep&sig=X"
+        );
+
+        assert_eq!(
+            Url::from_str("https://acct.blob.core.windows.net/c/p?sv=2025-01-05&sig=secret")
+                .unwrap()
+                .redact()
+                .to_string(),
+            format!(
+                "https://acct.blob.core.windows.net/c/p?sv=2025-01-05&sig={DEFAULT_REDACTION_STR}"
+            )
+        );
+    }
 
     #[test]
     fn test_remove_known_secrets_from_url() {
@@ -145,5 +235,16 @@ mod test {
             redacted.to_string(),
             format!("https://user:{DEFAULT_REDACTION_STR}@prefix.dev/conda-forge/")
         );
+    }
+
+    #[test]
+    fn a_url_that_cannot_be_a_base_still_has_its_signature_masked() {
+        let redacted = redact_known_secrets_from_url(
+            &Url::from_str("az:container/repodata.json?sig=secret").unwrap(),
+            DEFAULT_REDACTION_STR,
+        )
+        .expect("a signature must be masked even with no path segments to inspect");
+
+        assert!(!redacted.to_string().contains("secret"), "{redacted}");
     }
 }

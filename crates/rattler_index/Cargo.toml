@@ -1,7 +1,7 @@
 [package]
 exclude = ["tests/**"]
 name = "rattler_index"
-version = "0.30.9"
+version = "0.30.11"
 edition.workspace = true
 authors = []
 description = "A crate to index conda channels and create a repodata.json file."
@@ -28,7 +28,7 @@ rustls = [
   "opendal/reqwest-rustls-tls",
 ]
 s3 = ["opendal/services-s3", "dep:rattler_s3"]
-azure = ["opendal/services-azblob", "dep:rattler_azure"]
+azure = ["opendal/services-azblob", "dep:rattler_azure", "rattler_azure/opendal"]
 
 [[bin]]
 name = "rattler-index"
@@ -38,7 +38,6 @@ path = "src/main.rs"
 thiserror = { workspace = true }
 ahash = { workspace = true }
 anyhow = { workspace = true }
-base64 = { workspace = true }
 bytes = { workspace = true }
 indexmap = { workspace = true }
 jiff = { workspace = true }
@@ -58,6 +57,7 @@ rattler_networking = { workspace = true, default-features = false, features = [
 ] }
 rattler_conda_types = { workspace = true, default-features = false }
 rattler_digest = { workspace = true, default-features = false }
+rattler_redaction = { workspace = true, default-features = false }
 rattler_package_streaming = { workspace = true, default-features = false }
 hex = { workspace = true }
 rattler_azure = { workspace = true, optional = true, features = ["clap"] }
@@ -79,9 +79,20 @@ url = { workspace = true }
 zstd = { workspace = true }
 retry-policies = { workspace = true }
 
+[[test]]
+name = "azure_azurite"
+required-features = ["azure"]
+
 [dev-dependencies]
 rattler_repodata_gateway = { path = "../rattler_repodata_gateway", default-features = false, features = [
   "sparse",
 ] }
 tempfile = { workspace = true }
 tools = { path = "../tools", default-features = false }
+rattler_networking = { workspace = true, default-features = false, features = [
+  "system-integration",
+  "azure",
+] }
+reqwest-middleware = { workspace = true }
+# Reaches reqsign's env provider without an unsafe `set_var`.
+temp-env = { workspace = true }

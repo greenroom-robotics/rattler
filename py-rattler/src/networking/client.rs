@@ -2,10 +2,10 @@ use crate::{
     error::PyRattlerError,
     networking::middleware::{AddHeadersMiddleware, PyMiddleware},
 };
-use pyo3::{PyResult, pyclass, pymethods};
+use pyo3::{PyResult, exceptions::PyValueError, pyclass, pymethods};
 use rattler_networking::{
-    AuthenticationMiddleware, AuthenticationStorage, GCSMiddleware, LazyClient, MirrorMiddleware,
-    OciMiddleware, S3Middleware,
+    AuthenticationMiddleware, AuthenticationStorage, AzureMiddleware, GCSMiddleware, LazyClient,
+    MirrorMiddleware, OciMiddleware, S3Middleware,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest_middleware::ClientWithMiddleware;
@@ -22,6 +22,29 @@ pub struct PyClientWithMiddleware {
     pub(crate) inner: ClientWithMiddleware,
 }
 
+/// `AzureMiddleware` may not precede `AuthenticationMiddleware`.
+fn check_middleware_order(middlewares: &[PyMiddleware]) -> PyResult<()> {
+    let azure = middlewares
+        .iter()
+        .position(|m| matches!(m, PyMiddleware::Azure(_)));
+    let authentication = middlewares
+        .iter()
+        .position(|m| matches!(m, PyMiddleware::Authentication(_)));
+
+    match (azure, authentication) {
+        (Some(azure), Some(authentication)) if azure < authentication => {
+            Err(PyValueError::new_err(
+                "AzureMiddleware must come after AuthenticationMiddleware. AzureMiddleware rewrites \
+             `az://` URLs to `https://`, and AuthenticationMiddleware ignores URLs that are not \
+             already http(s), so this order would let a stored `*.blob.core.windows.net` \
+             credential attach to a container that has no `azure-options` grant. Write \
+             `Client([AuthenticationMiddleware(), AzureMiddleware()])` instead.",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 #[pymethods]
 impl PyClientWithMiddleware {
     #[new]
@@ -33,6 +56,7 @@ impl PyClientWithMiddleware {
         timeout: Option<u64>,
     ) -> PyResult<Self> {
         let middlewares = middlewares.unwrap_or_default();
+        check_middleware_order(&middlewares)?;
 
         let mut client_builder = reqwest::Client::builder();
 
@@ -79,10 +103,18 @@ impl PyClientWithMiddleware {
                     client = client.with(RetryTransientMiddleware::new_with_policy(policy));
                 }
                 PyMiddleware::Oci(_middleware) => {
-                    client = client.with(OciMiddleware::new(reqwest_client.clone()));
+                    client = client.with(
+                        OciMiddleware::new(reqwest_client.clone()).with_authentication_storage(
+                            AuthenticationStorage::from_env_and_defaults()
+                                .map_err(PyRattlerError::from)?,
+                        ),
+                    );
                 }
                 PyMiddleware::Gcs(middleware) => {
                     client = client.with(GCSMiddleware::from(middleware));
+                }
+                PyMiddleware::Azure(_middleware) => {
+                    client = client.with(AzureMiddleware::anonymous(reqwest_client.clone()));
                 }
                 PyMiddleware::S3(middleware) => {
                     client = client.with(S3Middleware::new(

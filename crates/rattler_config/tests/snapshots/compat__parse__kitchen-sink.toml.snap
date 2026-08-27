@@ -1,5 +1,6 @@
 ---
 source: crates/rattler_config/tests/compat.rs
+assertion_line: 64
 expression: "(unused, normalized(config))"
 ---
 (
@@ -206,6 +207,43 @@ expression: "(unused, normalized(config))"
                     },
                 },
             ),
+            azure_options: AzureOptionsMap(
+                {
+                    PathStyle(
+                        AccountPath {
+                            host: AzureHost("127.0.0.1:10000"),
+                            account: AccountName(
+                                "devstoreaccount1",
+                            ),
+                        },
+                    ): AzureEndpointOptions {
+                        scheme: Http,
+                        auth: {
+                            ContainerName(
+                                "general",
+                            ): DefaultChain,
+                        },
+                    },
+                    HostStyle(
+                        AccountHost {
+                            host: AzureHost("mycompany.blob.core.windows.net"),
+                            account: AccountName(
+                                "mycompany",
+                            ),
+                        },
+                    ): AzureEndpointOptions {
+                        scheme: Https,
+                        auth: {
+                            ContainerName(
+                                "public",
+                            ): Anonymous,
+                            ContainerName(
+                                "releases",
+                            ): DefaultChain,
+                        },
+                    },
+                },
+            ),
             index_config: IndexConfig {
                 default: IndexChannelConfig {
                     write_zst: Some(
@@ -217,6 +255,7 @@ expression: "(unused, normalized(config))"
                     repodata_revisions: None,
                     package_revision_assignment: None,
                     base_url: None,
+                    notices: None,
                     channel_relations: None,
                 },
                 per_channel: {
@@ -228,6 +267,7 @@ expression: "(unused, normalized(config))"
                         base_url: Some(
                             "../packages/",
                         ),
+                        notices: None,
                         channel_relations: None,
                     },
                 },

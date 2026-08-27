@@ -3,6 +3,7 @@ from __future__ import annotations
 from rattler.networking.middleware import (
     AddHeadersMiddleware,
     AuthenticationMiddleware,
+    AzureMiddleware,
     GCSMiddleware,
     MirrorMiddleware,
     OciMiddleware,
@@ -27,6 +28,7 @@ class Client:
                 | MirrorMiddleware
                 | OciMiddleware
                 | GCSMiddleware
+                | AzureMiddleware
                 | S3Middleware
             ]
             | None
@@ -35,6 +37,14 @@ class Client:
         user_agent: str | None = None,
         timeout: int | None = None,
     ) -> None:
+        """
+        Create a client that applies `middlewares` in the order given.
+
+        Raises:
+            ValueError: if `AzureMiddleware` is listed before
+                `AuthenticationMiddleware`. See `AzureMiddleware` for why that
+                order is unsafe.
+        """
         self._client = PyClientWithMiddleware(
             [middleware._middleware for middleware in middlewares] if middlewares else None,
             headers,
@@ -73,8 +83,7 @@ class Client:
         timeout: int | None = None,
     ) -> Client:
         """
-        Returns a client with the standard middleware stack: retry,
-        authentication, OCI, GCS and S3.
+        Returns a client with the standard middleware stack.
 
         Args:
             max_retries: Maximum retry attempts for transient errors (default 3).
@@ -96,6 +105,7 @@ class Client:
                 AuthenticationMiddleware(),
                 OciMiddleware(),
                 GCSMiddleware(),
+                AzureMiddleware(),
                 S3Middleware(),
             ],
             headers=headers,

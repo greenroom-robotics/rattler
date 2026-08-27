@@ -81,6 +81,32 @@ pub async fn upload_from_args(args: UploadOpts) -> miette::Result<()> {
             )
             .await
         }
+        #[cfg(feature = "azure")]
+        ServerType::Azure(azure_opts) => {
+            // https, because `upload_from_args` reads no configuration file at all —
+            // it only opens the auth store — so there is nowhere for an
+            // `[azure-options."<key>"]` entry to come from, and nothing to state a
+            // cleartext endpoint. Giving `rattler_upload` a `--config` of its own is
+            // what would lift that, and neither `rattler upload` nor rattler-build
+            // passes one today.
+            let location =
+                rattler_azure::locate_as(&azure_opts.channel, azure_opts.path_style.into())
+                    .into_diagnostic()?;
+            let scheme = rattler_azure::AzureScheme::default();
+            let credentials = azure_opts
+                .credentials
+                .resolve(upload::AZURE_UPLOAD_SAS_PERMISSIONS, &location, scheme)
+                .await
+                .into_diagnostic()?;
+            upload::upload_package_to_azure(
+                &location,
+                credentials,
+                scheme,
+                &args.package_files,
+                azure_opts.force,
+            )
+            .await
+        }
         ServerType::CondaForge(conda_forge_opts) => {
             let conda_forge_data = CondaForgeData::from(conda_forge_opts);
             upload::conda_forge::upload_packages_to_conda_forge(

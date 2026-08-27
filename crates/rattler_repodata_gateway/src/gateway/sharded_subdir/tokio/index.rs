@@ -15,7 +15,7 @@ use async_fd_lock::{LockWrite, RwLockWriteGuard};
 use bytes::Bytes;
 use fs_err::tokio as tokio_fs;
 use futures::{TryFutureExt, future::OptionFuture};
-use http::{HeaderMap, Method, Uri};
+use http::{HeaderMap, Method, StatusCode, Uri, header};
 use http_cache_semantics::{AfterResponse, BeforeRequest, CachePolicy, RequestLike};
 use rattler_conda_types::Channel;
 use rattler_networking::LazyClient;
@@ -198,9 +198,12 @@ pub async fn fetch_index(
                     ..
                 } => {
                     if cache_action == CacheAction::UseCacheOnly {
-                        return Err(GatewayError::CacheError(format!(
-                            "the sharded index cache for {channel_base_url} is stale and cache-only mode is enabled"
-                        )));
+                        // Cache-only and what we have may not be used, so this
+                        // subdir has no sharded index we can read. The caller
+                        // falls back to `repodata.json`.
+                        return Err(GatewayError::ShardedIndexNotCached(
+                            channel_base_url.clone().redact(),
+                        ));
                     }
 
                     // Determine the actual URL to use for the request
@@ -264,46 +267,96 @@ pub async fn fetch_index(
                         return Err(create_subdir_not_found_error(channel_base_url));
                     }
 
-                    match cache_header.policy.after_response(
+                    let after_response = cache_header.policy.after_response(
                         &state_request,
                         &response,
                         SystemTime::now(),
-                    ) {
-                        AfterResponse::NotModified(_policy, _) => {
-                            // The cached file is still valid
-                            match read_shard_index_from_reader(&mut cache_reader).await {
-                                Ok(shard_index) => {
-                                    tracing::debug!("shard index cache was not modified");
-                                    if let Some((reporter, index)) = download_reporter {
-                                        reporter.on_download_complete(response.url(), index);
-                                    }
-                                    // If reading the file failed for some reason we'll just
-                                    // fetch it again.
-                                    return Ok(shard_index);
-                                }
-                                Err(e) => {
+                    );
+
+                    // A 304 is taken as "the cached body still stands" on the status
+                    // alone, rather than left to `after_response`, which reports
+                    // `NotModified` only when the 304 echoes back the validator it
+                    // matched. Azure Blob does not echo one: it answers a conditional
+                    // GET with a bare 304 carrying no `etag` and no `last-modified`,
+                    // just `x-ms-error-code: ConditionNotMet`. That reads as
+                    // `Modified`, and the 304 then reaches `from_response`, which
+                    // rejects it for not being a success.
+                    //
+                    // What is required in return is that the request actually asked a
+                    // conditional question. A cache entry with no validator revalidates
+                    // with a plain GET, and a 304 to that answers nothing: honoring it
+                    // would let a proxy or CDN pin a stale shard index forever.
+                    let sent_conditional_request =
+                        state_request.headers().contains_key(header::IF_NONE_MATCH)
+                            || state_request
+                                .headers()
+                                .contains_key(header::IF_MODIFIED_SINCE);
+                    let is_not_modified =
+                        response.status() == StatusCode::NOT_MODIFIED && sent_conditional_request;
+
+                    if response.status() == StatusCode::NOT_MODIFIED && !sent_conditional_request {
+                        tracing::warn!(
+                            "ignoring a 304 for the shard index at {channel_base_url}: the request it answers carried no validator, so it cannot mean the cached index is current"
+                        );
+                    }
+
+                    let unmodified_policy = match &after_response {
+                        AfterResponse::NotModified(policy, _)
+                        | AfterResponse::Modified(policy, _)
+                            if is_not_modified =>
+                        {
+                            Some(policy.clone())
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(refreshed_policy) = unmodified_policy {
+                        match read_cached_shard_index(&mut cache_reader).await {
+                            Ok((body, shard_index)) => {
+                                tracing::debug!("shard index cache was not modified");
+
+                                // Store the refreshed policy so a 304 that carries
+                                // caching headers spares the next run a revalidation.
+                                // An already-stale policy teaches us nothing, so the
+                                // rewrite is skipped in that case.
+                                if !refreshed_policy.is_stale(SystemTime::now())
+                                    && let Err(e) = write_shard_index_cache(
+                                        cache_reader.into_inner().inner_mut(),
+                                        refreshed_policy,
+                                        body,
+                                    )
+                                    .await
+                                {
                                     tracing::warn!(
-                                        "the cached shard index has been corrupted: {e}"
+                                        "failed to store the refreshed cache policy for the shard index at {}: {e}",
+                                        cache_path.display()
                                     );
-                                    if let Some((reporter, index)) = download_reporter {
-                                        reporter.on_download_complete(response.url(), index);
-                                    }
+                                }
+
+                                if let Some((reporter, index)) = download_reporter {
+                                    reporter.on_download_complete(response.url(), index);
+                                }
+                                return Ok(shard_index);
+                            }
+                            Err(e) => {
+                                tracing::warn!("the cached shard index has been corrupted: {e}");
+                                if let Some((reporter, index)) = download_reporter {
+                                    reporter.on_download_complete(response.url(), index);
                                 }
                             }
                         }
-                        AfterResponse::Modified(policy, _) => {
-                            // Close the old file so we can create a new one.
-                            tracing::debug!("shard index cache has become stale");
-                            return from_response(
-                                cache_reader.into_inner(),
-                                &cache_path,
-                                policy,
-                                response,
-                                download_reporter,
-                                request_permit,
-                            )
-                            .await;
-                        }
+                    } else if let AfterResponse::Modified(policy, _) = after_response {
+                        // Close the old file so we can create a new one.
+                        tracing::debug!("shard index cache has become stale");
+                        return from_response(
+                            cache_reader.into_inner(),
+                            &cache_path,
+                            policy,
+                            response,
+                            download_reporter,
+                            request_permit,
+                        )
+                        .await;
                     }
                 }
             }
@@ -311,9 +364,9 @@ pub async fn fetch_index(
     }
 
     if cache_action == CacheAction::ForceCacheOnly {
-        return Err(GatewayError::CacheError(format!(
-            "the sharded index cache for {channel_base_url} is not available"
-        )));
+        return Err(GatewayError::ShardedIndexNotCached(
+            channel_base_url.clone().redact(),
+        ));
     }
 
     tracing::debug!("fetching fresh shard index");
@@ -464,20 +517,32 @@ async fn write_not_found_cache(cache_file: &mut File, policy: CachePolicy) -> st
 pub async fn read_shard_index_from_reader<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
 ) -> Result<ShardedRepodata, GatewayError> {
+    read_cached_shard_index(reader)
+        .await
+        .map(|(_, shard_index)| shard_index)
+}
+
+async fn read_cached_shard_index<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> Result<(Bytes, ShardedRepodata), GatewayError> {
     // Read the file to memory
     let mut bytes = Vec::new();
     reader
         .read_to_end(&mut bytes)
         .await
         .map_err(|e| GatewayError::IoError("failed to read shard index buffer".to_string(), e))?;
+    let bytes = Bytes::from(bytes);
 
     // Deserialize the bytes
-    run_blocking_task(move || {
-        rmp_serde::from_slice(&bytes)
+    let parse_bytes = bytes.clone();
+    let shard_index = run_blocking_task(move || {
+        rmp_serde::from_slice(&parse_bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
             .map_err(|e| GatewayError::IoError("failed to parse shard index".to_string(), e))
     })
-    .await
+    .await?;
+
+    Ok((bytes, shard_index))
 }
 
 /// Cache information stored at the start of the cache file.
@@ -551,5 +616,202 @@ impl RequestLike for SimpleRequest {
 
     fn is_same_uri(&self, other: &Uri) -> bool {
         &self.uri() == other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::IntoFuture,
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use axum::{Router, body::Body, http::Response, routing::get};
+    use rattler_conda_types::{RepodataRevisions, ShardedSubdirInfo};
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Default)]
+    struct MockHeaders {
+        etag: Option<&'static str>,
+        cache_control: Option<&'static str>,
+    }
+
+    impl MockHeaders {
+        fn apply(
+            self,
+            mut builder: axum::http::response::Builder,
+        ) -> axum::http::response::Builder {
+            if let Some(etag) = self.etag {
+                builder = builder.header("etag", etag);
+            }
+            if let Some(cache_control) = self.cache_control {
+                builder = builder.header("cache-control", cache_control);
+            }
+            builder
+        }
+    }
+
+    struct RevalidatingIndexServer {
+        local_addr: SocketAddr,
+        requests: Arc<AtomicUsize>,
+        _shutdown_sender: oneshot::Sender<()>,
+    }
+
+    impl RevalidatingIndexServer {
+        async fn new(etag: Option<&'static str>) -> Self {
+            Self::with_headers(
+                MockHeaders {
+                    etag,
+                    cache_control: None,
+                },
+                MockHeaders::default(),
+            )
+            .await
+        }
+
+        async fn with_headers(initial: MockHeaders, revalidation: MockHeaders) -> Self {
+            let sharded_index = ShardedRepodata {
+                info: ShardedSubdirInfo {
+                    subdir: "linux-64".to_string(),
+                    base_url: "./".to_string(),
+                    shards_base_url: "./shards/".to_string(),
+                    created_at: Some(jiff::Timestamp::now()),
+                    repodata_revisions: RepodataRevisions::default(),
+                    channel_relations: None,
+                },
+                shards: ahash::HashMap::default(),
+            };
+            let compressed_index =
+                zstd::encode_all(rmp_serde::to_vec(&sharded_index).unwrap().as_slice(), 3).unwrap();
+
+            let requests = Arc::new(AtomicUsize::new(0));
+            let served = Arc::clone(&requests);
+            let app = Router::new().route(
+                "/linux-64/repodata_shards.msgpack.zst",
+                get(move || async move {
+                    if served.fetch_add(1, Ordering::SeqCst) == 0 {
+                        initial
+                            .apply(Response::builder().status(StatusCode::OK))
+                            .body(Body::from(compressed_index.clone()))
+                            .unwrap()
+                    } else {
+                        revalidation
+                            .apply(Response::builder().status(StatusCode::NOT_MODIFIED))
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                }),
+            );
+
+            let listener = tokio::net::TcpListener::bind(SocketAddr::new([127, 0, 0, 1].into(), 0))
+                .await
+                .unwrap();
+            let local_addr = listener.local_addr().unwrap();
+
+            let (tx, rx) = oneshot::channel();
+            tokio::spawn(
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        rx.await.ok();
+                    })
+                    .into_future(),
+            );
+
+            Self {
+                local_addr,
+                requests,
+                _shutdown_sender: tx,
+            }
+        }
+
+        fn channel_base_url(&self) -> Url {
+            Url::parse(&format!(
+                "http://localhost:{}/linux-64/",
+                self.local_addr.port()
+            ))
+            .unwrap()
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn fetch(base_url: &Url, cache_dir: &Path) -> Result<ShardedRepodata, GatewayError> {
+        fetch_index(
+            rattler_networking::LazyClient::default(),
+            base_url,
+            cache_dir,
+            CacheAction::CacheOrFetch,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn fetch_twice(etag: Option<&'static str>) -> Result<ShardedRepodata, GatewayError> {
+        let server = RevalidatingIndexServer::new(etag).await;
+        let base_url = server.channel_base_url();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        fetch(&base_url, cache_dir.path())
+            .await
+            .expect("the first fetch is served a 200");
+
+        fetch(&base_url, cache_dir.path()).await
+    }
+
+    #[tokio::test]
+    async fn unconditional_304_is_not_honored() {
+        let err = fetch_twice(None)
+            .await
+            .expect_err("a 304 to a request we never made conditional is not an answer");
+        assert!(
+            err.to_string().contains("304"),
+            "the 304 should be rejected as an unexpected status, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_bare_304_is_honored() {
+        fetch_twice(Some("\"abc\""))
+            .await
+            .expect("a 304 answering our `if-none-match` serves the cached index");
+    }
+
+    #[tokio::test]
+    async fn a_304_refreshes_the_stored_cache_policy() {
+        let server = RevalidatingIndexServer::with_headers(
+            // Stale on arrival, so the next fetch revalidates.
+            MockHeaders {
+                etag: Some("\"abc\""),
+                cache_control: Some("max-age=0"),
+            },
+            MockHeaders {
+                etag: Some("\"abc\""),
+                cache_control: Some("max-age=3600"),
+            },
+        )
+        .await;
+        let base_url = server.channel_base_url();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        for _ in 0..3 {
+            fetch(&base_url, cache_dir.path())
+                .await
+                .expect("the index is served, then revalidated, then read from the cache");
+        }
+
+        assert_eq!(
+            server.request_count(),
+            2,
+            "the 304 said the entry is good for an hour, so the third fetch must not reach the server"
+        );
     }
 }

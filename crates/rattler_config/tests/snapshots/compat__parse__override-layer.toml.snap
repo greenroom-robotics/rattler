@@ -136,6 +136,28 @@ expression: "(unused, normalized(config))"
                     },
                 },
             ),
+            azure_options: AzureOptionsMap(
+                {
+                    HostStyle(
+                        AccountHost {
+                            host: AzureHost("mycompany.blob.core.windows.net"),
+                            account: AccountName(
+                                "mycompany",
+                            ),
+                        },
+                    ): AzureEndpointOptions {
+                        scheme: Https,
+                        auth: {
+                            ContainerName(
+                                "public",
+                            ): Anonymous,
+                            ContainerName(
+                                "staging",
+                            ): DefaultChain,
+                        },
+                    },
+                },
+            ),
             index_config: IndexConfig {
                 default: IndexChannelConfig {
                     write_zst: None,
@@ -143,6 +165,7 @@ expression: "(unused, normalized(config))"
                     repodata_revisions: None,
                     package_revision_assignment: None,
                     base_url: None,
+                    notices: None,
                     channel_relations: None,
                 },
                 per_channel: {},

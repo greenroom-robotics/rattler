@@ -5,6 +5,7 @@ from typing import Callable
 from rattler.rattler import (
     PyAddHeadersMiddleware,
     PyAuthenticationMiddleware,
+    PyAzureMiddleware,
     PyGCSMiddleware,
     PyMirrorMiddleware,
     PyOciMiddleware,
@@ -108,6 +109,9 @@ class RetryMiddleware:
 class OciMiddleware:
     """
     Middleware to handle `oci://` URLs
+
+    Authenticates by following the registry's `WWW-Authenticate` challenge, using any
+    credentials stored for the registry's host in the authentication storage.
     """
 
     def __init__(self) -> None:
@@ -151,6 +155,44 @@ class GCSMiddleware:
 
     def __init__(self) -> None:
         self._middleware = PyGCSMiddleware()
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}()"
+
+
+class AzureMiddleware:
+    """
+    Middleware to work with az:// URLs.
+
+    The per-host `azure-options` table is not exposed to Python yet, so this
+    middleware never signs: it rewrites `az://<host>/<container>/...` to
+    `https://<host>/<container>/...`, adds an `x-ms-version` header, and sends
+    the request on. A URL already carrying a `sig` query parameter is passed
+    through untouched.
+
+    Two cases do need the `azure-options` table and so are out of reach from
+    Python: a private container read with an ambient Azure credential rather
+    than a SAS token, and an endpoint served over plain `http`, such as the
+    Azurite emulator.
+
+    This middleware must be placed *after* `AuthenticationMiddleware`; `Client`
+    raises `ValueError` otherwise.
+
+    Examples
+    --------
+    ```python
+    >>> from rattler.networking import Client
+    >>> middleware = AzureMiddleware()
+    >>> middleware
+    AzureMiddleware()
+    >>> Client([middleware])
+    Client()
+    >>>
+    ```
+    """
+
+    def __init__(self) -> None:
+        self._middleware = PyAzureMiddleware()
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"

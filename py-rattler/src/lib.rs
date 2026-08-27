@@ -59,8 +59,8 @@ use match_spec::PyMatchSpec;
 use meta::get_rattler_version;
 use nameless_match_spec::PyNamelessMatchSpec;
 use networking::middleware::{
-    PyAddHeadersMiddleware, PyAuthenticationMiddleware, PyGCSMiddleware, PyMirrorMiddleware,
-    PyOciMiddleware, PyRetryMiddleware, PyS3Config, PyS3Middleware,
+    PyAddHeadersMiddleware, PyAuthenticationMiddleware, PyAzureMiddleware, PyGCSMiddleware,
+    PyMirrorMiddleware, PyOciMiddleware, PyRetryMiddleware, PyS3Config, PyS3Middleware,
 };
 use networking::{client::PyClientWithMiddleware, py_fetch_repo_data};
 use no_arch_type::PyNoArchType;
@@ -73,7 +73,7 @@ use pyo3::prelude::*;
 use record::{PyLink, PyRecord};
 use repo_data::{
     PyChannelInfo, PyChannelRelations, PyRepoData,
-    gateway::{PyFetchRepoDataOptions, PyGateway, PySourceConfig},
+    gateway::{PyChannelNotice, PyFetchRepoDataOptions, PyGateway, PySourceConfig},
     patch_instructions::PyPatchInstructions,
     sparse::{PyPackageFormatSelection, PySparseRepoData},
 };
@@ -119,6 +119,7 @@ fn rattler<'py>(py: Python<'py>, m: Bound<'py, PyModule>) -> PyResult<()> {
     m.add_class::<PyAuthenticationMiddleware>()?;
     m.add_class::<PyOciMiddleware>()?;
     m.add_class::<PyGCSMiddleware>()?;
+    m.add_class::<PyAzureMiddleware>()?;
     m.add_class::<PyS3Middleware>()?;
     m.add_class::<PyS3Config>()?;
     m.add_class::<PyRetryMiddleware>()?;
@@ -146,6 +147,7 @@ fn rattler<'py>(py: Python<'py>, m: Bound<'py, PyModule>) -> PyResult<()> {
     m.add_class::<PyChannelRelations>()?;
     m.add_class::<PyPatchInstructions>()?;
     m.add_class::<PyGateway>()?;
+    m.add_class::<PyChannelNotice>()?;
     m.add_class::<PySourceConfig>()?;
     m.add_class::<PyFetchRepoDataOptions>()?;
 
@@ -197,6 +199,9 @@ fn rattler<'py>(py: Python<'py>, m: Bound<'py, PyModule>) -> PyResult<()> {
     m.add_function(
         wrap_pyfunction!(package_streaming::fetch_raw_package_file_from_url, &m).unwrap(),
     )?;
+    m.add_class::<package_streaming::archive::PyPackageArchive>()?;
+    m.add_class::<package_streaming::archive::PySectionStream>()?;
+    m.add_class::<package_streaming::archive::PyArchiveEntry>()?;
 
     // Explicit environment specification
     m.add_class::<PyExplicitEnvironmentSpec>()?;

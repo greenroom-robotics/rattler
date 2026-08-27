@@ -5,7 +5,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::Verbosity;
 #[cfg(feature = "azure")]
-use rattler_azure::AzureCredentials;
+use rattler_azure::{AzureChannelUrl, AzureEndpointKey, AzureLocation, AzureScheme};
 use rattler_conda_types::Platform;
 use rattler_config::config::{
     concurrency::default_max_concurrent_solves, index::IndexChannelConfig,
@@ -23,7 +23,7 @@ use rattler_index::{IndexS3Config, index_s3_with_channel_metadata};
 use rattler_networking::AuthenticationStorage;
 #[cfg(feature = "s3")]
 use rattler_s3::S3Credentials;
-#[cfg(any(feature = "s3", feature = "azure"))]
+#[cfg(feature = "s3")]
 use url::Url;
 
 #[cfg(feature = "s3")]
@@ -38,23 +38,9 @@ fn parse_s3_url(value: &str) -> Result<Url, String> {
     }
 }
 
+/// The SAS permissions indexing needs: read, write, list, create.
 #[cfg(feature = "azure")]
-fn parse_azure_url(value: &str) -> Result<Url, String> {
-    let url: Url = Url::parse(value).map_err(|e| format!("`{value}` isn't a valid URL: {e}"))?;
-    // Require host + a container segment, e.g.
-    // https://<account>.blob.core.windows.net/<container>/<prefix>.
-    let has_container = url
-        .path_segments()
-        .and_then(|mut segments| segments.next())
-        .is_some_and(|segment| !segment.is_empty());
-    if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() && has_container {
-        Ok(url)
-    } else {
-        Err(format!(
-            "Only Azure Blob URLs of format https://<account>.blob.core.windows.net/<container>/... can be used, not `{value}`"
-        ))
-    }
-}
+const AZURE_INDEX_SAS_PERMISSIONS: &str = "rwlc";
 
 /// The `rattler-index` CLI.
 #[derive(Parser)]
@@ -127,11 +113,13 @@ enum Commands {
 
     /// Index a channel stored in an Azure Blob container.
     #[cfg(feature = "azure")]
+    #[command(name = "az")]
     Azblob {
         /// The Azure Blob channel URL, e.g.
-        /// `https://<account>.blob.core.windows.net/<container>/<channel>`.
-        #[arg(value_parser = parse_azure_url)]
-        channel: Url,
+        /// `az://<account>.blob.core.windows.net/<container>/<channel>`.
+        // Not a wire `Url`: the wire scheme comes from the matched `azure-options`
+        // entry, which is only read after clap has run.
+        channel: AzureChannelUrl,
 
         #[clap(flatten)]
         credentials: rattler_azure::clap::AzureCredentialsOpts,
@@ -173,12 +161,8 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::FileSystem { channel } => {
-            let target = channel
-                .canonicalize()
-                .unwrap_or_else(|_| channel.clone())
-                .to_string_lossy()
-                .into_owned();
-            let resolved = resolve_index_channel_config(&config, &target);
+            let resolved =
+                resolve_index_channel_config(&config, &IndexConfigKey::for_path(&channel));
             let (write_zst, write_shards, repodata_revisions, package_revision_assignment) =
                 effective_index_options(&resolved);
             let channel_metadata = ChannelMetadata::from_index_config(&resolved);
@@ -205,8 +189,8 @@ async fn main() -> anyhow::Result<()> {
             channel,
             mut credentials,
         } => {
-            let target = channel.to_string();
-            let resolved = resolve_index_channel_config(&config, &target);
+            let resolved =
+                resolve_index_channel_config(&config, &IndexConfigKey::for_url(&channel));
             let (write_zst, write_shards, repodata_revisions, package_revision_assignment) =
                 effective_index_options(&resolved);
             let channel_metadata = ChannelMetadata::from_index_config(&resolved);
@@ -255,18 +239,23 @@ async fn main() -> anyhow::Result<()> {
             channel,
             credentials,
         } => {
-            let target = channel.to_string();
-            let resolved = resolve_index_channel_config(&config, &target);
+            let resolved =
+                resolve_index_channel_config(&config, &IndexConfigKey::for_azure(&channel));
             let (write_zst, write_shards, repodata_revisions, package_revision_assignment) =
                 effective_index_options(&resolved);
             let channel_metadata = ChannelMetadata::from_index_config(&resolved);
 
-            let credentials = AzureCredentials::try_from(credentials)?;
+            let (location, scheme) = azure_endpoint(&config, &channel)?;
+
+            let credentials = credentials
+                .resolve(AZURE_INDEX_SAS_PERMISSIONS, &location, scheme)
+                .await?;
 
             index_azure_with_channel_metadata(
                 IndexAzureConfig {
-                    channel,
+                    location,
                     credentials,
+                    scheme,
                     target_platform: cli.target_platform,
                     repodata_patch: cli.repodata_patch,
                     write_zst,
@@ -286,10 +275,60 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_index_channel_config(config: &Option<Config>, target: &str) -> IndexChannelConfig {
+#[cfg(feature = "azure")]
+fn azure_endpoint(
+    config: &Option<Config>,
+    channel: &AzureChannelUrl,
+) -> anyhow::Result<(AzureLocation, AzureScheme)> {
+    let located = rattler_azure::locate(channel, |key| {
+        config
+            .as_ref()
+            .is_some_and(|config| config.azure_options.contains(key))
+    })?;
+    // Re-derived because the scheme lookup below is keyed by it; the `?` arm is
+    // where the error names the key to add.
+    let key = match located.key() {
+        Some(key) => key.clone(),
+        None => AzureEndpointKey::host_style(channel.host())?,
+    };
+    let scheme = config
+        .as_ref()
+        .map(|config| config.azure_options.get(&key).scheme())
+        .unwrap_or_default();
+    Ok((located, scheme))
+}
+
+/// The `[index-config."…"]` key a channel is looked up under.
+struct IndexConfigKey(String);
+
+impl IndexConfigKey {
+    fn for_path(path: &std::path::Path) -> Self {
+        Self(
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    #[cfg(feature = "s3")]
+    fn for_url(url: &Url) -> Self {
+        Self(url.to_string())
+    }
+
+    #[cfg(feature = "azure")]
+    fn for_azure(channel: &AzureChannelUrl) -> Self {
+        Self(channel.canonical().to_string())
+    }
+}
+
+fn resolve_index_channel_config(
+    config: &Option<Config>,
+    key: &IndexConfigKey,
+) -> IndexChannelConfig {
     config
         .as_ref()
-        .map(|c| c.index_config.resolve(target))
+        .map(|c| c.index_config.resolve(&key.0))
         .unwrap_or_default()
 }
 
@@ -311,4 +350,69 @@ fn effective_index_options(
         repodata_revisions,
         package_revision_assignment,
     )
+}
+
+#[cfg(all(test, feature = "azure"))]
+mod tests {
+    use super::*;
+
+    fn config_from(toml: &str) -> Option<Config> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rattler-config.toml");
+        std::fs::write(&path, toml).expect("write config");
+        Some(Config::load_from_files(vec![path]).expect("config should load"))
+    }
+
+    #[test]
+    fn index_config_is_keyed_by_the_canonical_az_url() {
+        let config = config_from(
+            r#"
+            [index-config."az://acct.blob.core.windows.net/general"]
+            write-shards = false
+            "#,
+        );
+        let channel =
+            AzureChannelUrl::parse("az://acct.blob.core.windows.net/general/mychannel").unwrap();
+
+        let key = IndexConfigKey::for_azure(&channel);
+        assert_eq!(
+            resolve_index_channel_config(&config, &key).write_shards,
+            Some(false)
+        );
+        assert_ne!(key.0, channel.wire(AzureScheme::Https).to_string());
+    }
+
+    #[test]
+    fn a_path_style_entry_drives_the_azurite_index_config() {
+        let config = config_from(
+            r#"
+            [azure-options."127.0.0.1:10000/devstoreaccount1"]
+            scheme = "http"
+
+            [azure-options."127.0.0.1:10000/devstoreaccount1".auth]
+            general = true
+            "#,
+        );
+        let channel =
+            AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general/mychannel")
+                .unwrap();
+
+        let (location, scheme) = azure_endpoint(&config, &channel).unwrap();
+        assert_eq!(scheme, AzureScheme::Http);
+        let (key, container) = location.addressed().unwrap();
+        assert_eq!(
+            key,
+            &AzureEndpointKey::parse("127.0.0.1:10000/devstoreaccount1").unwrap()
+        );
+        assert_eq!(container.as_str(), "general");
+    }
+
+    #[test]
+    fn an_unconfigured_ip_literal_channel_is_refused() {
+        let channel =
+            AzureChannelUrl::parse("az://127.0.0.1:10000/devstoreaccount1/general/mychannel")
+                .unwrap();
+
+        assert!(azure_endpoint(&None, &channel).is_err());
+    }
 }

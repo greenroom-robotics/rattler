@@ -33,6 +33,7 @@
 //! example.
 
 pub mod cuda;
+pub mod defaults;
 pub mod libc;
 pub mod linux;
 pub mod osx;
@@ -43,6 +44,7 @@ use std::{
     env, fmt,
     fmt::Display,
     hash::{Hash, Hasher},
+    path::Path,
     str::FromStr,
     sync::Arc,
 };
@@ -158,9 +160,39 @@ pub trait EnvOverride: Sized {
             Self::detect_with_fallback(ov, Self::detect_from_host)
         })
     }
+
+    /// Detect the virtual package for the current system, using `cache_dir` for any on-disk
+    /// detection cache.
+    ///
+    /// The default implementation ignores `cache_dir` and defers to
+    /// [`EnvOverride::detect_from_host`]. Virtual packages with an expensive detection step (such
+    /// as CUDA) override this to thread the cache directory through.
+    fn detect_from_host_with_cache_dir(
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        let _ = cache_dir;
+        Self::detect_from_host()
+    }
+
+    /// Like [`EnvOverride::detect`] but funnels the host detection through
+    /// [`EnvOverride::detect_from_host_with_cache_dir`] so an on-disk detection cache can be used.
+    fn detect_cached(
+        ov: Option<&Override>,
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        ov.map_or_else(
+            || Self::detect_from_host_with_cache_dir(cache_dir),
+            |ov| {
+                Self::detect_with_fallback(ov, || Self::detect_from_host_with_cache_dir(cache_dir))
+            },
+        )
+    }
 }
 
 /// An enum that represents all virtual package types provided by this library.
+// Non-exhaustive so that adding new virtual package types (like `__ios` and
+// `__android`) is not a breaking change for downstream crates.
+#[non_exhaustive]
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum VirtualPackage {
     /// Available on windows
@@ -174,6 +206,12 @@ pub enum VirtualPackage {
 
     /// Available when running on `OSX`
     Osx(Osx),
+
+    /// Available when targeting `iOS`
+    Ios(Ios),
+
+    /// Available when targeting `Android`
+    Android(Android),
 
     /// Available `LibC` family and version
     LibC(LibC),
@@ -189,6 +227,9 @@ pub enum VirtualPackage {
 }
 
 /// A struct that represents all virtual packages provided by this library.
+// Non-exhaustive so that adding new virtual package types (like `__ios` and
+// `__android`) is not a breaking change for downstream crates.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct VirtualPackages {
     /// Available on windows
@@ -202,6 +243,12 @@ pub struct VirtualPackages {
 
     /// Available when running on `OSX`
     pub osx: Option<Osx>,
+
+    /// Available when targeting `iOS`
+    pub ios: Option<Ios>,
+
+    /// Available when targeting `Android`
+    pub android: Option<Android>,
 
     /// Available `LibC` family and version
     pub libc: Option<LibC>,
@@ -224,6 +271,8 @@ impl VirtualPackages {
             unix,
             linux,
             osx,
+            ios,
+            android,
             libc,
             cuda,
             cuda_arch,
@@ -235,6 +284,8 @@ impl VirtualPackages {
             unix.then_some(VirtualPackage::Unix),
             linux.map(VirtualPackage::Linux),
             osx.map(VirtualPackage::Osx),
+            ios.map(VirtualPackage::Ios),
+            android.map(VirtualPackage::Android),
             libc.map(VirtualPackage::LibC),
             cuda.map(VirtualPackage::Cuda),
             cuda_arch.map(VirtualPackage::CudaArch),
@@ -251,12 +302,32 @@ impl VirtualPackages {
 
     /// Detect the virtual packages of the current system with the given
     /// overrides.
-    pub fn detect(overrides: &VirtualPackageOverrides) -> Result<Self, DetectVirtualPackageError> {
-        let cuda = Cuda::detect(overrides.cuda.as_ref())?;
-        let mut cuda_arch = CudaArch::detect(overrides.cuda_arch.as_ref())?;
+    ///
+    /// `cache_dir` is used to cache expensive detection results (currently CUDA) on disk across
+    /// processes; pass `None` to disable the on-disk cache.
+    pub fn detect(
+        overrides: &VirtualPackageOverrides,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, DetectVirtualPackageError> {
+        tracing::trace!(
+            cache_dir = %cache_dir.map_or_else(
+                || "<disabled>".to_string(),
+                |path| path.display().to_string()
+            ),
+            "detecting virtual packages"
+        );
+
+        let cuda = Cuda::detect_with_cache_dir(overrides.cuda.as_ref(), cache_dir)?;
+        tracing::trace!(?cuda, "detected CUDA virtual package");
+        let mut cuda_arch =
+            CudaArch::detect_with_cache_dir(overrides.cuda_arch.as_ref(), cache_dir)?;
+        tracing::trace!(?cuda_arch, "detected CUDA architecture virtual package");
 
         // Enforce CEP requirement: __cuda_arch must be absent when __cuda is absent
         if cuda.is_none() {
+            if cuda_arch.is_some() {
+                tracing::debug!("dropping __cuda_arch because __cuda was not detected");
+            }
             cuda_arch = None;
         }
 
@@ -265,6 +336,8 @@ impl VirtualPackages {
             unix: Platform::current().is_unix(),
             linux: Linux::detect(overrides.linux.as_ref())?,
             osx: Osx::detect(overrides.osx.as_ref())?,
+            ios: Ios::detect(overrides.ios.as_ref())?,
+            android: Android::detect(overrides.android.as_ref())?,
             libc: LibC::detect(overrides.libc.as_ref())?,
             cuda,
             cuda_arch,
@@ -283,36 +356,82 @@ impl VirtualPackages {
     /// # Cross-compilation defaults
     ///
     /// When cross-compiling (targeting a platform different from the current one), the following
-    /// defaults are used if no override is provided:
+    /// defaults are used if no override is provided (see the [`defaults`] module):
     ///
-    /// - **Windows** (`__win`): No version specified
-    /// - **Linux** (`__linux`): Version 0
-    /// - **OSX** (`__osx`): Version 0
-    /// - **`LibC`** (`__glibc`): `glibc` with version 0 (only for Linux platforms)
+    /// - **Windows** (`__win`): [`defaults::default_windows_version`]
+    /// - **Linux** (`__linux`): [`defaults::default_linux_version`]
+    /// - **OSX** (`__osx`): [`defaults::default_mac_os_version`]
+    /// - **iOS** (`__ios`): Version 0 (minimum supported iOS version)
+    /// - **Android** (`__android`): Version 0 (minimum supported API level)
+    /// - **`LibC`** (`__glibc`): `glibc` with [`defaults::default_glibc_version`] (only for Linux
+    ///   platforms)
     /// - **CUDA** (`__cuda`): Not included (None)
     /// - **Archspec**: Platform-specific minimal architecture (e.g., `x86_64` for `osx-64`)
     pub fn detect_for_platform(
         platform: Platform,
         overrides: &VirtualPackageOverrides,
+        cache_dir: Option<&Path>,
     ) -> Result<Self, DetectVirtualPackageError> {
-        let virtual_packages = Self::detect(overrides)?;
+        let virtual_packages = Self::detect(overrides, cache_dir)?;
         if platform == Platform::current() {
             // If we're targeting the current platform, just return the detected packages
             Ok(virtual_packages)
         } else {
             // When cross-compiling, respect overrides but fall back to defaults
             let win = if platform.is_windows() {
-                // Check override first, fall back to default (no version)
-                virtual_packages
-                    .win
-                    .or_else(|| Some(Windows { version: None }))
+                // Check override first, fall back to the default version
+                virtual_packages.win.or_else(|| {
+                    let version = defaults::default_windows_version();
+                    log_default_virtual_package(
+                        "__win",
+                        platform,
+                        &version,
+                        Windows::DEFAULT_ENV_NAME,
+                    );
+                    Some(Windows {
+                        version: Some(version),
+                    })
+                })
             } else {
                 None
             };
 
             let linux = if platform.is_linux() {
                 virtual_packages.linux.or_else(|| {
-                    Some(Linux {
+                    let version = defaults::default_linux_version();
+                    log_default_virtual_package(
+                        "__linux",
+                        platform,
+                        &version,
+                        Linux::DEFAULT_ENV_NAME,
+                    );
+                    Some(Linux { version })
+                })
+            } else {
+                None
+            };
+
+            let osx = if platform.is_osx() {
+                // Check override first, fall back to the default version
+                virtual_packages.osx.or_else(|| {
+                    defaults::default_mac_os_version(platform).map(|version| {
+                        log_default_virtual_package(
+                            "__osx",
+                            platform,
+                            &version,
+                            Osx::DEFAULT_ENV_NAME,
+                        );
+                        Osx { version }
+                    })
+                })
+            } else {
+                None
+            };
+
+            let ios = if platform.is_ios() {
+                // Check override first, fall back to version 0
+                virtual_packages.ios.or_else(|| {
+                    Some(Ios {
                         version: Version::major(0),
                     })
                 })
@@ -320,10 +439,10 @@ impl VirtualPackages {
                 None
             };
 
-            let osx = if platform.is_osx() {
+            let android = if platform.is_android() {
                 // Check override first, fall back to version 0
-                virtual_packages.osx.or_else(|| {
-                    Some(Osx {
+                virtual_packages.android.or_else(|| {
+                    Some(Android {
                         version: Version::major(0),
                     })
                 })
@@ -332,11 +451,18 @@ impl VirtualPackages {
             };
 
             let libc = if platform.is_linux() {
-                // Check override first, fall back to glibc 0
+                // Check override first, fall back to the default glibc version
                 virtual_packages.libc.or_else(|| {
+                    let version = defaults::default_glibc_version();
+                    log_default_virtual_package(
+                        "__glibc",
+                        platform,
+                        &version,
+                        LibC::DEFAULT_ENV_NAME,
+                    );
                     Some(LibC {
                         family: "glibc".into(),
-                        version: Version::major(0),
+                        version,
                     })
                 })
             } else {
@@ -356,6 +482,8 @@ impl VirtualPackages {
                 unix: platform.is_unix(),
                 linux,
                 osx,
+                ios,
+                android,
                 libc,
                 cuda: virtual_packages.cuda,
                 cuda_arch: virtual_packages.cuda_arch,
@@ -363,6 +491,19 @@ impl VirtualPackages {
             })
         }
     }
+}
+
+/// Logs that the version of a virtual package could not be detected for the
+/// target platform and that a default version is assumed instead.
+fn log_default_virtual_package(
+    name: &str,
+    platform: Platform,
+    version: &Version,
+    env_var_name: &str,
+) {
+    tracing::info!(
+        "cannot detect the version of the virtual package '{name}' when targeting '{platform}', assuming version {version}; set the {env_var_name} environment variable to override"
+    );
 }
 
 impl From<VirtualPackage> for GenericVirtualPackage {
@@ -376,6 +517,8 @@ impl From<VirtualPackage> for GenericVirtualPackage {
             VirtualPackage::Win(windows) => windows.into(),
             VirtualPackage::Linux(linux) => linux.into(),
             VirtualPackage::Osx(osx) => osx.into(),
+            VirtualPackage::Ios(ios) => ios.into(),
+            VirtualPackage::Android(android) => android.into(),
             VirtualPackage::LibC(libc) => libc.into(),
             VirtualPackage::Cuda(cuda) => cuda.into(),
             VirtualPackage::CudaArch(cuda_arch) => cuda_arch.into(),
@@ -389,18 +532,21 @@ impl VirtualPackage {
     /// the versions could not be properly detected.
     #[deprecated(
         since = "1.1.0",
-        note = "Use `VirtualPackage::detect(&VirtualPackageOverrides::default())` instead."
+        note = "Use `VirtualPackage::detect(&VirtualPackageOverrides::default(), None)` instead."
     )]
     pub fn current() -> Result<Vec<Self>, DetectVirtualPackageError> {
-        Self::detect(&VirtualPackageOverrides::default())
+        Self::detect(&VirtualPackageOverrides::default(), None)
     }
 
     /// Detect the virtual packages of the current system with the given
     /// overrides.
+    ///
+    /// See [`VirtualPackages::detect`] for the `cache_dir` semantics.
     pub fn detect(
         overrides: &VirtualPackageOverrides,
+        cache_dir: Option<&Path>,
     ) -> Result<Vec<Self>, DetectVirtualPackageError> {
-        Ok(VirtualPackages::detect(overrides)?
+        Ok(VirtualPackages::detect(overrides, cache_dir)?
             .into_virtual_packages()
             .collect())
     }
@@ -435,12 +581,19 @@ pub enum DetectVirtualPackageError {
 ///
 /// Use `VirtualPackageOverrides::from_env()` to create an instance of this
 /// struct with all overrides set to the default environment variables.
+// Non-exhaustive so that adding new virtual package overrides (like `ios` and
+// `android`) is not a breaking change for downstream crates.
+#[non_exhaustive]
 #[derive(Default, Clone, Debug)]
 pub struct VirtualPackageOverrides {
     /// The override for the win virtual package
     pub win: Option<Override>,
     /// The override for the osx virtual package
     pub osx: Option<Override>,
+    /// The override for the ios virtual package
+    pub ios: Option<Override>,
+    /// The override for the android virtual package
+    pub android: Option<Override>,
     /// The override for the linux virtual package
     pub linux: Option<Override>,
     /// The override for the libc virtual package
@@ -460,6 +613,8 @@ impl VirtualPackageOverrides {
         Self {
             win: Some(ov.clone()),
             osx: Some(ov.clone()),
+            ios: Some(ov.clone()),
+            android: Some(ov.clone()),
             linux: Some(ov.clone()),
             libc: Some(ov.clone()),
             cuda: Some(ov.clone()),
@@ -603,8 +758,19 @@ pub struct Cuda {
 
 impl Cuda {
     /// Returns the maximum Cuda version available on the current platform.
-    pub fn current() -> Option<Self> {
-        cuda::cuda_version().map(|version| Self { version })
+    ///
+    /// See [`cuda::cuda_info`] for the `cache_dir` semantics.
+    pub fn current(cache_dir: Option<&Path>) -> Option<Self> {
+        cuda::cuda_version(cache_dir).map(|version| Self { version })
+    }
+
+    /// Detect the Cuda virtual package with the given override, using `cache_dir` for the on-disk
+    /// detection cache.
+    pub fn detect_with_cache_dir(
+        ov: Option<&Override>,
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        <Self as EnvOverride>::detect_cached(ov, cache_dir)
     }
 }
 
@@ -621,7 +787,12 @@ impl EnvOverride for Cuda {
         })
     }
     fn detect_from_host() -> Result<Option<Self>, DetectVirtualPackageError> {
-        Ok(Self::current())
+        Ok(Self::current(None))
+    }
+    fn detect_from_host_with_cache_dir(
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        Ok(Self::current(cache_dir))
     }
     const DEFAULT_ENV_NAME: &'static str = "CONDA_OVERRIDE_CUDA";
 }
@@ -673,12 +844,22 @@ impl CudaArch {
     /// * No CUDA drivers are installed
     /// * No CUDA devices are detected
     /// * Device enumeration fails
-    /// * The system is using musl libc (dynamic library loading not supported)
-    pub fn current() -> Option<Self> {
-        cuda::cuda_arch().map(|arch_info| Self {
+    ///
+    /// See [`cuda::cuda_info`] for the `cache_dir` semantics.
+    pub fn current(cache_dir: Option<&Path>) -> Option<Self> {
+        cuda::cuda_arch(cache_dir).map(|arch_info| Self {
             version: Version::from_str(&format!("{}.{}", arch_info.major, arch_info.minor))
                 .unwrap_or_else(|_| Version::major(u64::from(arch_info.major))),
         })
+    }
+
+    /// Detect the CUDA compute capability virtual package with the given override, using
+    /// `cache_dir` for the on-disk detection cache.
+    pub fn detect_with_cache_dir(
+        ov: Option<&Override>,
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        <Self as EnvOverride>::detect_cached(ov, cache_dir)
     }
 }
 
@@ -696,7 +877,13 @@ impl EnvOverride for CudaArch {
     }
 
     fn detect_from_host() -> Result<Option<Self>, DetectVirtualPackageError> {
-        Ok(Self::current())
+        Ok(Self::current(None))
+    }
+
+    fn detect_from_host_with_cache_dir(
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        Ok(Self::current(cache_dir))
     }
 
     const DEFAULT_ENV_NAME: &'static str = "CONDA_OVERRIDE_CUDA_ARCH";
@@ -825,6 +1012,15 @@ impl Archspec {
             // The first every Apple Silicon Macs are based on m1.
             Platform::OsxArm64 => "m1",
 
+            // iOS and Android arm64/aarch64 devices are all 64-bit ARM.
+            Platform::IosArm64 | Platform::IosSimulatorArm64 | Platform::AndroidAarch64 => {
+                "aarch64"
+            }
+            Platform::IosSimulator64 | Platform::Android64 => "x86_64",
+            Platform::Android32 => "x86",
+            // 32-bit ARM (armeabi-v7a) is not modelled by archspec.
+            Platform::AndroidArmV7a => return None,
+
             // Otherwise, we assume that the architecture is unknown.
             _ => return None,
         };
@@ -835,11 +1031,35 @@ impl Archspec {
     /// Constructs an `Archspec` from the given `archspec_name`. Creates a
     /// "generic" architecture if the name is not known.
     pub fn from_name(archspec_name: &str) -> Self {
+        Self::from_known_name(archspec_name).unwrap_or_else(|| {
+            Arc::new(archspec::cpu::Microarchitecture::generic(archspec_name)).into()
+        })
+    }
+
+    /// Constructs an `Archspec` when `archspec_name` is a microarchitecture
+    /// known to the bundled archspec database, `None` otherwise. Unlike
+    /// [`Self::from_name`] this never invents a "generic" architecture, so
+    /// callers can reject or diagnose unknown names.
+    pub fn from_known_name(archspec_name: &str) -> Option<Self> {
         Microarchitecture::known_targets()
             .get(archspec_name)
             .cloned()
-            .unwrap_or_else(|| Arc::new(archspec::cpu::Microarchitecture::generic(archspec_name)))
-            .into()
+            .map(Into::into)
+    }
+
+    /// Returns true if a host with this microarchitecture can run code built
+    /// for the `required` microarchitecture: they are equal, or this one is a
+    /// descendant of the requirement in the microarchitecture DAG. An
+    /// `Unknown` host is only compatible with an `Unknown` requirement, while
+    /// an `Unknown` requirement constrains nothing.
+    pub fn is_compatible_with(&self, required: &Self) -> bool {
+        match (self, required) {
+            (_, Archspec::Unknown) => true,
+            (Archspec::Unknown, Archspec::Microarchitecture(_)) => false,
+            (Archspec::Microarchitecture(host), Archspec::Microarchitecture(required)) => {
+                host.name() == required.name() || host.is_strict_superset(required)
+            }
+        }
     }
 }
 
@@ -862,10 +1082,24 @@ impl From<Archspec> for VirtualPackage {
 impl EnvOverride for Archspec {
     fn parse_version(value: &str) -> Result<Self, ParseVirtualPackageOverrideError> {
         if value == "0" {
-            Ok(Archspec::Unknown)
-        } else {
-            Ok(Self::from_name(value))
+            return Ok(Archspec::Unknown);
         }
+        if let Some(archspec) = Self::from_known_name(value) {
+            return Ok(archspec);
+        }
+        // An unknown name would silently become a "generic" node that no real
+        // host microarchitecture is compatible with, so reject it instead.
+        let underscored = value.replace('-', "_");
+        let suggestion = if Self::from_known_name(&underscored).is_some() {
+            format!(", did you mean '{underscored}'?")
+        } else {
+            String::from(
+                "; use a known microarchitecture name (e.g. 'x86_64_v3') or '0' to disable",
+            )
+        };
+        Err(ParseVirtualPackageOverrideError::validation_error(format!(
+            "'{value}' is not a known archspec microarchitecture{suggestion}"
+        )))
     }
 
     const DEFAULT_ENV_NAME: &'static str = "CONDA_OVERRIDE_ARCHSPEC";
@@ -924,6 +1158,126 @@ impl EnvOverride for Osx {
         Ok(Self::current()?)
     }
     const DEFAULT_ENV_NAME: &'static str = "CONDA_OVERRIDE_OSX";
+}
+
+/// iOS virtual package description.
+///
+/// The version encodes the *minimum* supported iOS version (the min-OS-version
+/// axis of a `PyPI` wheel tag such as `ios_13_0_arm64_iphoneos`). The arch and the
+/// device/simulator distinction are encoded in the subdir (e.g. `ios-arm64`,
+/// `iossimulator-arm64`) instead, so version compatibility falls out of the
+/// normal solver just like `__osx` and `__glibc`.
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Deserialize)]
+pub struct Ios {
+    /// The minimum supported iOS version.
+    pub version: Version,
+}
+
+impl Ios {
+    /// Returns the iOS version of the current platform.
+    ///
+    /// Runtime version detection is not implemented yet, so this always returns
+    /// `None`. The `__ios` virtual package is instead produced when
+    /// cross-compiling to an `ios-*` subdir (see
+    /// [`VirtualPackages::detect_for_platform`]) or via the
+    /// `CONDA_OVERRIDE_IOS` environment variable.
+    pub fn current() -> Option<Self> {
+        None
+    }
+}
+
+impl From<Ios> for GenericVirtualPackage {
+    fn from(ios: Ios) -> Self {
+        GenericVirtualPackage {
+            name: PackageName::new_unchecked("__ios"),
+            version: ios.version,
+            build_string: "0".into(),
+        }
+    }
+}
+
+impl From<Ios> for VirtualPackage {
+    fn from(ios: Ios) -> Self {
+        VirtualPackage::Ios(ios)
+    }
+}
+
+impl From<Version> for Ios {
+    fn from(version: Version) -> Self {
+        Self { version }
+    }
+}
+
+impl EnvOverride for Ios {
+    fn parse_version(env_var_value: &str) -> Result<Self, ParseVirtualPackageOverrideError> {
+        Ok(Self {
+            version: Version::from_str(env_var_value)?,
+        })
+    }
+    fn detect_from_host() -> Result<Option<Self>, DetectVirtualPackageError> {
+        Ok(Self::current())
+    }
+    const DEFAULT_ENV_NAME: &'static str = "CONDA_OVERRIDE_IOS";
+}
+
+/// Android virtual package description.
+///
+/// The version encodes the *minimum* supported Android API level (the API-level
+/// axis of a `PyPI` wheel tag such as `android_21_arm64_v8a`). The ABI is encoded
+/// in the subdir (e.g. `android-aarch64`, `android-armv7a`) instead, so version
+/// compatibility falls out of the normal solver just like `__osx` and
+/// `__glibc`.
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Deserialize)]
+pub struct Android {
+    /// The minimum supported Android API level, encoded as a version.
+    pub version: Version,
+}
+
+impl Android {
+    /// Returns the Android API level of the current platform.
+    ///
+    /// Runtime version detection is not implemented yet, so this always returns
+    /// `None`. The `__android` virtual package is instead produced when
+    /// cross-compiling to an `android-*` subdir (see
+    /// [`VirtualPackages::detect_for_platform`]) or via the
+    /// `CONDA_OVERRIDE_ANDROID` environment variable.
+    pub fn current() -> Option<Self> {
+        None
+    }
+}
+
+impl From<Android> for GenericVirtualPackage {
+    fn from(android: Android) -> Self {
+        GenericVirtualPackage {
+            name: PackageName::new_unchecked("__android"),
+            version: android.version,
+            build_string: "0".into(),
+        }
+    }
+}
+
+impl From<Android> for VirtualPackage {
+    fn from(android: Android) -> Self {
+        VirtualPackage::Android(android)
+    }
+}
+
+impl From<Version> for Android {
+    fn from(version: Version) -> Self {
+        Self { version }
+    }
+}
+
+impl EnvOverride for Android {
+    fn parse_version(env_var_value: &str) -> Result<Self, ParseVirtualPackageOverrideError> {
+        Ok(Self {
+            version: Version::from_str(env_var_value)?,
+        })
+    }
+    fn detect_from_host() -> Result<Option<Self>, DetectVirtualPackageError> {
+        Ok(Self::current())
+    }
+    const DEFAULT_ENV_NAME: &'static str = "CONDA_OVERRIDE_ANDROID";
 }
 
 /// Windows virtual package description
@@ -995,9 +1349,71 @@ mod test {
     #[test]
     fn doesnt_crash() {
         let virtual_packages =
-            VirtualPackages::detect(&VirtualPackageOverrides::default()).unwrap();
+            VirtualPackages::detect(&VirtualPackageOverrides::default(), None).unwrap();
         println!("{virtual_packages:#?}");
     }
+
+    #[test]
+    fn archspec_compatibility() {
+        let arch = Archspec::from_name;
+
+        // A descendant microarchitecture satisfies its ancestors, including
+        // through multiple inheritance (m2 derives from both m1 and armv8.5a).
+        assert!(arch("skylake").is_compatible_with(&arch("x86_64_v3")));
+        assert!(arch("m2").is_compatible_with(&arch("m1")));
+        assert!(arch("m2").is_compatible_with(&arch("armv8.5a")));
+        assert!(arch("x86_64_v3").is_compatible_with(&arch("x86_64_v3")));
+
+        // An ancestor does not satisfy a more specific requirement.
+        assert!(!arch("haswell").is_compatible_with(&arch("skylake")));
+        assert!(!arch("x86_64").is_compatible_with(&arch("x86_64_v3")));
+
+        // Different microarchitecture families are never compatible.
+        assert!(!arch("m2").is_compatible_with(&arch("x86_64")));
+        assert!(!arch("skylake").is_compatible_with(&arch("aarch64")));
+
+        // Unknown-name (generic, parentless) nodes only match themselves.
+        assert!(arch("not-a-real-arch").is_compatible_with(&arch("not-a-real-arch")));
+        assert!(!arch("skylake").is_compatible_with(&arch("not-a-real-arch")));
+
+        // An Unknown host fails any specific requirement; an Unknown
+        // requirement constrains nothing.
+        assert!(!Archspec::Unknown.is_compatible_with(&arch("x86_64")));
+        assert!(Archspec::Unknown.is_compatible_with(&Archspec::Unknown));
+        assert!(arch("skylake").is_compatible_with(&Archspec::Unknown));
+    }
+
+    #[test]
+    fn archspec_from_known_name() {
+        assert_eq!(
+            Archspec::from_known_name("skylake").map(|a| a.as_str().to_string()),
+            Some("skylake".to_string())
+        );
+        assert_eq!(Archspec::from_known_name("x86-64-v3"), None);
+        assert_eq!(Archspec::from_known_name("nonsense"), None);
+    }
+
+    #[test]
+    fn archspec_override_rejects_unknown_names() {
+        assert_eq!(
+            Archspec::parse_version("skylake").unwrap().as_str(),
+            "skylake"
+        );
+        assert_eq!(Archspec::parse_version("0").unwrap(), Archspec::Unknown);
+
+        // The dashed spelling gets a did-you-mean hint.
+        let error = Archspec::parse_version("x86-64-v3").unwrap_err();
+        assert!(error.to_string().contains("did you mean 'x86_64_v3'"));
+
+        // Other unknown names name the generic fix.
+        let error = Archspec::parse_version("nonsense").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("'nonsense' is not a known archspec microarchitecture")
+        );
+    }
+
     #[test]
     fn parse_libc() {
         let v = "1.23";
@@ -1105,7 +1521,7 @@ mod test {
 
         // Test Linux 64-bit
         let linux_packages =
-            VirtualPackages::detect_for_platform(Platform::Linux64, &overrides).unwrap();
+            VirtualPackages::detect_for_platform(Platform::Linux64, &overrides, None).unwrap();
         let linux_names: Vec<String> = linux_packages
             .into_generic_virtual_packages()
             .map(|pkg| pkg.name.as_normalized().to_string())
@@ -1117,7 +1533,7 @@ mod test {
 
         // Test macOS ARM64
         let osx_packages =
-            VirtualPackages::detect_for_platform(Platform::OsxArm64, &overrides).unwrap();
+            VirtualPackages::detect_for_platform(Platform::OsxArm64, &overrides, None).unwrap();
         let osx_names: Vec<String> = osx_packages
             .into_generic_virtual_packages()
             .map(|pkg| pkg.name.as_normalized().to_string())
@@ -1128,7 +1544,7 @@ mod test {
 
         // Test Windows 64-bit
         let win_packages =
-            VirtualPackages::detect_for_platform(Platform::Win64, &overrides).unwrap();
+            VirtualPackages::detect_for_platform(Platform::Win64, &overrides, None).unwrap();
         let win_names: Vec<String> = win_packages
             .into_generic_virtual_packages()
             .map(|pkg| pkg.name.as_normalized().to_string())
@@ -1136,6 +1552,109 @@ mod test {
         assert!(win_names.contains(&"__win".to_string()));
         assert!(!win_names.contains(&"__unix".to_string()));
         assert!(win_names.contains(&"__archspec".to_string()));
+    }
+
+    #[test]
+    fn test_cross_platform_default_versions() {
+        // When targeting a platform whose virtual packages cannot be detected
+        // on the host, the pixi default versions are used instead of 0. The
+        // host's own platform family is skipped because there the detected
+        // (host) versions take precedence over the defaults.
+        let overrides = VirtualPackageOverrides::default();
+        let current = Platform::current();
+
+        if !current.is_linux() {
+            let packages =
+                VirtualPackages::detect_for_platform(Platform::Linux64, &overrides, None).unwrap();
+            assert_eq!(
+                packages.linux.expect("__linux should be present").version,
+                defaults::default_linux_version()
+            );
+            let libc = packages.libc.expect("__glibc should be present");
+            assert_eq!(libc.family, "glibc");
+            assert_eq!(libc.version, defaults::default_glibc_version());
+        }
+
+        if !current.is_osx() {
+            let packages =
+                VirtualPackages::detect_for_platform(Platform::OsxArm64, &overrides, None).unwrap();
+            assert_eq!(
+                packages.osx.expect("__osx should be present").version,
+                defaults::default_mac_os_version(Platform::OsxArm64).unwrap()
+            );
+        }
+
+        if !current.is_windows() {
+            let packages =
+                VirtualPackages::detect_for_platform(Platform::Win64, &overrides, None).unwrap();
+            assert_eq!(
+                packages.win.expect("__win should be present").version,
+                Some(defaults::default_windows_version())
+            );
+        }
+    }
+
+    #[test]
+    fn test_ios_android_virtual_packages() {
+        // Cross-compiling to an ios-* subdir yields __ios (falling back to
+        // version 0) plus __unix, but not __osx.
+        let ios_packages = VirtualPackages::detect_for_platform(
+            Platform::IosArm64,
+            &VirtualPackageOverrides::default(),
+            None,
+        )
+        .unwrap();
+        let ios_names: Vec<String> = ios_packages
+            .into_generic_virtual_packages()
+            .map(|pkg| pkg.name.as_normalized().to_string())
+            .collect();
+        assert!(ios_names.contains(&"__ios".to_string()));
+        assert!(ios_names.contains(&"__unix".to_string()));
+        assert!(!ios_names.contains(&"__osx".to_string()));
+
+        // The __ios version can be overridden (mirrors CONDA_OVERRIDE_OSX).
+        let overrides = VirtualPackageOverrides {
+            ios: Some(Override::String("15.0".to_string())),
+            ..Default::default()
+        };
+        let ios_packages =
+            VirtualPackages::detect_for_platform(Platform::IosSimulatorArm64, &overrides, None)
+                .unwrap();
+        let ios = ios_packages
+            .into_generic_virtual_packages()
+            .find(|pkg| pkg.name.as_normalized() == "__ios")
+            .expect("__ios should be present");
+        assert_eq!(ios.version, Version::from_str("15.0").unwrap());
+
+        // Cross-compiling to an android-* subdir yields __android plus __unix,
+        // but not __linux.
+        let android_packages = VirtualPackages::detect_for_platform(
+            Platform::AndroidAarch64,
+            &VirtualPackageOverrides::default(),
+            None,
+        )
+        .unwrap();
+        let android_names: Vec<String> = android_packages
+            .into_generic_virtual_packages()
+            .map(|pkg| pkg.name.as_normalized().to_string())
+            .collect();
+        assert!(android_names.contains(&"__android".to_string()));
+        assert!(android_names.contains(&"__unix".to_string()));
+        assert!(!android_names.contains(&"__linux".to_string()));
+
+        // The __android version (API level) can be overridden.
+        let overrides = VirtualPackageOverrides {
+            android: Some(Override::String("21".to_string())),
+            ..Default::default()
+        };
+        let android_packages =
+            VirtualPackages::detect_for_platform(Platform::AndroidArmV7a, &overrides, None)
+                .unwrap();
+        let android = android_packages
+            .into_generic_virtual_packages()
+            .find(|pkg| pkg.name.as_normalized() == "__android")
+            .expect("__android should be present");
+        assert_eq!(android.version, Version::from_str("21").unwrap());
     }
 
     #[test]
@@ -1199,7 +1718,7 @@ mod test {
 
         // Case 1: Both not present - cuda_arch should be None
         let overrides = VirtualPackageOverrides::default();
-        let packages = VirtualPackages::detect(&overrides).unwrap();
+        let packages = VirtualPackages::detect(&overrides, None).unwrap();
         // If cuda is None, cuda_arch must also be None
         if packages.cuda.is_none() {
             assert!(
@@ -1215,7 +1734,7 @@ mod test {
             cuda_arch: Some(cuda_arch_override),
             ..Default::default()
         };
-        let packages = VirtualPackages::detect(&overrides).unwrap();
+        let packages = VirtualPackages::detect(&overrides, None).unwrap();
         if packages.cuda.is_none() {
             assert!(
                 packages.cuda_arch.is_none(),
@@ -1231,7 +1750,7 @@ mod test {
             cuda_arch: Some(cuda_arch_override),
             ..Default::default()
         };
-        let packages = VirtualPackages::detect(&overrides).unwrap();
+        let packages = VirtualPackages::detect(&overrides, None).unwrap();
         assert!(
             packages.cuda.is_some(),
             "cuda should be present with override"
@@ -1251,7 +1770,7 @@ mod test {
             cuda_arch: Some(cuda_arch_override),
             ..Default::default()
         };
-        let packages = VirtualPackages::detect(&overrides).unwrap();
+        let packages = VirtualPackages::detect(&overrides, None).unwrap();
         assert!(
             packages.cuda.is_none(),
             "cuda should be None with empty string override"
