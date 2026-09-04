@@ -117,10 +117,7 @@ async fn upload_single_package(
         .chunk(DESIRED_CHUNK_SIZE)
         .concurrent(PART_CONCURRENCY)
         .if_not_exists(!force)
-        .user_metadata([
-            (String::from("package-sha256"), hex::encode(sha256hash)),
-            (String::from("package-md5"), hex::encode(md5hash)),
-        ])
+        .user_metadata(blob_metadata(&sha256hash, &md5hash))
         .await
     {
         Err(e) if e.kind() == ErrorKind::ConditionNotMatch => {
@@ -169,6 +166,13 @@ async fn upload_single_package(
     }
 
     Ok(())
+}
+
+fn blob_metadata(sha256hash: &[u8], md5hash: &[u8]) -> [(String, String); 2] {
+    [
+        (String::from("package_sha256"), hex::encode(sha256hash)),
+        (String::from("package_md5"), hex::encode(md5hash)),
+    ]
 }
 
 /// Build an opendal [`AzblobConfig`] from a channel URL and credentials.
@@ -225,4 +229,28 @@ fn azblob_config(credentials: &AzureCredentials, channel: &Url) -> miette::Resul
         sas_token,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blob_metadata;
+
+    fn is_valid_azure_metadata_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    #[test]
+    fn blob_metadata_keys_are_valid_azure_metadata_names() {
+        let metadata = blob_metadata(&[0xab; 32], &[0xcd; 16]);
+        let keys = metadata
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["package_sha256", "package_md5"]);
+        assert!(keys.iter().all(|key| is_valid_azure_metadata_name(key)));
+    }
 }
