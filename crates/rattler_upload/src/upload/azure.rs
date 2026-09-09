@@ -171,8 +171,8 @@ async fn upload_single_package(
     if size > DESIRED_CHUNK_SIZE as u64 {
         tracing::warn!(
             "{blob_url} is larger than {DESIRED_CHUNK_SIZE} bytes, so it is uploaded through \
-             Azure's multi-block path, which carries no blob metadata: package-sha256, \
-             package-md5 and content-disposition will be missing on this blob."
+             Azure's multi-block path, which carries no blob metadata: package_sha256, \
+             package_md5 and content-disposition will be missing on this blob."
         );
     }
 

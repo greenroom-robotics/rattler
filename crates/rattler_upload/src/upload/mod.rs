@@ -283,10 +283,7 @@ pub(crate) mod object_store {
             chunk: Some(DESIRED_CHUNK_SIZE),
             concurrent: PART_CONCURRENCY,
             content_disposition: Some(format!("attachment; filename={}", target.filename)),
-            user_metadata: Some(HashMap::from([
-                (String::from("package-sha256"), hex::encode(sha256)),
-                (String::from("package-md5"), hex::encode(md5)),
-            ])),
+            user_metadata: Some(blob_metadata(&sha256, &md5)),
             if_not_exists: !force.is_enabled(),
             ..WriteOptions::default()
         };
@@ -360,9 +357,18 @@ pub(crate) mod object_store {
         }
     }
 
+    /// Azure metadata names must be valid C# identifiers, so the keys use
+    /// underscores rather than the hyphens S3 would also accept.
+    fn blob_metadata(sha256: &[u8], md5: &[u8]) -> HashMap<String, String> {
+        HashMap::from([
+            (String::from("package_sha256"), hex::encode(sha256)),
+            (String::from("package_md5"), hex::encode(md5)),
+        ])
+    }
+
     #[cfg(test)]
     mod test {
-        use super::{BlobStoreError, hash_file};
+        use super::{BlobStoreError, blob_metadata, hash_file};
         use crate::upload::test_utils::test_package_path;
         use opendal::ErrorKind;
         use rattler_digest::{Md5, Sha256, compute_file_digest};
@@ -383,6 +389,23 @@ pub(crate) mod object_store {
                 compute_file_digest::<Md5>(&path).unwrap(),
                 "recorded md5 must match the file's"
             );
+        }
+
+        #[test]
+        fn blob_metadata_keys_are_valid_azure_metadata_names() {
+            fn is_valid_azure_metadata_name(name: &str) -> bool {
+                let mut chars = name.chars();
+                chars
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+
+            let metadata = blob_metadata(&[0xab; 32], &[0xcd; 16]);
+            let mut keys = metadata.keys().map(String::as_str).collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(keys, ["package_md5", "package_sha256"]);
+            assert!(keys.iter().all(|key| is_valid_azure_metadata_name(key)));
         }
 
         #[test]
