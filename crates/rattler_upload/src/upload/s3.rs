@@ -23,8 +23,9 @@ pub async fn upload_package_to_s3(
     channel: Url,
     credentials: ResolvedS3Credentials,
     package_files: &[PathBuf],
-    force: ForceOverwrite,
+    force: impl Into<ForceOverwrite>,
 ) -> miette::Result<()> {
+    let force = force.into();
     let bucket = channel
         .host_str()
         .ok_or(miette::miette!("No bucket in S3 URL"))?;
