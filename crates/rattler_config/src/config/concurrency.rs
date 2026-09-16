@@ -17,6 +17,11 @@ pub fn default_max_concurrent_downloads() -> usize {
     50
 }
 
+/// The default maximum number of concurrent source builds. Builds are resource heavy, so only one runs at a time unless configured otherwise.
+pub fn default_max_concurrent_builds() -> usize {
+    1
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct ConcurrencyConfig {
@@ -31,6 +36,12 @@ pub struct ConcurrencyConfig {
     // to 0 of partial struct was omitted.
     #[serde(default = "default_max_concurrent_downloads")]
     pub downloads: usize,
+
+    /// The maximum number of concurrent source builds that can be run at once.
+    // Needing to set this default next to the default of the full struct to avoid serde defaulting
+    // to 0 of partial struct was omitted.
+    #[serde(default = "default_max_concurrent_builds")]
+    pub builds: usize,
 }
 
 impl Default for ConcurrencyConfig {
@@ -38,6 +49,7 @@ impl Default for ConcurrencyConfig {
         Self {
             solves: default_max_concurrent_solves(),
             downloads: default_max_concurrent_downloads(),
+            builds: default_max_concurrent_builds(),
         }
     }
 }
@@ -61,6 +73,11 @@ impl Config for ConcurrencyConfig {
             } else {
                 other.downloads
             },
+            builds: if other.builds == ConcurrencyConfig::default().builds {
+                self.builds
+            } else {
+                other.builds
+            },
         })
     }
 
@@ -79,10 +96,21 @@ impl Config for ConcurrencyConfig {
             ));
         }
 
+        if self.builds == 0 {
+            return Err(ValidationError::InvalidValue(
+                "builds".to_string(),
+                "The number of concurrent builds must be greater than 0".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
     fn keys(&self) -> Vec<String> {
-        vec!["solves".to_string(), "downloads".to_string()]
+        vec![
+            "solves".to_string(),
+            "downloads".to_string(),
+            "builds".to_string(),
+        ]
     }
 }

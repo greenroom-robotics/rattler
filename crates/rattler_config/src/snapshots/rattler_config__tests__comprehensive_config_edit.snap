@@ -26,6 +26,7 @@ disable-zstd = false
 [concurrency]
 solves = 16
 downloads = 32
+builds = 1
 
 [proxy-config]
 https = "https://secure-proxy.company.com/"

@@ -33,6 +33,7 @@ disable-sharded = true
 [concurrency]
 solves = 9
 downloads = 12
+builds = 1
 
 [proxy-config]
 https = "https://proxy.example.com:8080/"
