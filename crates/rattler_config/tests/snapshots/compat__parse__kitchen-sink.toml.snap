@@ -139,6 +139,7 @@ expression: "(unused, normalized(config))"
             concurrency: ConcurrencyConfig {
                 solves: 0,
                 downloads: 12,
+                builds: 1,
             },
             proxy_config: ProxyConfig {
                 https: Some(
