@@ -20,5 +20,6 @@ array_field = []
 [concurrency]
 solves = 12
 downloads = 24
+builds = 1
 
 [nested]
