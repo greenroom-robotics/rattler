@@ -12,6 +12,7 @@ array_field = []
 [concurrency]
 solves = 6
 downloads = 50
+builds = 1
 
 [s3-options.test-bucket]
 endpoint-url = "https://s3.amazonaws.com/"
