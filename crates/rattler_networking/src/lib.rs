@@ -2,7 +2,9 @@
 
 //! Networking utilities for Rattler, specifically authenticating requests
 pub use authentication_middleware::AuthenticationMiddleware;
-pub use authentication_storage::{authentication::Authentication, storage::AuthenticationStorage};
+pub use authentication_storage::{
+    AuthenticationStorageError, authentication::Authentication, storage::AuthenticationStorage,
+};
 pub use challenge_middleware::{
     AuthChallengeMiddleware, AuthFlow, AuthFlowError, BearerToken, Challenge,
 };
@@ -14,17 +16,17 @@ pub use offline_middleware::{OfflineError, OfflineMiddleware};
 #[cfg(feature = "gcs")]
 pub mod gcs_middleware;
 #[cfg(feature = "gcs")]
-pub use gcs_middleware::GCSMiddleware;
+pub use gcs_middleware::{GCSMiddleware, GcsMiddlewareError};
 
 #[cfg(feature = "s3")]
 pub mod s3_middleware;
 #[cfg(feature = "s3")]
-pub use s3_middleware::S3Middleware;
+pub use s3_middleware::{S3Middleware, S3MiddlewareError};
 
 #[cfg(feature = "azure")]
 pub mod azure_middleware;
 #[cfg(feature = "azure")]
-pub use azure_middleware::AzureMiddleware;
+pub use azure_middleware::{AzureMiddleware, AzureMiddlewareError};
 
 pub mod authentication_middleware;
 pub mod authentication_storage;
@@ -35,6 +37,7 @@ mod lazy_client;
 pub mod mirror_middleware;
 pub mod oci_middleware;
 pub mod offline_middleware;
+pub mod oidc_exchange;
 #[cfg(feature = "rattler_config")]
 pub mod proxy;
 pub mod retry_policies;

@@ -23,6 +23,7 @@ use rattler_digest::{Md5, Sha256, parse_digest_from_hex};
 use url::Url;
 
 use crate::{
+    build_string::PyBuildString,
     error::PyRattlerError,
     no_arch_type::PyNoArchType,
     package_name::PyPackageName,
@@ -184,7 +185,7 @@ impl PyRecord {
     pub fn create(
         name: PyPackageName,
         version: (PyVersion, String),
-        build: String,
+        build: PyBuildString,
         build_number: u64,
         subdir: String,
         arch: Option<String>,
@@ -192,10 +193,12 @@ impl PyRecord {
         noarch: Option<PyNoArchType>,
         python_site_packages_path: Option<String>,
     ) -> Self {
+        let build = build.inner;
         let noarch = noarch.map(Into::into);
         Self {
             inner: RecordInner::Package(Arc::new(PackageRecord {
                 name: name.into(),
+                attestations_sha256: None,
                 version: VersionWithSource::new(version.0.inner.clone(), version.1),
                 build,
                 build_number,
@@ -219,6 +222,7 @@ impl PyRecord {
                 sha256: None,
                 size: None,
                 timestamp: None,
+                indexed_timestamp: None,
                 track_features: Vec::new(),
             })),
         }
@@ -369,15 +373,17 @@ impl PyRecord {
         self.as_package_record_mut().arch = arch;
     }
 
-    /// The build string of the package.
+    /// The build string of the package, preserving legacy values without validation.
     #[getter]
-    pub fn build(&self) -> String {
-        self.as_package_record().build.clone()
+    pub fn build(&self) -> PyBuildString {
+        PyBuildString {
+            inner: self.as_package_record().build.clone(),
+        }
     }
 
     #[setter]
-    pub fn set_build(&mut self, build: String) {
-        self.as_package_record_mut().build = build;
+    pub fn set_build(&mut self, build: PyBuildString) {
+        self.as_package_record_mut().build = build.inner;
     }
 
     /// The build number of the package.
@@ -550,6 +556,25 @@ impl PyRecord {
         self.as_package_record_mut().platform = platform;
     }
 
+    /// Optionally a SHA256 hash of the package's Sigstore attestation sidecar.
+    #[getter]
+    pub fn attestations_sha256<'a>(&self, py: Python<'a>) -> Option<Bound<'a, PyBytes>> {
+        self.as_package_record()
+            .attestations_sha256
+            .map(|sha| PyBytes::new(py, &sha))
+    }
+
+    /// Optionally a SHA256 hash of the package's Sigstore attestation sidecar.
+    #[setter]
+    pub fn set_attestations_sha256(
+        &mut self,
+        attestations_sha256: Option<Bound<'_, PyBytes>>,
+    ) -> PyResult<()> {
+        self.as_package_record_mut().attestations_sha256 =
+            attestations_sha256.map(sha256_from_pybytes).transpose()?;
+        Ok(())
+    }
+
     /// Optionally a SHA256 hash of the package archive.
     #[getter]
     pub fn sha256<'a>(&self, py: Python<'a>) -> Option<Bound<'a, PyBytes>> {
@@ -617,6 +642,23 @@ impl PyRecord {
             self.as_package_record_mut().timestamp = None;
         }
 
+        Ok(())
+    }
+
+    /// Server-assigned first index time in Unix milliseconds (CEP-0047).
+    #[getter]
+    pub fn indexed_timestamp(&self) -> Option<i64> {
+        self.as_package_record()
+            .indexed_timestamp
+            .map(|ts| ts.timestamp_millis())
+    }
+
+    #[setter]
+    pub fn set_indexed_timestamp(&mut self, timestamp: Option<i64>) -> PyResult<()> {
+        self.as_package_record_mut().indexed_timestamp = timestamp
+            .map(|ts| jiff::Timestamp::from_millisecond(ts).map(TimestampMs::from_timestamp_millis))
+            .transpose()
+            .map_err(|err| PyValueError::new_err(format!("Invalid indexed timestamp: {err}")))?;
         Ok(())
     }
 

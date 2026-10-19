@@ -17,7 +17,7 @@ solves = 9
 [s3-options.other-bucket]
 endpoint-url = "https://minio.example.com"
 region = "auto"
-force-path-style = false
+addressing-style = "virtual-host"
 
 [azure-options."mycompany.blob.core.windows.net".auth]
 staging = true

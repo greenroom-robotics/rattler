@@ -8,7 +8,7 @@ use crate::{
     },
 };
 use rattler_conda_types::package::{
-    ArchiveIdentifier, CondaArchiveType, DistArchiveIdentifier, DistArchiveType,
+    ArchiveIdentifier, BuildString, CondaArchiveType, DistArchiveIdentifier, DistArchiveType,
 };
 use rattler_conda_types::{
     BuildNumber, ChannelUrl, Flag, NoArchType, PackageName, PackageRecord, PackageUrl,
@@ -98,7 +98,7 @@ fn find_build_and_build_number(
     read_build: &str,
     read_build_number: u64,
     file_id: &DistArchiveIdentifier,
-) -> (String, u64) {
+) -> (BuildString, u64) {
     let build = if read_build.is_empty() {
         file_id.identifier.build_string.clone()
     } else {
@@ -110,7 +110,7 @@ fn find_build_and_build_number(
         read_build_number
     };
 
-    (build, build_number)
+    (BuildString::new_unchecked(build), build_number)
 }
 
 impl<'a> From<CondaPackageDataModel<'a>> for LegacyCondaPackageData {
@@ -138,6 +138,7 @@ impl<'a> From<CondaPackageDataModel<'a>> for LegacyCondaPackageData {
 
         Self::Binary(LegacyCondaBinaryData {
             package_record: PackageRecord {
+                attestations_sha256: None,
                 build,
                 build_number,
                 constrains: value.constrains.into_owned(),
@@ -157,6 +158,7 @@ impl<'a> From<CondaPackageDataModel<'a>> for LegacyCondaPackageData {
                 size: value.size.into_owned(),
                 subdir,
                 timestamp: value.timestamp.map(Into::into),
+                indexed_timestamp: None,
                 track_features: value.track_features.into_owned(),
                 version: value.version.into_owned(),
                 run_exports: None,

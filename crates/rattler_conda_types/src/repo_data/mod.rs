@@ -26,11 +26,11 @@ use url::Url;
 
 use crate::{
     Arch, Channel, Flag, MatchSpec, Matches, NoArchType, PackageName, PackageUrl,
-    ParseMatchSpecError, ParseStrictness, Platform, RepoDataRecord, VersionWithSource,
+    ParseMatchSpecError, ParseStrictness, RepoDataRecord, Subdir, VersionWithSource,
     build_spec::BuildNumber,
     package::{
-        ArchiveIdentifier, CondaArchiveType, DistArchiveIdentifier, IndexJson, RunExportsJson,
-        WheelArchiveType,
+        ArchiveIdentifier, BuildString, CondaArchiveType, DistArchiveIdentifier, IndexJson,
+        RunExportsJson, WheelArchiveType,
     },
     utils::{
         TimestampMs, UrlWithTrailingSlash,
@@ -39,6 +39,7 @@ use crate::{
             sort_set_alphabetically,
         },
     },
+    virtual_package_detector::DetectorRegistrationMetadata,
 };
 
 /// [`RepoData`] is an index of package binaries available on in a subdirectory
@@ -107,12 +108,28 @@ pub struct ChannelInfo {
     /// [CEP-42](https://github.com/conda/ceps/blob/main/cep-0042.md).
     #[serde(default, skip_serializing_if = "ChannelRelations::is_none_or_empty")]
     pub channel_relations: Option<ChannelRelations>,
+
+    /// The virtual package detectors the channel registers for this subdir.
+    /// Malformed metadata shapes reject repodata during deserialization.
+    /// Validate detector keys and registration semantics with
+    /// [`SubdirDetectorRegistrations::parse`](crate::virtual_package_detector::SubdirDetectorRegistrations::parse).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::virtual_package_detector::deserialize_present"
+    )]
+    pub virtual_package_detectors: Option<DetectorRegistrationMetadata>,
 }
 
 /// Repodata revisions keyed by revision, mirroring the `vN` dictionary of the
 /// CEP draft <https://github.com/conda/ceps/pull/146>. Keying encodes
 /// uniqueness; insertion order is preserved.
 pub type RepodataRevisions = IndexMap<RepodataRevision, RepodataRevisionMetadata>;
+
+/// The maximum length in bytes of a [`RepodataRevisionMetadata::message`]
+/// written by a producer, as required by CEP 48. Readers accept longer
+/// messages.
+pub const MAX_REPODATA_REVISION_MESSAGE_BYTES: usize = 8192;
 
 /// Metadata for a single [`RepodataRevisions`] entry; the revision itself is
 /// the map key.
@@ -547,8 +564,18 @@ pub struct PackageRecord {
     /// the package is `noarch`.
     pub arch: Option<String>,
 
-    /// The build string of the package
-    pub build: String,
+    /// The SHA256 hash of the Sigstore attestation sidecar served alongside the
+    /// package, as specified by
+    /// [CEP 50](https://conda.org/learn/ceps/cep-0050). The sidecar is served
+    /// at `<package_url>.sigs.<attestations_sha256>` and contains a JSON array
+    /// of Sigstore bundles. If this is `None` no attestations are advertised
+    /// for the package.
+    #[serde_as(as = "Option<SerializableHash::<rattler_digest::Sha256>>")]
+    pub attestations_sha256: Option<Sha256Hash>,
+
+    /// The build string of the package. The field is always serialized and
+    /// required when deserializing, including empty values in existing data.
+    pub build: BuildString,
 
     /// The build number of the package
     pub build_number: BuildNumber,
@@ -581,6 +608,12 @@ pub struct PackageRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<Flag>,
 
+    /// When this artifact first entered the channel index (CEP-0047).
+    /// Assigned by the channel server or indexer, in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde_as(as = "Option<crate::utils::serde::StrictTimestampMs>")]
+    pub indexed_timestamp: Option<crate::utils::TimestampMs>,
+
     /// A deprecated md5 hash
     #[serde_as(as = "Option<SerializableHash::<rattler_digest::Md5>>")]
     pub legacy_bz2_md5: Option<Md5Hash>,
@@ -608,9 +641,9 @@ pub struct PackageRecord {
     pub noarch: NoArchType,
 
     /// Optionally the platform the package supports.
-    /// Note that this does not match the [`Platform`] enum, but is only the
+    /// Note that this does not match the [`Subdir`] enum, but is only the
     /// first part of the platform (e.g. `linux`, `osx`, `win`, ...).
-    /// The `subdir` field contains the `Platform` enum.
+    /// The `subdir` field contains the `Subdir` enum.
     pub platform: Option<String>,
 
     /// Package identifiers of packages that are equivalent to this package but
@@ -646,7 +679,7 @@ pub struct PackageRecord {
     #[serde(default)]
     pub subdir: String,
 
-    /// The date this entry was created.
+    /// The start of the package build, as supplied by the package builder.
     pub timestamp: Option<crate::utils::TimestampMs>,
 
     /// Track features are nowadays only used to downweight packages (ie. give
@@ -757,7 +790,7 @@ impl FromStr for UrlOrPath {
 impl Display for PackageRecord {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if self.build.is_empty() {
-            write!(f, "{} {}", self.name.as_normalized(), self.version,)
+            write!(f, "{} {}", self.name.as_normalized(), self.version)
         } else {
             write!(
                 f,
@@ -781,14 +814,6 @@ impl PackageRecord {
     /// Returns true if package `run_exports` is some.
     pub fn has_run_exports(&self) -> bool {
         self.run_exports.is_some()
-    }
-
-    /// Returns the timestamp used by indexing operations.
-    ///
-    /// This currently returns the package build timestamp. A future index
-    /// timestamp can change this method without changing its callers.
-    pub fn timestamp_for_indexing(&self) -> Option<TimestampMs> {
-        self.timestamp
     }
 }
 
@@ -924,8 +949,13 @@ impl AsRef<PackageRecord> for PackageRecord {
 impl PackageRecord {
     /// A simple helper method that constructs a `PackageRecord` with the bare
     /// minimum values.
-    pub fn new(name: PackageName, version: impl Into<VersionWithSource>, build: String) -> Self {
+    pub fn new(
+        name: PackageName,
+        version: impl Into<VersionWithSource>,
+        build: BuildString,
+    ) -> Self {
         Self {
+            attestations_sha256: None,
             arch: None,
             build,
             build_number: 0,
@@ -945,8 +975,9 @@ impl PackageRecord {
             extra_depends: BTreeMap::new(),
             sha256: None,
             size: None,
-            subdir: Platform::current().to_string(),
+            subdir: Subdir::current().unwrap_or(Subdir::NoArch).to_string(),
             timestamp: None,
+            indexed_timestamp: None,
             track_features: vec![],
             version: version.into(),
             purls: None,
@@ -1133,7 +1164,7 @@ pub enum ConvertSubdirError {
         /// The architecture.
         arch: String,
     },
-    /// Platform key is empty
+    /// Subdir key is empty
     #[error("platform key is empty in index.json")]
     PlatformEmpty,
     /// Arch key is empty
@@ -1146,9 +1177,9 @@ pub enum ConvertSubdirError {
 /// These were the combinations that have been found in the database.
 /// and have been represented in the function.
 ///
-/// # Why can we not use `Platform::FromStr`?
+/// # Why can we not use `Subdir::FromStr`?
 ///
-/// We cannot use the [`Platform`] `FromStr` directly because `x86` and `x86_64`
+/// We cannot use the [`Subdir`] `FromStr` directly because `x86` and `x86_64`
 /// are different architecture strings. Also some combinations have been
 /// removed, because they have not been found.
 fn determine_subdir(
@@ -1187,6 +1218,7 @@ impl PackageRecord {
         };
 
         Ok(PackageRecord {
+            attestations_sha256: None,
             arch: index.arch,
             build: index.build,
             build_number: index.build_number,
@@ -1208,6 +1240,7 @@ impl PackageRecord {
             size,
             subdir,
             timestamp: index.timestamp,
+            indexed_timestamp: None,
             track_features: index.track_features,
             version: index.version,
             purls: index.purls,
@@ -1223,8 +1256,11 @@ mod test {
     use crate::{
         Channel, ChannelConfig, ChannelInfo, ChannelRelations, PackageRecord, RepoData,
         RepodataRevision, V3Extensions, V3Packages,
-        package::DistArchiveIdentifier,
+        package::{BuildString, DistArchiveIdentifier},
         repo_data::{compute_package_url, determine_subdir},
+        virtual_package_detector::{
+            ChannelDetectorRegistrations, RegistrationError, SubdirDetectorRegistrations,
+        },
     };
 
     // isl-0.12.2-1.tar.bz2
@@ -1273,6 +1309,49 @@ mod test {
         insta::assert_snapshot!(json);
     }
 
+    #[test]
+    fn test_attestations_sha256() {
+        let raw = r#"{
+            "name": "foo",
+            "version": "1.0",
+            "build": "h1234_0",
+            "build_number": 0,
+            "subdir": "noarch",
+            "attestations_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }"#;
+        let record: PackageRecord = serde_json::from_str(raw).unwrap();
+        let hash = record.attestations_sha256.expect("hash should be parsed");
+        assert_eq!(
+            hex::encode(hash),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+
+        // Round-trips through serialization and is omitted when absent.
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            json["attestations_sha256"],
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        let record: PackageRecord = serde_json::from_str(
+            r#"{"name": "foo", "version": "1.0", "build": "h1234_0", "build_number": 0, "subdir": "noarch"}"#,
+        )
+        .unwrap();
+        assert!(record.attestations_sha256.is_none());
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json.get("attestations_sha256").is_none());
+
+        // A value that is not a valid SHA256 hex string is rejected.
+        let raw = r#"{
+            "name": "foo",
+            "version": "1.0",
+            "build": "h1234_0",
+            "build_number": 0,
+            "subdir": "noarch",
+            "attestations_sha256": "not-a-hash"
+        }"#;
+        assert!(serde_json::from_str::<PackageRecord>(raw).is_err());
+    }
+
     // See https://github.com/conda/ceps/blob/main/cep-0042.md
     #[test]
     fn test_channel_relations() {
@@ -1308,6 +1387,7 @@ mod test {
                     base: Some("../conda-forge".to_string()),
                     overrides: None,
                 }),
+                virtual_package_detectors: None,
             }),
             packages: IndexMap::default(),
             conda_packages: IndexMap::default(),
@@ -1330,6 +1410,7 @@ mod test {
                     base_url: None,
                     repodata_revisions: IndexMap::default(),
                     channel_relations,
+                    virtual_package_detectors: None,
                 }),
                 packages: IndexMap::default(),
                 conda_packages: IndexMap::default(),
@@ -1339,6 +1420,109 @@ mod test {
             let json = serde_json::to_string(&repodata).unwrap();
             assert!(!json.contains("channel_relations"));
         }
+    }
+
+    #[test]
+    fn test_virtual_package_detectors_round_trip() {
+        let raw = r#"{
+            "info": {
+                "subdir": "linux-64",
+                "virtual_package_detectors": {
+                    "mpi-detect": ["__conda_forge_openmpi", "__conda_forge_mpich"]
+                }
+            },
+            "packages": {},
+            "packages.conda": {}
+        }"#;
+        let repodata: RepoData = serde_json::from_str(raw).unwrap();
+        let detectors = repodata
+            .info
+            .as_ref()
+            .and_then(|info| info.virtual_package_detectors.as_ref())
+            .unwrap();
+        assert_eq!(
+            detectors["mpi-detect"],
+            ["__conda_forge_openmpi", "__conda_forge_mpich"]
+        );
+
+        let json = serde_json::to_string(&repodata).unwrap();
+        assert_eq!(serde_json::from_str::<RepoData>(&json).unwrap(), repodata);
+
+        let without = RepoData {
+            info: Some(ChannelInfo {
+                subdir: Some("linux-64".to_string()),
+                base_url: None,
+                repodata_revisions: IndexMap::default(),
+                channel_relations: None,
+                virtual_package_detectors: None,
+            }),
+            ..repodata
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("virtual_package_detectors"));
+    }
+
+    #[test]
+    fn virtual_package_detector_metadata_rejects_malformed_shapes() {
+        for metadata in [
+            "null",
+            "true",
+            "42",
+            "\"mpi-detect\"",
+            "[]",
+            "[[\"mpi-detect\", [\"__cuda\"]]]",
+            r#"{"mpi-detect": null}"#,
+            r#"{"mpi-detect": "__cuda"}"#,
+            r#"{"mpi-detect": {"__cuda": true}}"#,
+            r#"{"mpi-detect": ["__cuda", 5]}"#,
+        ] {
+            let raw = format!(r#"{{"info": {{"virtual_package_detectors": {metadata}}}}}"#);
+            assert!(
+                serde_json::from_str::<RepoData>(&raw).is_err(),
+                "{metadata}"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_package_detector_metadata_preserves_semantic_validation() {
+        for metadata in [None, Some("{}")] {
+            let raw = metadata.map_or_else(
+                || r#"{"info": {}}"#.to_string(),
+                |metadata| format!(r#"{{"info": {{"virtual_package_detectors": {metadata}}}}}"#),
+            );
+            let repodata: RepoData = serde_json::from_str(&raw).unwrap();
+            let parsed = SubdirDetectorRegistrations::parse(
+                repodata
+                    .info
+                    .as_ref()
+                    .unwrap()
+                    .virtual_package_detectors
+                    .as_ref(),
+            )
+            .unwrap();
+            assert!(
+                ChannelDetectorRegistrations::combine([&parsed])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let repodata: RepoData = serde_json::from_str(
+            r#"{"info":{"virtual_package_detectors":{"mpi detect":["__cuda"]}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            SubdirDetectorRegistrations::parse(
+                repodata
+                    .info
+                    .as_ref()
+                    .unwrap()
+                    .virtual_package_detectors
+                    .as_ref()
+            ),
+            Err(RegistrationError::InvalidDetectorName { .. })
+        ));
     }
 
     #[test]
@@ -1614,19 +1798,51 @@ mod test {
     }
 
     #[test]
-    fn test_package_record_timestamp_for_indexing() {
-        let timestamp = crate::utils::TimestampMs::from_timestamp_millis(
-            jiff::Timestamp::from_millisecond(1_700_000_000_000).unwrap(),
-        );
+    fn indexed_timestamp_uses_strict_milliseconds_and_survives_patches() {
         let mut record = PackageRecord::new(
             crate::PackageName::new_unchecked("demo"),
             crate::Version::major(1),
-            "0".to_string(),
+            "0".parse::<BuildString>().unwrap(),
         );
-
-        assert_eq!(record.timestamp_for_indexing(), None);
-        record.timestamp = Some(timestamp);
-        assert_eq!(record.timestamp_for_indexing(), Some(timestamp));
+        assert!(
+            serde_json::to_value(&record)
+                .unwrap()
+                .get("indexed_timestamp")
+                .is_none()
+        );
+        for millis in [0, 1, -1, 1_700_000_000_123] {
+            let mut value = serde_json::to_value(&record).unwrap();
+            value["indexed_timestamp"] = millis.into();
+            record = serde_json::from_value(value).unwrap();
+            assert_eq!(record.indexed_timestamp.unwrap().timestamp_millis(), millis);
+            let patch = serde_json::from_value(
+                serde_json::json!({"depends": ["python"], "indexed_timestamp": 99}),
+            )
+            .unwrap();
+            record.apply_patch(&patch);
+            assert_eq!(
+                serde_json::to_value(&record).unwrap()["indexed_timestamp"],
+                millis
+            );
+        }
+        // Even a legacy seconds-marked value must serialize as milliseconds here.
+        record.indexed_timestamp = Some(crate::utils::TimestampMs::from_timestamp_seconds(
+            jiff::Timestamp::from_second(1).unwrap(),
+        ));
+        assert_eq!(
+            serde_json::to_value(&record).unwrap()["indexed_timestamp"],
+            1000
+        );
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["indexed_timestamp"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<PackageRecord>(value.clone())
+                .unwrap()
+                .indexed_timestamp
+                .is_none()
+        );
+        value["indexed_timestamp"] = i64::MAX.into();
+        assert!(serde_json::from_value::<PackageRecord>(value).is_err());
     }
 
     #[test]
@@ -1800,7 +2016,7 @@ mod test {
             PackageRecord::new(
                 PackageName::new_unchecked("zebra"),
                 Version::major(1),
-                "h123".to_string(),
+                "h123".parse::<BuildString>().unwrap(),
             ),
         );
         packages.insert(
@@ -1808,7 +2024,7 @@ mod test {
             PackageRecord::new(
                 PackageName::new_unchecked("apple"),
                 Version::major(2),
-                "h456".to_string(),
+                "h456".parse::<BuildString>().unwrap(),
             ),
         );
         packages.insert(
@@ -1816,7 +2032,7 @@ mod test {
             PackageRecord::new(
                 PackageName::new_unchecked("mango"),
                 Version::major(1),
-                "h789".to_string(),
+                "h789".parse::<BuildString>().unwrap(),
             ),
         );
         packages.insert(
@@ -1824,7 +2040,7 @@ mod test {
             PackageRecord::new(
                 PackageName::new_unchecked("banana"),
                 Version::major(3),
-                "habc".to_string(),
+                "habc".parse::<BuildString>().unwrap(),
             ),
         );
 
@@ -1834,7 +2050,7 @@ mod test {
             PackageRecord::new(
                 PackageName::new_unchecked("xray"),
                 Version::major(1),
-                "h111".to_string(),
+                "h111".parse::<BuildString>().unwrap(),
             ),
         );
         conda_packages.insert(
@@ -1842,7 +2058,7 @@ mod test {
             PackageRecord::new(
                 PackageName::new_unchecked("alpha"),
                 Version::major(2),
-                "h222".to_string(),
+                "h222".parse::<BuildString>().unwrap(),
             ),
         );
         conda_packages.insert(
@@ -1850,7 +2066,7 @@ mod test {
             PackageRecord::new(
                 PackageName::new_unchecked("omega"),
                 Version::major(3),
-                "h333".to_string(),
+                "h333".parse::<BuildString>().unwrap(),
             ),
         );
 
@@ -1906,7 +2122,7 @@ mod test {
             let mut r = PackageRecord::new(
                 PackageName::new_unchecked(name),
                 version.parse::<Version>().unwrap(),
-                format!("{build}_{build_number}"),
+                BuildString::new_unchecked(format!("{build}_{build_number}")),
             );
             r.build_number = build_number;
             r.subdir = subdir.to_string();
@@ -1948,13 +2164,12 @@ mod test {
         let formatted: Vec<String> = records
             .iter()
             .map(|r| {
-                format!(
-                    "{}/{}-{}-{}",
-                    r.subdir,
-                    r.name.as_normalized(),
-                    r.version,
-                    r.build
-                )
+                let name = r.name.as_normalized();
+                if r.build.is_empty() {
+                    format!("{}/{name}-{}", r.subdir, r.version)
+                } else {
+                    format!("{}/{name}-{}-{}", r.subdir, r.version, r.build)
+                }
             })
             .collect();
         insta::assert_snapshot!(formatted.join("\n"));
@@ -1969,7 +2184,7 @@ mod test {
                 let mut r = PackageRecord::new(
                     PackageName::new_unchecked("polars"),
                     version.parse::<Version>().unwrap(),
-                    format!("{build}_{build_number}"),
+                    BuildString::new_unchecked(format!("{build}_{build_number}")),
                 );
                 r.build_number = build_number;
                 r.subdir = "linux-64".to_string();

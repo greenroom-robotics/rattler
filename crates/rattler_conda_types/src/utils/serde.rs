@@ -7,12 +7,14 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::{
     marker::PhantomData,
-    path::{Path, PathBuf},
+    path::{Path, PathBuf, is_separator},
 };
 use url::Url;
 
 /// A helper struct that serializes Paths in a normalized way.
-/// - Backslashes are replaced with forward-slashes.
+/// - Path separators of the current platform are written as forward-slashes.
+///   On Windows this turns `\` into `/`; on Unix a `\` is an ordinary
+///   character in a file name and is written unchanged.
 pub(crate) struct NormalizedPath;
 
 impl<P: AsRef<Path>> SerializeAs<P> for NormalizedPath {
@@ -20,10 +22,16 @@ impl<P: AsRef<Path>> SerializeAs<P> for NormalizedPath {
     where
         S: Serializer,
     {
-        match source.as_ref().to_str() {
-            Some(s) => s.replace('\\', "/").serialize(serializer),
-            None => Err(S::Error::custom("path contains invalid UTF-8 characters")),
-        }
+        let Some(path) = source.as_ref().to_str() else {
+            return Err(S::Error::custom("path contains invalid UTF-8 characters"));
+        };
+        let is_non_slash_separator = |c: char| c != '/' && is_separator(c);
+        let normalized = if path.contains(is_non_slash_separator) {
+            Cow::Owned(path.replace(is_non_slash_separator, "/"))
+        } else {
+            Cow::Borrowed(path)
+        };
+        normalized.serialize(serializer)
     }
 }
 
@@ -222,6 +230,24 @@ impl Serialize for TimestampMs {
         };
 
         timestamp.serialize(serializer)
+    }
+}
+
+/// Strict Unix millisecond encoding for server-assigned index timestamps.
+pub(crate) struct StrictTimestampMs;
+
+impl SerializeAs<TimestampMs> for StrictTimestampMs {
+    fn serialize_as<S: Serializer>(source: &TimestampMs, serializer: S) -> Result<S::Ok, S::Error> {
+        source.timestamp_millis().serialize(serializer)
+    }
+}
+
+impl<'de> DeserializeAs<'de, TimestampMs> for StrictTimestampMs {
+    fn deserialize_as<D: Deserializer<'de>>(deserializer: D) -> Result<TimestampMs, D::Error> {
+        let millis = i64::deserialize(deserializer)?;
+        jiff::Timestamp::from_millisecond(millis)
+            .map(TimestampMs::from_timestamp_millis)
+            .map_err(D::Error::custom)
     }
 }
 

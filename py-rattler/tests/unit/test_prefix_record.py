@@ -1,13 +1,15 @@
 import json
 import os
 from pathlib import Path
+
 from rattler import (
-    PrefixRecord,
+    BuildString,
+    FileMode,
+    PackageRecord,
     PrefixPaths,
     PrefixPathsEntry,
     PrefixPathType,
-    FileMode,
-    PackageRecord,
+    PrefixRecord,
     RepoDataRecord,
     VersionWithSource,
 )
@@ -18,7 +20,7 @@ def test_load_prefix_record() -> None:
         Path(__file__).parent / ".." / ".." / ".." / "test-data" / "conda-meta" / "tk-8.6.12-h8ffe710_0.json"
     )
     assert r.arch == "x86_64"
-    assert r.build == "h8ffe710_0"
+    assert str(r.build) == "h8ffe710_0"
     assert r.build_number == 0
     assert r.channel == "https://conda.anaconda.org/conda-forge/win-64"
     assert len(r.constrains) == 0
@@ -41,9 +43,11 @@ def test_load_prefix_record() -> None:
             paths_with_placeholder += 1
             assert isinstance(entry.file_mode, FileMode)
             assert entry.file_mode.text or entry.file_mode.binary
+            assert entry.file_mode.mode in ("text", "binary")
             assert entry.sha256_in_prefix.hex() is not None
         else:
             assert entry.file_mode.unknown
+            assert entry.file_mode.mode == "unknown"
             assert entry.sha256.hex() is not None
         assert entry.size_in_bytes > 0
 
@@ -72,7 +76,7 @@ def test_create_prefix_record() -> None:
         name="foobar",
         version="1.0",
         build_number=1,
-        build="foo_1",
+        build=BuildString("foo_1"),
         platform="win-64",
         subdir="win",
         arch="x86_64",
@@ -130,7 +134,7 @@ def test_repodata_record_setters_update_backend() -> None:
         name="foobar",
         version="1.0",
         build_number=1,
-        build="foo_1",
+        build=BuildString("foo_1"),
         platform="win-64",
         subdir="win",
         arch="x86_64",
@@ -171,6 +175,7 @@ def test_prefix_paths() -> None:
     assert prefix_paths_entry.path_type.hardlink
     assert prefix_paths_entry.prefix_placeholder == "placeholder_foo_bar"
     assert prefix_paths_entry.file_mode.binary
+    assert prefix_paths_entry.file_mode.mode == "binary"
     assert prefix_paths_entry.sha256.hex() == "c505c9636f910d737b3a304ca2daff88fef1a92450d4dcd2f1a9d735eb1fa4d6"
     assert (
         prefix_paths_entry.sha256_in_prefix.hex() == "c505c9636f910d737b3a304ca2daff88fef1a92450d4dcd2f1a9d735eb1fa4d6"

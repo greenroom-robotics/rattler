@@ -14,7 +14,9 @@ use std::io::Read;
 use std::str::FromStr;
 use std::{io, path::Path};
 
-use crate::{NoArchType, PackageName, PackageRecord, PrefixRecord, VersionWithSource};
+use crate::{
+    NoArchType, PackageName, PackageRecord, PrefixRecord, VersionWithSource, package::BuildString,
+};
 use hex;
 use itertools::Itertools;
 use memmap2::Mmap;
@@ -43,8 +45,9 @@ pub struct MinimalPrefixRecord {
     pub name: PackageName,
     /// The package version
     pub version: VersionWithSource,
-    /// The build string
-    pub build: String,
+    /// The build string of the package. Empty when the package has no build
+    /// identifier.
+    pub build: BuildString,
 
     /// SHA256 hash of the package
     pub sha256: Option<Sha256Hash>,
@@ -206,7 +209,7 @@ impl MinimalPrefixRecord {
                 .map_err(|e| format!("Could not parse package name: {e:#?}"))
                 .map_err(io::Error::other)?,
             version,
-            build: build.into(),
+            build: BuildString::new_unchecked(build),
             sha256: final_sha256,
             md5: final_md5,
             size: final_size,
@@ -221,6 +224,7 @@ impl MinimalPrefixRecord {
     /// This creates a `PackageRecord` with only the essential fields filled in.
     pub fn to_package_record(&self) -> PackageRecord {
         PackageRecord {
+            attestations_sha256: None,
             name: self.name.clone(),
             version: self.version.clone(),
             build: self.build.clone(),
@@ -242,6 +246,7 @@ impl MinimalPrefixRecord {
             purls: None,
             run_exports: None,
             timestamp: None,
+            indexed_timestamp: None,
             track_features: Vec::new(),
             python_site_packages_path: None,
             extra_depends: std::collections::BTreeMap::new(),

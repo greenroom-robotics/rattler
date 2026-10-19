@@ -44,7 +44,7 @@ mod prefix;
 #[cfg(feature = "s3")]
 mod s3;
 #[cfg(feature = "s3")]
-pub use s3::upload_package_to_s3;
+pub use s3::{upload_package_to_s3, upload_package_to_s3_with_attestation};
 
 pub use anaconda::AnacondaError;
 pub use cloudsmith::CloudsmithError;
@@ -130,6 +130,44 @@ pub(crate) mod object_store {
 
         pub(crate) async fn stat(&self, path: &str) -> Result<opendal::Metadata, BlobStoreError> {
             self.0.stat(path).await.map_err(BlobStoreError::new)
+        }
+
+        /// Writes `bytes` to `path` unless an object already exists there.
+        #[cfg(feature = "s3")]
+        pub(crate) async fn write_new(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+            content_type: &str,
+        ) -> Result<(), BlobStoreError> {
+            self.0
+                .write_with(path, bytes)
+                .content_type(content_type)
+                .if_not_exists(true)
+                .await
+                .map(|_| ())
+                .map_err(BlobStoreError::new)
+        }
+
+        #[cfg(feature = "s3")]
+        pub(crate) async fn read(
+            &self,
+            path: &str,
+        ) -> Result<tokio_util::bytes::Bytes, BlobStoreError> {
+            self.0
+                .read(path)
+                .await
+                .map(|buffer| buffer.to_bytes())
+                .map_err(BlobStoreError::new)
+        }
+
+        #[cfg(feature = "s3")]
+        pub(crate) async fn copy(&self, from: &str, to: &str) -> Result<(), BlobStoreError> {
+            self.0
+                .copy(from, to)
+                .await
+                .map(|_| ())
+                .map_err(BlobStoreError::new)
         }
 
         async fn writer(
@@ -509,9 +547,14 @@ pub async fn upload_package_to_quetz(
 
         let hash = sha256_sum(package_file).into_diagnostic()?;
 
+        let force = if quetz_data.force.is_enabled() {
+            "true"
+        } else {
+            "false"
+        };
         let prepared_request = client
             .request(Method::POST, upload_url)
-            .query(&[("force", "false"), ("sha256", &hash)])
+            .query(&[("force", force), ("sha256", &hash)])
             .header("X-API-Key", token.clone());
 
         send_request_with_retry(prepared_request, package_file).await?;
@@ -912,6 +955,31 @@ mod test {
             url,
             "test-channel".to_string(),
             Some("test-api-key".to_string()),
+            false.into(),
+        );
+        let result =
+            super::upload_package_to_quetz(&storage, &vec![test_package_path()], quetz_data).await;
+        assert!(result.is_ok(), "{:?}", result.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_quetz_upload_force() {
+        async fn ok_with_force_true(
+            axum::extract::RawQuery(query): axum::extract::RawQuery,
+            _body: axum::body::Bytes,
+        ) -> StatusCode {
+            let query = query.unwrap_or_default();
+            assert!(query.contains("force=true"), "query: {query}");
+            StatusCode::OK
+        }
+        let router = Router::new().fallback(ok_with_force_true);
+        let url = start_test_server(router).await;
+        let storage = AuthenticationStorage::empty();
+        let quetz_data = QuetzData::new(
+            url,
+            "test-channel".to_string(),
+            Some("test-api-key".to_string()),
+            true.into(),
         );
         let result =
             super::upload_package_to_quetz(&storage, &vec![test_package_path()], quetz_data).await;
@@ -923,8 +991,12 @@ mod test {
         let router = Router::new().fallback(unauthorized);
         let url = start_test_server(router).await;
         let storage = AuthenticationStorage::empty();
-        let quetz_data =
-            QuetzData::new(url, "test-channel".to_string(), Some("bad-key".to_string()));
+        let quetz_data = QuetzData::new(
+            url,
+            "test-channel".to_string(),
+            Some("bad-key".to_string()),
+            false.into(),
+        );
         let result =
             super::upload_package_to_quetz(&storage, &vec![test_package_path()], quetz_data).await;
         assert!(result.is_err());
@@ -939,6 +1011,7 @@ mod test {
             url,
             "test-channel".to_string(),
             Some("test-key".to_string()),
+            false.into(),
         );
         let result =
             super::upload_package_to_quetz(&storage, &vec![test_package_path()], quetz_data).await;

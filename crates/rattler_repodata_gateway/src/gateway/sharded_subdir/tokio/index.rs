@@ -267,96 +267,81 @@ pub async fn fetch_index(
                         return Err(create_subdir_not_found_error(channel_base_url));
                     }
 
-                    let after_response = cache_header.policy.after_response(
-                        &state_request,
-                        &response,
-                        SystemTime::now(),
-                    );
-
-                    // A 304 is taken as "the cached body still stands" on the status
-                    // alone, rather than left to `after_response`, which reports
-                    // `NotModified` only when the 304 echoes back the validator it
-                    // matched. Azure Blob does not echo one: it answers a conditional
-                    // GET with a bare 304 carrying no `etag` and no `last-modified`,
-                    // just `x-ms-error-code: ConditionNotMet`. That reads as
-                    // `Modified`, and the 304 then reaches `from_response`, which
-                    // rejects it for not being a success.
-                    //
-                    // What is required in return is that the request actually asked a
-                    // conditional question. A cache entry with no validator revalidates
-                    // with a plain GET, and a 304 to that answers nothing: honoring it
-                    // would let a proxy or CDN pin a stale shard index forever.
+                    // Azure Blob answers a conditional GET with a bare 304 that echoes
+                    // no validator, which `after_response` reads as `Modified`. A 304 to
+                    // a request that carried a validator still means the cached body
+                    // stands; one to an unconditional request answers nothing.
                     let sent_conditional_request =
                         state_request.headers().contains_key(header::IF_NONE_MATCH)
                             || state_request
                                 .headers()
                                 .contains_key(header::IF_MODIFIED_SINCE);
-                    let is_not_modified =
-                        response.status() == StatusCode::NOT_MODIFIED && sent_conditional_request;
 
-                    if response.status() == StatusCode::NOT_MODIFIED && !sent_conditional_request {
-                        tracing::warn!(
-                            "ignoring a 304 for the shard index at {channel_base_url}: the request it answers carried no validator, so it cannot mean the cached index is current"
-                        );
-                    }
-
-                    let unmodified_policy = match &after_response {
-                        AfterResponse::NotModified(policy, _)
-                        | AfterResponse::Modified(policy, _)
-                            if is_not_modified =>
-                        {
-                            Some(policy.clone())
+                    let refreshed_policy = match cache_header.policy.after_response(
+                        &state_request,
+                        &response,
+                        SystemTime::now(),
+                    ) {
+                        AfterResponse::NotModified(policy, _) if sent_conditional_request => {
+                            Some(policy)
                         }
-                        _ => None,
+                        AfterResponse::Modified(_, _)
+                            if response.status() == StatusCode::NOT_MODIFIED
+                                && sent_conditional_request =>
+                        {
+                            None
+                        }
+                        AfterResponse::NotModified(policy, _)
+                        | AfterResponse::Modified(policy, _) => {
+                            // Close the old file so we can create a new one.
+                            tracing::debug!("shard index cache has become stale");
+                            return from_response(
+                                cache_reader.into_inner(),
+                                &cache_path,
+                                policy,
+                                response,
+                                download_reporter,
+                                request_permit,
+                            )
+                            .await;
+                        }
                     };
 
-                    if let Some(refreshed_policy) = unmodified_policy {
-                        match read_cached_shard_index(&mut cache_reader).await {
-                            Ok((body, shard_index)) => {
-                                tracing::debug!("shard index cache was not modified");
+                    if let Some((reporter, index)) = download_reporter {
+                        reporter.on_download_complete(response.url(), index);
+                    }
 
-                                // Store the refreshed policy so a 304 that carries
-                                // caching headers spares the next run a revalidation.
-                                // An already-stale policy teaches us nothing, so the
-                                // rewrite is skipped in that case.
-                                if !refreshed_policy.is_stale(SystemTime::now())
-                                    && let Err(e) = write_shard_index_cache(
-                                        cache_reader.into_inner().inner_mut(),
-                                        refreshed_policy,
-                                        body,
+                    match read_shard_index_with_bytes(&mut cache_reader).await {
+                        Ok((shard_index, bytes)) => {
+                            // The 304 carries refreshed caching headers. Store them
+                            // with the cached body so later loads treat the index as
+                            // fresh instead of revalidating it again.
+                            if let Some(policy) = refreshed_policy {
+                                write_shard_index_cache(
+                                    cache_reader.get_mut().inner_mut(),
+                                    policy,
+                                    bytes,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    GatewayError::IoError(
+                                        format!(
+                                            "failed to update shard index cache at {}",
+                                            cache_path.display()
+                                        ),
+                                        e,
                                     )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "failed to store the refreshed cache policy for the shard index at {}: {e}",
-                                        cache_path.display()
-                                    );
-                                }
-
-                                if let Some((reporter, index)) = download_reporter {
-                                    reporter.on_download_complete(response.url(), index);
-                                }
-                                return Ok(shard_index);
+                                })?;
                             }
-                            Err(e) => {
-                                tracing::warn!("the cached shard index has been corrupted: {e}");
-                                if let Some((reporter, index)) = download_reporter {
-                                    reporter.on_download_complete(response.url(), index);
-                                }
-                            }
+                            tracing::debug!("shard index cache was not modified");
+                            return Ok(shard_index);
                         }
-                    } else if let AfterResponse::Modified(policy, _) = after_response {
-                        // Close the old file so we can create a new one.
-                        tracing::debug!("shard index cache has become stale");
-                        return from_response(
-                            cache_reader.into_inner(),
-                            &cache_path,
-                            policy,
-                            response,
-                            download_reporter,
-                            request_permit,
-                        )
-                        .await;
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "the cached shard index is corrupted, fetching it again"
+                            );
+                        }
                     }
                 }
             }
@@ -517,32 +502,31 @@ async fn write_not_found_cache(cache_file: &mut File, policy: CachePolicy) -> st
 pub async fn read_shard_index_from_reader<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
 ) -> Result<ShardedRepodata, GatewayError> {
-    read_cached_shard_index(reader)
-        .await
-        .map(|(_, shard_index)| shard_index)
+    Ok(read_shard_index_with_bytes(reader).await?.0)
 }
 
-async fn read_cached_shard_index<R: AsyncRead + Unpin>(
+/// Reads the shard index from a reader and deserializes it, also returning the
+/// raw bytes so the caller can write them back to the cache.
+async fn read_shard_index_with_bytes<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
-) -> Result<(Bytes, ShardedRepodata), GatewayError> {
-    // Read the file to memory
+) -> Result<(ShardedRepodata, Bytes), GatewayError> {
     let mut bytes = Vec::new();
     reader
         .read_to_end(&mut bytes)
         .await
         .map_err(|e| GatewayError::IoError("failed to read shard index buffer".to_string(), e))?;
     let bytes = Bytes::from(bytes);
+    Ok((parse_shard_index(bytes.clone()).await?, bytes))
+}
 
-    // Deserialize the bytes
-    let parse_bytes = bytes.clone();
-    let shard_index = run_blocking_task(move || {
-        rmp_serde::from_slice(&parse_bytes)
+/// Deserializes a decoded (decompressed) shard index.
+async fn parse_shard_index(bytes: Bytes) -> Result<ShardedRepodata, GatewayError> {
+    run_blocking_task(move || {
+        rmp_serde::from_slice(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
             .map_err(|e| GatewayError::IoError("failed to parse shard index".to_string(), e))
     })
-    .await?;
-
-    Ok((bytes, shard_index))
+    .await
 }
 
 /// Cache information stored at the start of the cache file.
@@ -684,6 +668,7 @@ mod tests {
                     created_at: Some(jiff::Timestamp::now()),
                     repodata_revisions: RepodataRevisions::default(),
                     channel_relations: None,
+                    virtual_package_detectors: None,
                 },
                 shards: ahash::HashMap::default(),
             };

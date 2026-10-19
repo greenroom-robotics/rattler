@@ -21,6 +21,62 @@ use url::Url;
 /// The Azure Storage REST API version sent on every signed request.
 const X_MS_VERSION: &str = "2021-12-02";
 
+/// An error that occurred while turning an `az://` request into a signed
+/// HTTP(S) one.
+#[derive(Debug, thiserror::Error)]
+pub enum AzureMiddlewareError {
+    /// The URL is not a valid Azure channel URL.
+    #[error(transparent)]
+    InvalidUrl(#[from] rattler_azure::AzureUrlError),
+
+    /// The request URL could not be carried over to the request being signed.
+    #[error("failed to build http request for signing")]
+    UnsignableUri(#[source] http::uri::InvalidUri),
+
+    /// The body is a stream, so its `Content-Length` is unknown.
+    #[error(
+        "cannot sign a streaming request body for `{authority}`: Shared Key signs \
+         `Content-Length`, which a body of unknown size does not have"
+    )]
+    StreamingBody {
+        /// The host and port the request addresses.
+        authority: String,
+    },
+
+    /// The container is granted, but no credential could be resolved for it.
+    #[error(
+        "could not resolve an Azure credential for `{container}` on `{key}`, which \
+         `[azure-options.\"{key}\".auth]` `{container} = true` requires\n\
+         \n\
+         Try one of:\n\
+         \x20 - `az login`\n\
+         \x20 - `AZURE_STORAGE_ACCOUNT_NAME` and `AZURE_STORAGE_ACCOUNT_KEY` in the \
+         environment\n\
+         \x20 - set `{container} = false` to fetch this container anonymously\n\
+         \n\
+         Debug logging lists the credential providers that were tried."
+    )]
+    Credential {
+        /// The `azure-options` entry that granted the container.
+        key: AzureEndpointKey,
+        /// The granted container.
+        container: ContainerName,
+        /// The reason reqsign gave.
+        #[source]
+        source: reqsign_core::Error,
+    },
+
+    /// The signer returned a URI that is not a valid URL.
+    #[error("failed to parse signed azure URL '{redacted}'")]
+    InvalidSignedUrl {
+        /// The signed URI with its signature masked.
+        redacted: String,
+        /// The reason it could not be parsed.
+        #[source]
+        source: url::ParseError,
+    },
+}
+
 /// Middleware that rewrites `az://` URLs to their wire form and signs the ones
 /// whose container is granted credentials.
 ///
@@ -145,14 +201,13 @@ impl AzureMiddleware {
     }
 
     fn resolve(&self, url: &Url) -> MiddlewareResult<Resolved> {
-        let channel = AzureChannelUrl::parse(url.as_str()).map_err(|e| {
-            // The URL is not echoed back: the one rejection a user hits here is
-            // userinfo, and quoting it would print their password.
-            reqwest_middleware::Error::Middleware(anyhow::Error::from(e))
-        })?;
+        let channel = AzureChannelUrl::parse(url.as_str())
+            .map_err(AzureMiddlewareError::from)
+            .map_err(reqwest_middleware::Error::middleware)?;
 
         let location = rattler_azure::locate(&channel, |key| self.options.contains_key(key))
-            .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::Error::from(e)))?;
+            .map_err(AzureMiddlewareError::from)
+            .map_err(reqwest_middleware::Error::middleware)?;
 
         let unconfigured = AzureEndpointOptions::default();
         let entry = location
@@ -220,11 +275,12 @@ impl AzureMiddleware {
 
         let (mut parts, ()) = http::Request::new(()).into_parts();
         parts.method = req.method().clone();
-        parts.uri = req.url().as_str().parse().map_err(|e| {
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                "failed to build http request for signing: {e}"
-            ))
-        })?;
+        parts.uri = req
+            .url()
+            .as_str()
+            .parse()
+            .map_err(AzureMiddlewareError::UnsignableUri)
+            .map_err(reqwest_middleware::Error::middleware)?;
         parts.headers = req.headers().clone();
 
         // Shared Key signs `Content-Length`, so it has to be on the request
@@ -239,11 +295,11 @@ impl AzureMiddleware {
                 );
             }
             None if req.body().is_some() => {
-                return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                    "cannot sign a streaming request body for `{}`: Shared Key signs \
-                     `Content-Length`, which a body of unknown size does not have",
-                    req.url().authority()
-                )));
+                return Err(reqwest_middleware::Error::middleware(
+                    AzureMiddlewareError::StreamingBody {
+                        authority: req.url().authority().to_string(),
+                    },
+                ));
             }
             None => {}
         }
@@ -251,34 +307,27 @@ impl AzureMiddleware {
         // reqsign says only "failed to load signing credential", so an expired
         // `az login` and an empty environment arrive here indistinguishable.
         let signer = self.signer_for(channel, scheme);
-        signer.sign(&mut parts, None).await.map_err(|e| {
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                "could not resolve an Azure credential for `{container}` on `{key}`, which \
-                 `[azure-options.\"{key}\".auth]` `{container} = true` requires: {e}\n\
-                 \n\
-                 Try one of:\n\
-                 \x20 - `az login`\n\
-                 \x20 - `AZURE_STORAGE_ACCOUNT_NAME` and `AZURE_STORAGE_ACCOUNT_KEY` in the \
-                 environment\n\
-                 \x20 - set `{container} = false` to fetch this container anonymously\n\
-                 \n\
-                 Debug logging lists the credential providers that were tried."
-            ))
-        })?;
+        signer
+            .sign(&mut parts, None)
+            .await
+            .map_err(|source| AzureMiddlewareError::Credential {
+                key: key.clone(),
+                container: container.clone(),
+                source,
+            })
+            .map_err(reqwest_middleware::Error::middleware)?;
 
         *req.headers_mut() = parts.headers;
-        let signed_url = Url::parse(&parts.uri.to_string()).map_err(|e| {
-            // The signed URI carries the signature reqsign just attached, so it is
-            // reported masked — an error message is the one place a credential
-            // reliably ends up in a log.
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                "failed to parse signed azure URL '{}': {e}",
-                rattler_redaction::redact_signatures_in_text(
+        let signed_url = Url::parse(&parts.uri.to_string())
+            .map_err(|source| AzureMiddlewareError::InvalidSignedUrl {
+                redacted: rattler_redaction::redact_signatures_in_text(
                     &parts.uri.to_string(),
                     rattler_redaction::DEFAULT_REDACTION_STR,
                 )
-            ))
-        })?;
+                .into_owned(),
+                source,
+            })
+            .map_err(reqwest_middleware::Error::middleware)?;
         *req.url_mut() = signed_url;
         Ok(())
     }
@@ -313,7 +362,7 @@ impl Middleware for AzureMiddleware {
                 "404 from `{}`, which has no `azure-options` auth grant; Azure answers an \
                  unauthorized read of a private container with 404, so grant the container if it \
                  is private",
-                channel.canonical()
+                channel.redacted()
             );
         }
 
