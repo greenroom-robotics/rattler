@@ -1,6 +1,6 @@
 [package]
 name = "rattler_upload"
-version = "0.13.5"
+version = "0.15.3"
 edition.workspace = true
 authors = [
   "Wolf Vollprecht <w.vollprecht@gmail.com>",
@@ -21,12 +21,14 @@ rustls = [
   "rattler_package_streaming/rustls",
   "sigstore-sign?/rustls",
   "opendal?/reqwest-rustls-tls",
+  "rattler_azure?/rustls",
 ]
 native-tls = [
   "reqwest/native-tls",
   "rattler_networking/native-tls",
   "rattler_package_streaming/native-tls",
   "sigstore-sign?/native-tls",
+  "rattler_azure?/native-tls",
 ]
 s3 = ["rattler_networking/s3", "rattler_s3", "rattler_s3/opendal", "dep:opendal"]
 azure = ["dep:rattler_azure", "rattler_azure/opendal", "dep:opendal", "opendal/services-azblob"]

@@ -12,7 +12,7 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use opendal::{Configurator, ErrorKind, Operator, services::AzblobConfig};
+use opendal::{ErrorKind, Operator, services::AzblobConfig};
 use rattler_azure::{
     Auth, AzureChannelUrl, AzureCredentials, AzureEndpointKey, AzureEndpointOptions, AzureScheme,
     ContainerName,
@@ -80,9 +80,7 @@ fn production_operator(channel: &AzureChannelUrl) -> Operator {
         azurite_options().scheme(),
     )
     .expect("azblob config for an azurite path-style channel");
-    Operator::new(config.into_builder())
-        .expect("azblob operator")
-        .finish()
+    rattler_azure::azblob_operator(config).expect("azblob operator")
 }
 
 /// An operator written out by hand, *not* derived from the code under test, so a
@@ -96,9 +94,7 @@ fn verify_operator(prefix: &str) -> Operator {
         root: Some(format!("/{prefix}")),
         ..Default::default()
     };
-    Operator::new(config.into_builder())
-        .expect("azblob operator")
-        .finish()
+    rattler_azure::azblob_operator(config).expect("azblob operator")
 }
 
 /// Create the channel's container and clear this test's prefix inside it. The

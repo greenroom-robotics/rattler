@@ -1858,7 +1858,7 @@ pub async fn index_fs_with_channel_metadata(
     // enumeration since it doesn't parse as a `Subdir`.
     config.atomic_write_dir = Some(root.join(".tmp").to_string_lossy().to_string());
     let builder = config.into_builder();
-    let op = Operator::new(builder)?.finish();
+    let op = Operator::new(builder)?;
     index_with_channel_metadata(
         target_platform,
         op,
@@ -1916,9 +1916,9 @@ fn s3_operator(credentials: &S3CredentialSource, channel: &Url) -> Result<Operat
     let bucket = channel
         .host_str()
         .ok_or(anyhow::anyhow!("No bucket in S3 URL"))?;
-    let builder = credentials.opendal_builder(bucket, channel.path());
+    let operator = credentials.opendal_operator(bucket, channel.path())?;
 
-    Ok(Operator::new(builder)?.layer(RetryLayer::new()).finish())
+    Ok(operator.layer(RetryLayer::new()))
 }
 
 /// Create a new `repodata.json` for all packages in the channel at the given S3
@@ -2027,26 +2027,23 @@ pub async fn index_azure_with_channel_metadata(
 ) -> anyhow::Result<()> {
     let azblob_config = rattler_azure::azblob_config(&credentials, &location, scheme)?;
     let (key, container) = location.addressed()?;
-    let builder = azblob_config.into_builder();
     // opendal's default retry interceptor logs the error with its `url` context, and
     // for a SAS the credential is *in* that URL. Same message, signature masked.
-    let op = Operator::new(builder)?
-        .layer(
-            RetryLayer::new().with_notify(|event: opendal::layers::RetryEvent<'_>| {
-                tracing::warn!(
-                    target: "opendal::layers::retry",
-                    "will retry {:?} (attempt {}) after {}s because: {}",
-                    event.op,
-                    event.attempt,
-                    event.retry_after.as_secs_f64(),
-                    rattler_redaction::redact_signatures_in_text(
-                        &format!("{:?}", event.err),
-                        rattler_redaction::DEFAULT_REDACTION_STR,
-                    ),
-                );
-            }),
-        )
-        .finish();
+    let op = rattler_azure::azblob_operator(azblob_config)?.layer(RetryLayer::new().with_notify(
+        |event: opendal::layers::RetryEvent<'_>| {
+            tracing::warn!(
+                target: "opendal::layers::retry",
+                "will retry {:?} (attempt {}) after {}s because: {}",
+                event.op,
+                event.attempt,
+                event.retry_after.as_secs_f64(),
+                rattler_redaction::redact_signatures_in_text(
+                    &format!("{:?}", event.err),
+                    rattler_redaction::DEFAULT_REDACTION_STR,
+                ),
+            );
+        },
+    ));
 
     // A missing container answers a list with the same `NotFound` an empty prefix
     // does, so ask once here, where the answer can still be attributed to the
@@ -2437,7 +2434,7 @@ pub async fn ensure_channel_initialized_fs_with_channel_metadata(
     config.root = Some(root.to_string_lossy().to_string());
     // Atomic writes, see `index_fs_with_channel_metadata`.
     config.atomic_write_dir = Some(root.join(".tmp").to_string_lossy().to_string());
-    let op = Operator::new(config.into_builder())?.finish();
+    let op = Operator::new(config.into_builder())?;
     ensure_channel_initialized_with_channel_metadata(&op, channel_metadata).await
 }
 
@@ -2704,7 +2701,7 @@ mod tests {
         let channel = tempfile::tempdir().unwrap();
         let mut config = FsConfig::default();
         config.root = Some(channel.path().to_string_lossy().to_string());
-        let op = Operator::new(config.into_builder()).unwrap().finish();
+        let op = Operator::new(config.into_builder()).unwrap();
         op.create_dir("noarch/").await.unwrap();
         op.write("noarch/repodata_from_packages.json", "source sentinel")
             .await

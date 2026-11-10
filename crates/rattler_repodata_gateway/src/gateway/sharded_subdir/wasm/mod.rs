@@ -18,11 +18,12 @@ use crate::{
     gateway::{
         error::SubdirNotFoundError,
         sharded_subdir::{
-            decode_zst_bytes_async, is_missing_sharded_repodata_status, parse_records,
+            decode_verified_shard_async, is_missing_sharded_repodata_status, parse_records,
         },
-        subdir::{PackageRecords, SubdirClient},
+        subdir::{FetchedPackage, SubdirClient},
     },
-    reporter::ResponseReporterExt,
+    reporter::{DownloadProgressGuard, ResponseReporterExt},
+    sparse::{FormatBucketSet, PackageFormatSelection},
     utils::js_fetch::JsFetcher,
 };
 
@@ -120,11 +121,12 @@ impl SubdirClient for ShardedSubdir {
     async fn fetch_package_records(
         &self,
         name: &PackageName,
+        _buckets: FormatBucketSet,
         reporter: Option<&dyn Reporter>,
-    ) -> Result<PackageRecords, GatewayError> {
+    ) -> Result<FetchedPackage, GatewayError> {
         // Find the shard that contains the package
         let Some(shard) = self.sharded_repodata.shards.get(name.as_normalized()) else {
-            return Ok(PackageRecords::default());
+            return Ok(FetchedPackage::empty());
         };
 
         // Download the shard
@@ -151,9 +153,10 @@ impl SubdirClient for ShardedSubdir {
                         .build()
                         .expect("failed to build shard request");
 
-                    let reporter = reporter
-                        .and_then(Reporter::download_reporter)
-                        .map(|r| (r, r.on_download_start(&shard_url)));
+                    let download = DownloadProgressGuard::start(
+                        reporter.and_then(Reporter::download_reporter),
+                        &shard_url,
+                    );
                     let shard_response = self
                         .client
                         .client()
@@ -163,31 +166,30 @@ impl SubdirClient for ShardedSubdir {
                         .map_err(FetchRepoDataError::from)?;
 
                     let bytes = shard_response
-                        .bytes_with_progress(reporter)
+                        .bytes_with_progress(download.reporter())
                         .await
                         .map_err(FetchRepoDataError::from)?;
 
-                    if let Some((reporter, index)) = reporter {
-                        reporter.on_download_complete(&shard_url, index);
-                    }
+                    download.finish(&shard_url);
 
                     bytes::Bytes::from(bytes)
                 }
             }
         };
 
-        let shard_bytes = decode_zst_bytes_async(shard_bytes, shard_url).await?;
+        let shard_bytes = decode_verified_shard_async(shard_bytes, *shard, shard_url).await?;
 
-        // Parse the records from the shard (includes dep extraction)
+        // Parse the records from the shard
         parse_records(
             shard_bytes,
+            name.clone(),
             self.channel.base_url.clone(),
             self.package_base_url.clone(),
         )
         .await
     }
 
-    fn package_names(&self) -> Vec<String> {
+    fn package_names(&self, _selection: PackageFormatSelection) -> Vec<String> {
         self.sharded_repodata.shards.keys().cloned().collect()
     }
 

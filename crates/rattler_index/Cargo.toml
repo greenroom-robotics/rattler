@@ -1,7 +1,7 @@
 [package]
 exclude = ["tests/**"]
 name = "rattler_index"
-version = "0.33.5"
+version = "0.34.5"
 edition.workspace = true
 authors = []
 description = "A crate to index conda channels and create a repodata.json file."
@@ -19,12 +19,14 @@ native-tls = [
   "rattler_package_streaming/native-tls",
   "rattler_networking/native-tls",
   "rattler_s3?/native-tls",
+  "rattler_azure?/native-tls",
 ]
 rustls = [
   "reqwest/rustls",
   "rattler_package_streaming/rustls",
   "rattler_networking/rustls",
   "rattler_s3?/rustls",
+  "rattler_azure?/rustls",
   "opendal/reqwest-rustls-tls",
 ]
 s3 = ["opendal/services-s3", "dep:rattler_s3", "rattler_s3/opendal"]

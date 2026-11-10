@@ -5,7 +5,7 @@ use std::{
 
 use futures::StreamExt;
 use miette::IntoDiagnostic;
-use opendal::{Configurator, ErrorKind};
+use opendal::ErrorKind;
 use rattler_azure::{
     AccountName, AzureChannelUrl, AzureCredentials, AzureLocation, AzureScheme, ContainerName,
 };
@@ -38,8 +38,7 @@ pub async fn upload_package_to_azure(
     let (key, container) = location.addressed().into_diagnostic()?;
     let channel = location.channel();
 
-    let builder = config.into_builder();
-    let op = BlobStore::new(builder).into_diagnostic()?;
+    let op = BlobStore::new(rattler_azure::azblob_operator(config)).into_diagnostic()?;
 
     // Every upload runs to completion even once another has failed, so no future is
     // dropped mid-upload: see `discard_partial_upload` for what that would cost.
@@ -197,7 +196,7 @@ mod test {
     use crate::upload::test_utils::test_package_path;
 
     fn memory_operator() -> BlobStore {
-        BlobStore::new(Memory::default()).unwrap()
+        BlobStore::new(opendal::Operator::new(Memory::default())).unwrap()
     }
 
     fn test_channel() -> AzureChannelUrl {

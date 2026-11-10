@@ -12,7 +12,9 @@ readme.workspace = true
 [features]
 default = []
 clap = ["dep:clap", "dep:jiff", "dep:which", "dep:tokio"]
-opendal = ["dep:opendal"]
+opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest"]
+rustls = ["opendal-http-transport-reqwest?/rustls"]
+native-tls = ["opendal-http-transport-reqwest?/native-tls"]
 serde = ["dep:serde", "indexmap/serde"]
 
 [dependencies]
@@ -22,6 +24,7 @@ jiff = { workspace = true, optional = true }
 opendal = { workspace = true, default-features = false, features = [
   "services-azblob",
 ], optional = true }
+opendal-http-transport-reqwest = { workspace = true, optional = true }
 percent-encoding = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }

@@ -55,6 +55,25 @@ pub fn azblob_config(
     })
 }
 
+/// An opendal operator for `config`.
+///
+/// `opendal` has no HTTP transport unless one is installed, and installing it
+/// process-wide would take that choice away from the application, so the
+/// operator gets its own `reqwest` transport.
+pub fn azblob_operator(
+    config: opendal::services::AzblobConfig,
+) -> opendal::Result<opendal::Operator> {
+    use opendal::Configurator;
+
+    let operator = opendal::Operator::new(config.into_builder())?;
+    let context = operator
+        .context()
+        .with_http_transport(opendal::HttpTransporter::new(
+            opendal_http_transport_reqwest::ReqwestTransport::default(),
+        ));
+    Ok(operator.with_context(context))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,7 +30,7 @@ mod sas;
 mod test_support;
 
 #[cfg(feature = "opendal")]
-pub use azblob::azblob_config;
+pub use azblob::{azblob_config, azblob_operator};
 pub use channel_url::AzureChannelUrl;
 pub use credentials::AzureCredentials;
 pub use endpoint_key::{AccountHost, AccountPath, AzureEndpointKey};
